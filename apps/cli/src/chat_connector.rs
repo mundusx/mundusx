@@ -391,6 +391,7 @@ fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let telemetry = item["data"]["telemetry"].clone();
     json!({
         "sequence": sequence,
         "event": {
@@ -406,7 +407,7 @@ fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
                 _ if event_type == "model_turn_completed" => "Model step completed".to_string(),
                 _ => "Hermes is working".to_string(),
             },
-            "metadata": {"tool": tool, "skills": skills, "source_type": raw_type}
+            "metadata": {"tool": tool, "skills": skills, "source_type": raw_type, "telemetry": telemetry}
         }
     })
 }
@@ -1100,13 +1101,17 @@ mod tests {
         let event = structured_hermes_event(
             &serde_json::json!({
                 "type": "skills_selected",
-                "data": {"skills": ["test-driven-development"]}
+                "data": {
+                    "skills": ["test-driven-development"],
+                    "telemetry": {"context_remaining": 24576, "context_length": 32768}
+                }
             }),
             42,
         );
         assert_eq!(event["sequence"], 42);
         assert_eq!(event["event"]["type"], "skills_selected");
         assert_eq!(event["event"]["summary"], "Using test-driven-development");
+        assert_eq!(event["event"]["metadata"]["telemetry"]["context_remaining"], 24576);
     }
 
     #[test]

@@ -59,8 +59,30 @@ def main():
 
     from run_agent import AIAgent
 
+    agent_holder = {}
+
+    def telemetry():
+        """Return the same bounded session metrics Hermes shows in its CLI."""
+        agent = agent_holder.get("agent")
+        if agent is None:
+            return {}
+        compressor = getattr(agent, "context_compressor", None)
+        context_length = int(getattr(compressor, "context_length", 0) or 0)
+        context_used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+        return {
+            "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
+            "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
+            "total_tokens": int(getattr(agent, "session_total_tokens", 0) or 0),
+            "api_calls": int(getattr(agent, "session_api_calls", 0) or 0),
+            "context_used": context_used,
+            "context_length": context_length,
+            "context_remaining": max(0, context_length - context_used) if context_length else 0,
+            "compressions": int(getattr(compressor, "compression_count", 0) or 0),
+        }
+
     def event_callback(kind, data=None):
-        payload = data if isinstance(data, dict) else {"value": data}
+        payload = dict(data) if isinstance(data, dict) else {"value": data}
+        payload["telemetry"] = telemetry()
         emit("MUNDUSX_EVENT=", {"type": str(kind), "data": payload})
 
     def tool_start_callback(call_id, name, arguments):
@@ -73,6 +95,7 @@ def main():
                     "call_id": call_id,
                     "name": name,
                     "verification": is_verification_command(command),
+                    "telemetry": telemetry(),
                 },
             },
         )
@@ -88,6 +111,7 @@ def main():
                     "name": name,
                     "verification": is_verification_command(command),
                     "success": tool_result_succeeded(result),
+                    "telemetry": telemetry(),
                 },
             },
         )
@@ -138,6 +162,7 @@ def main():
         skip_memory=True,
         load_soul_identity=False,
     )
+    agent_holder["agent"] = agent
     try:
         result = agent.run_conversation(
             user_message=user_prompt,
