@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::thread;
 use std::time::Duration;
@@ -215,14 +215,61 @@ fn connection_id(data_dir: &Path, regenerate: bool) -> Result<String, String> {
     Ok(id)
 }
 
+fn remote_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        // Reuse DNS, TLS sessions, and pooled connections. Creating an implicit
+        // client for every long-poll request made Windows repeatedly perform a
+        // fresh TLS handshake and occasionally strand the connector offline.
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(45))
+            .timeout_write(Duration::from_secs(20))
+            .build()
+    })
+}
+
+fn retryable_remote_transport(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Transport(transport) => {
+            let message = transport.to_string().to_ascii_lowercase();
+            message.contains("connection failed")
+                || message.contains("tls connection init failed")
+                || message.contains("connection reset")
+                || message.contains("dns")
+        }
+        ureq::Error::Status(status, _) => matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504),
+    }
+}
+
 fn post_remote(url: &str, token: &str, path: &str, body: Value) -> Result<Value, String> {
-    ureq::post(&format!("{url}{path}"))
-        .timeout(Duration::from_secs(30))
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(body)
-        .map_err(|error| format!("Chat connector request failed: {error}"))?
-        .into_json()
-        .map_err(|error| format!("Chat connector returned invalid JSON: {error}"))
+    const ATTEMPTS: usize = 3;
+    let endpoint = format!("{url}{path}");
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match remote_agent()
+            .post(&endpoint)
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(body.clone())
+        {
+            Ok(response) => {
+                return response
+                    .into_json()
+                    .map_err(|error| format!("Chat connector returned invalid JSON: {error}"));
+            }
+            Err(error) if retryable_remote_transport(&error) && attempt + 1 < ATTEMPTS => {
+                last_error = Some(error.to_string());
+                thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+            }
+            Err(error) => {
+                return Err(format!("Chat connector request failed at {path}: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "Chat connector request failed at {path} after {ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown transport failure".to_string())
+    ))
 }
 
 fn transient_agent_failure(error: &str) -> bool {
