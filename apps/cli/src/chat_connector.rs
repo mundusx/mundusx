@@ -58,6 +58,20 @@ pub struct ConnectorOptions {
     pub authorize_only: bool,
 }
 
+fn project_model_url(chat_url: &str) -> String {
+    if let Ok(value) = std::env::var("MUNDUSX_PROJECT_MODEL_URL") {
+        let value = value.trim().trim_end_matches('/');
+        if value.starts_with("https://") || value.starts_with("http://127.0.0.1:") {
+            return value.to_string();
+        }
+    }
+    if chat_url.trim_end_matches('/') == "https://chat.mundusx.ai" {
+        "https://mundusx.ai/v1".to_string()
+    } else {
+        format!("{}/api/agent/model/v1", chat_url.trim_end_matches('/'))
+    }
+}
+
 fn saved_token(data_dir: &Path, chat_url: &str) -> Option<String> {
     serde_json::from_str::<Value>(&fs::read_to_string(connection_file(data_dir)).ok()?)
         .ok()
@@ -678,7 +692,7 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
                 allow_mutations,
                 Some(stop.as_ref()),
                 Some((
-                    &format!("{}/api/agent/model/v1", options.chat_url),
+                    &project_model_url(&options.chat_url),
                     &options.token,
                     &task_id,
                     connection_id,
@@ -944,8 +958,9 @@ pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), Str
 mod tests {
     use super::{
         bounded_task_workspace, changed_file_events, connection_id, harness_completion_content,
-        request_requires_verification, requires_project_file_change, structured_hermes_event,
-        successful_verification, transient_agent_failure, validate_chat_url, workspace_snapshot,
+        project_model_url, request_requires_verification, requires_project_file_change,
+        structured_hermes_event, successful_verification, transient_agent_failure,
+        validate_chat_url, workspace_snapshot,
     };
     use std::fs;
 
@@ -954,6 +969,18 @@ mod tests {
         assert!(validate_chat_url("https://chat.mundusx.ai/").is_ok());
         assert!(validate_chat_url("http://localhost:8787").is_ok());
         assert!(validate_chat_url("http://chat.mundusx.ai").is_err());
+    }
+
+    #[test]
+    fn production_project_agent_bypasses_the_chat_model_relay() {
+        assert_eq!(
+            project_model_url("https://chat.mundusx.ai"),
+            "https://mundusx.ai/v1"
+        );
+        assert_eq!(
+            project_model_url("http://127.0.0.1:3000"),
+            "http://127.0.0.1:3000/api/agent/model/v1"
+        );
     }
 
     #[test]
