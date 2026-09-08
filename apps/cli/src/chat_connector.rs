@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::thread;
 use std::time::Duration;
@@ -56,6 +56,20 @@ pub struct ConnectorOptions {
     pub workspace: PathBuf,
     pub reauthorize: bool,
     pub authorize_only: bool,
+}
+
+fn project_model_url(chat_url: &str) -> String {
+    if let Ok(value) = std::env::var("MUNDUSX_PROJECT_MODEL_URL") {
+        let value = value.trim().trim_end_matches('/');
+        if value.starts_with("https://") || value.starts_with("http://127.0.0.1:") {
+            return value.to_string();
+        }
+    }
+    if chat_url.trim_end_matches('/') == "https://chat.mundusx.ai" {
+        "https://mundusx.ai/v1".to_string()
+    } else {
+        format!("{}/api/agent/model/v1", chat_url.trim_end_matches('/'))
+    }
 }
 
 fn saved_token(data_dir: &Path, chat_url: &str) -> Option<String> {
@@ -201,14 +215,61 @@ fn connection_id(data_dir: &Path, regenerate: bool) -> Result<String, String> {
     Ok(id)
 }
 
+fn remote_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        // Reuse DNS, TLS sessions, and pooled connections. Creating an implicit
+        // client for every long-poll request made Windows repeatedly perform a
+        // fresh TLS handshake and occasionally strand the connector offline.
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(45))
+            .timeout_write(Duration::from_secs(20))
+            .build()
+    })
+}
+
+fn retryable_remote_transport(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Transport(transport) => {
+            let message = transport.to_string().to_ascii_lowercase();
+            message.contains("connection failed")
+                || message.contains("tls connection init failed")
+                || message.contains("connection reset")
+                || message.contains("dns")
+        }
+        ureq::Error::Status(status, _) => matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504),
+    }
+}
+
 fn post_remote(url: &str, token: &str, path: &str, body: Value) -> Result<Value, String> {
-    ureq::post(&format!("{url}{path}"))
-        .timeout(Duration::from_secs(30))
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(body)
-        .map_err(|error| format!("Chat connector request failed: {error}"))?
-        .into_json()
-        .map_err(|error| format!("Chat connector returned invalid JSON: {error}"))
+    const ATTEMPTS: usize = 3;
+    let endpoint = format!("{url}{path}");
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match remote_agent()
+            .post(&endpoint)
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(body.clone())
+        {
+            Ok(response) => {
+                return response
+                    .into_json()
+                    .map_err(|error| format!("Chat connector returned invalid JSON: {error}"));
+            }
+            Err(error) if retryable_remote_transport(&error) && attempt + 1 < ATTEMPTS => {
+                last_error = Some(error.to_string());
+                thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+            }
+            Err(error) => {
+                return Err(format!("Chat connector request failed at {path}: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "Chat connector request failed at {path} after {ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown transport failure".to_string())
+    ))
 }
 
 fn transient_agent_failure(error: &str) -> bool {
@@ -241,7 +302,7 @@ fn transient_agent_failure(error: &str) -> bool {
 fn requires_project_file_change(prompt: &str) -> bool {
     let value = prompt.trim().to_ascii_lowercase();
     let advisory_opening = [
-        "what ", "why ", "how ", "should ", "do i ", "does ", "is ", "are ",
+        "what ", "which ", "where ", "when ", "who ", "why ", "how ", "should ", "do i ", "does ", "is ", "are ",
         "explain ", "compare ", "recommend ", "can i ask", "could i ask", "may i ask",
         "can i know", "could i know", "may i know",
     ]
@@ -347,6 +408,7 @@ fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let telemetry = item["data"]["telemetry"].clone();
     json!({
         "sequence": sequence,
         "event": {
@@ -362,7 +424,7 @@ fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
                 _ if event_type == "model_turn_completed" => "Model step completed".to_string(),
                 _ => "Hermes is working".to_string(),
             },
-            "metadata": {"tool": tool, "skills": skills, "source_type": raw_type}
+            "metadata": {"tool": tool, "skills": skills, "source_type": raw_type, "telemetry": telemetry}
         }
     })
 }
@@ -695,7 +757,7 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
                 allow_mutations,
                 Some(stop.as_ref()),
                 Some((
-                    &format!("{}/api/agent/model/v1", options.chat_url),
+                    &project_model_url(&options.chat_url),
                     &options.token,
                     &task_id,
                     connection_id,
@@ -961,8 +1023,9 @@ pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), Str
 mod tests {
     use super::{
         bounded_task_workspace, changed_file_events, connection_id, harness_completion_content,
-        request_requires_verification, requires_project_file_change, structured_hermes_event,
-        successful_verification, transient_agent_failure, validate_chat_url, workspace_snapshot,
+        project_model_url, request_requires_verification, requires_project_file_change,
+        structured_hermes_event, successful_verification, transient_agent_failure,
+        validate_chat_url, workspace_snapshot,
     };
     use std::fs;
 
@@ -971,6 +1034,18 @@ mod tests {
         assert!(validate_chat_url("https://chat.mundusx.ai/").is_ok());
         assert!(validate_chat_url("http://localhost:8787").is_ok());
         assert!(validate_chat_url("http://chat.mundusx.ai").is_err());
+    }
+
+    #[test]
+    fn production_project_agent_bypasses_the_chat_model_relay() {
+        assert_eq!(
+            project_model_url("https://chat.mundusx.ai"),
+            "https://mundusx.ai/v1"
+        );
+        assert_eq!(
+            project_model_url("http://127.0.0.1:3000"),
+            "http://127.0.0.1:3000/api/agent/model/v1"
+        );
     }
 
     #[test]
@@ -998,6 +1073,12 @@ mod tests {
         ));
         assert!(!requires_project_file_change(
             "Can I ask you something if I wanted to create also an enrollment system here? what are the changes that we need?"
+        ));
+        assert!(!requires_project_file_change(
+            "Which folder did you create this?"
+        ));
+        assert!(!requires_project_file_change(
+            "Where did you add the enrollment tests?"
         ));
         assert!(requires_project_file_change(
             "Can you create an enrollment system here?"
@@ -1049,13 +1130,17 @@ mod tests {
         let event = structured_hermes_event(
             &serde_json::json!({
                 "type": "skills_selected",
-                "data": {"skills": ["test-driven-development"]}
+                "data": {
+                    "skills": ["test-driven-development"],
+                    "telemetry": {"context_remaining": 24576, "context_length": 32768}
+                }
             }),
             42,
         );
         assert_eq!(event["sequence"], 42);
         assert_eq!(event["event"]["type"], "skills_selected");
         assert_eq!(event["event"]["summary"], "Using test-driven-development");
+        assert_eq!(event["event"]["metadata"]["telemetry"]["context_remaining"], 24576);
     }
 
     #[test]
