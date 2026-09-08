@@ -302,7 +302,7 @@ fn transient_agent_failure(error: &str) -> bool {
 fn requires_project_file_change(prompt: &str) -> bool {
     let value = prompt.trim().to_ascii_lowercase();
     let advisory_opening = [
-        "what ", "why ", "how ", "should ", "do i ", "does ", "is ", "are ",
+        "what ", "which ", "where ", "when ", "who ", "why ", "how ", "should ", "do i ", "does ", "is ", "are ",
         "explain ", "compare ", "recommend ", "can i ask", "could i ask", "may i ask",
         "can i know", "could i know", "may i know",
     ]
@@ -1073,6 +1073,12 @@ mod tests {
         ));
         assert!(!requires_project_file_change(
             "Can I ask you something if I wanted to create also an enrollment system here? what are the changes that we need?"
+        ));
+        assert!(!requires_project_file_change(
+            "Which folder did you create this?"
+        ));
+        assert!(!requires_project_file_change(
+            "Where did you add the enrollment tests?"
         ));
         assert!(requires_project_file_change(
             "Can you create an enrollment system here?"
