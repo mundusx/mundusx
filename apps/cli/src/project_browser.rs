@@ -386,6 +386,49 @@ pub fn execute(root: &Path, request: &Value, mutations: bool) -> Result<Value, S
                 json!({"content": content.chars().take(8000).collect::<String>(), "truncated":content.chars().count() > 8000}),
             )
         }
+        "inspect_file" => {
+            if relative.is_empty() {
+                return Err("Select a file inside the project".into());
+            }
+            let target = path(root, relative, true)?;
+            if !target.exists() {
+                return Ok(json!({"exists": false, "path": relative}));
+            }
+            let content = read_text(&target)?;
+            Ok(
+                json!({"exists": true, "path": relative, "content": content, "bytes": content.len()}),
+            )
+        }
+        "write_file" => {
+            if !mutations || relative.is_empty() {
+                return Err(
+                    "Saving code requires explicit write permission and a file path".into(),
+                );
+            }
+            let content = request["content"].as_str().ok_or("Missing content")?;
+            if content.len() as u64 > LIMIT {
+                return Err("Code files are limited to 128 KB".into());
+            }
+            let target = path(root, relative, true)?;
+            let expected_missing = request["expected_missing"].as_bool().unwrap_or(false);
+            let expected_content = request["expected_content"].as_str();
+            if target.exists() {
+                let current = read_text(&target)?;
+                if expected_missing || expected_content.is_some_and(|expected| expected != current)
+                {
+                    return Err("The file changed after review. Review the current file before saving again".into());
+                }
+            } else if expected_content.is_some() {
+                return Err(
+                    "The file was removed after review. Review the destination before saving again"
+                        .into(),
+                );
+            }
+            let parent = target.parent().ok_or("Invalid project path")?;
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            fs::write(&target, content).map_err(|e| e.to_string())?;
+            Ok(json!({"saved": true, "path": relative, "bytes": content.len()}))
+        }
         "config_read" | "config_write" => {
             let name = match request["section"].as_str().unwrap_or("") {
                 "instructions" => "instructions.md",
@@ -522,6 +565,40 @@ mod tests {
             &root,
             &json!({"operation":"new_file","path":"hello.txt"}),
             true
+        )
+        .is_err());
+        let code = json!({"operation":"write_file","path":"src/main.rs","content":"fn main() {}","expected_missing":true});
+        execute(&root, &code, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "fn main() {}"
+        );
+        assert!(execute(
+            &root,
+            &json!({"operation":"write_file","path":"src/main.rs","content":"changed","expected_missing":true}),
+            true
+        )
+        .is_err());
+        assert!(execute(
+            &root,
+            &json!({"operation":"write_file","path":"src/main.rs","content":"changed","expected_content":"stale"}),
+            true
+        )
+        .is_err());
+        execute(
+            &root,
+            &json!({"operation":"write_file","path":"src/main.rs","content":"changed","expected_content":"fn main() {}"}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "changed"
+        );
+        assert!(execute(
+            &root,
+            &json!({"operation":"write_file","path":"no.txt","content":"x","expected_missing":true}),
+            false
         )
         .is_err());
         fs::remove_dir_all(root).unwrap();
