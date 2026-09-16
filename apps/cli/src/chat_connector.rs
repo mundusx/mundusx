@@ -766,6 +766,15 @@ fn bounded_task_workspace(
     Ok(target)
 }
 
+fn report_journaled(options: &ConnectorOptions, journal: &super::task_journal::TaskJournal,
+    scope: &str, task_id: &str, completion: Value) -> Result<(), String> {
+    journal.prepare(scope, task_id, &completion)?;
+    post_remote(&options.chat_url, &options.token,
+        &format!("/api/agent/connector/tasks/{task_id}/complete"), completion)
+        .map_err(|e| format!("TASK_REPORT_PENDING: {e}"))?;
+    journal.acknowledge(scope, task_id)
+}
+
 fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Result<(), String> {
     let task_id = task["task_id"]
         .as_str()
@@ -825,6 +834,11 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
             }}),
         )?;
         return Ok(());
+    }
+    let journal = super::task_journal::TaskJournal::open(&super::data_dir())?;
+    let journal_scope = format!("{}/{}", options.chat_url.trim_end_matches('/'), connection_id);
+    if let Some(completion) = journal.claim(&journal_scope, task, &task_workspace)? {
+        return report_journaled(options, &journal, &journal_scope, &task_id, completion);
     }
     let before_files = workspace_snapshot(&task_workspace);
     post_task_events(
@@ -903,6 +917,10 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
     let event_batcher = TaskEventBatcher::start(options.clone(), task_id.clone());
     let mut streamed_event_sequence = 1_000_u64;
     let mut stream_hermes_event = |event: Value| {
+        if let Err(error) = journal.boundary(&journal_scope, &task_id, &event) {
+            eprintln!("could not persist tool boundary: {error}");
+            stop.store(true, Ordering::Relaxed);
+        }
         let mapped = structured_hermes_event(&event, streamed_event_sequence);
         streamed_event_sequence += 1;
         event_batcher.push(mapped);
@@ -1091,10 +1109,8 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
                 verified,
                 browser_verified,
             );
-            post_remote(
-                &options.chat_url,
-                &options.token,
-                &format!("/api/agent/connector/tasks/{task_id}/complete"),
+            report_journaled(
+                options, &journal, &journal_scope, &task_id,
                 json!({"status": "completed", "result": {
                     "content": content,
                     "session_id": session_id,
@@ -1107,10 +1123,8 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
             )?;
         }
         Err(error) => {
-            post_remote(
-                &options.chat_url,
-                &options.token,
-                &format!("/api/agent/connector/tasks/{task_id}/complete"),
+            report_journaled(
+                options, &journal, &journal_scope, &task_id,
                 json!({"status": "failed", "error": error, "result": {
                     "session_id": session_id,
                     "changed_files": changed_files,
@@ -1125,12 +1139,32 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
 fn run_and_report(options: &ConnectorOptions, connection_id: &str, task: &Value) {
     if let Err(error) = run_task(options, connection_id, task) {
         eprintln!("local task failed: {error}");
+        // The durable outbox owns reporting. Never turn a successful execution
+        // into a failed task merely because its completion upload timed out.
+        if error.starts_with("TASK_REPORT_PENDING:") { return; }
         if let Some(task_id) = task["task_id"].as_str() {
             let _ = post_remote(&options.chat_url, &options.token,
                 &format!("/api/agent/connector/tasks/{task_id}/complete"),
                 json!({"status":"failed", "error":error}));
         }
     }
+}
+
+fn recover_pending_reports(options: &ConnectorOptions, connection_id: &str, data_dir: &Path) -> Result<(), String> {
+    let journal = super::task_journal::TaskJournal::open(data_dir)?;
+    let scope = format!("{}/{}", options.chat_url.trim_end_matches('/'), connection_id);
+    for (task_id, completion) in journal.pending_reports(&scope)? {
+        // Server ownership and cancellation always take precedence over local history.
+        let state = post_remote(&options.chat_url, &options.token,
+            &format!("/api/agent/connector/tasks/{task_id}/heartbeat"),
+            json!({"connection_id": connection_id}))?;
+        match state["state"].as_str() {
+            Some("running") => report_journaled(options, &journal, &scope, &task_id, completion)?,
+            Some("cancelled" | "completed" | "failed") => journal.acknowledge(&scope, &task_id)?,
+            _ => {} // Wait for a fresh server claim; never execute from the journal alone.
+        }
+    }
+    Ok(())
 }
 
 pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), String> {
@@ -1191,7 +1225,14 @@ pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), Str
         options.chat_url
     );
     let mut worker: Option<thread::JoinHandle<()>> = None;
+    let mut last_recovery = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now);
     loop {
+        if worker.is_none() && last_recovery.elapsed() >= Duration::from_secs(60) {
+            if let Err(error) = recover_pending_reports(&options, &connection_id, data_dir) {
+                eprintln!("local task report remains pending: {error}");
+            }
+            last_recovery = Instant::now();
+        }
         if worker.as_ref().is_some_and(|handle| handle.is_finished()) {
             if let Some(handle) = worker.take() { let _ = handle.join(); }
         }
@@ -1239,6 +1280,53 @@ mod tests {
         validate_chat_url, workspace_snapshot,
     };
     use std::fs;
+
+    #[test]
+    fn completion_upload_failure_survives_restart_and_respects_cancellation() {
+        use super::*;
+        for remote_state in ["running", "cancelled", "completed", "failed"] {
+        let dir = std::env::temp_dir().join(format!("report-recovery-{}", uuid::Uuid::new_v4()));
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let options = ConnectorOptions {
+            chat_url: format!("http://{}", server.server_addr()), token: "test".into(),
+            device_name: "test".into(), workspace: dir.clone(), reauthorize: false, authorize_only: false,
+        };
+        let scope = format!("{}/device", options.chat_url);
+        let handle = std::thread::spawn(move || {
+            let req = server.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert!(req.url().ends_with("/task/complete"));
+            req.respond(tiny_http::Response::from_string("unavailable").with_status_code(503)).unwrap();
+            let req = server.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert!(req.url().ends_with("/task/heartbeat"));
+            req.respond(tiny_http::Response::from_string(json!({"state":remote_state}).to_string())
+                .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())).unwrap();
+            if remote_state == "running" {
+                let mut req = server.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+                assert!(req.url().ends_with("/task/complete"));
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!({"status":"completed"}));
+                req.respond(tiny_http::Response::from_string("{}").with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())).unwrap();
+            }
+            assert!(server.recv_timeout(Duration::from_millis(200)).unwrap().is_none());
+        });
+        {
+            let journal = super::super::task_journal::TaskJournal::open(&dir).unwrap();
+            journal.claim(&scope, &json!({"task_id":"task","session_id":"session"}), &dir).unwrap();
+            let result = report_journaled(&options, &journal, &scope, "task", json!({"status":"completed"}));
+            assert!(result.unwrap_err().starts_with("TASK_REPORT_PENDING:"));
+            assert_eq!(journal.pending_reports(&scope).unwrap().len(), 1);
+        }
+        recover_pending_reports(&options, "device", &dir).unwrap();
+        {
+            let journal = super::super::task_journal::TaskJournal::open(&dir).unwrap();
+            assert!(journal.pending_reports(&scope).unwrap().is_empty());
+        }
+        handle.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn progress_events_are_collected_into_one_bounded_batch() {

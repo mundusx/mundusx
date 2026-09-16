@@ -265,7 +265,7 @@ pub fn run(
             .env("MUNDUSX_HERMES_PROJECT_ROOT", project)
             .env("MUNDUSX_HERMES_WORKSPACE", workspace)
             .env("MUNDUSX_HERMES_PROMPT", prompt)
-            .env("MUNDUSX_HERMES_TASK", mundusx_session_id)
+            .env("MUNDUSX_HERMES_TASK", remote_model.map(|(_, _, task_id, _)| task_id).unwrap_or(mundusx_session_id))
             .env("OPENAI_BASE_URL", base_url)
             .env("OPENAI_API_KEY", token);
         if let Some(session) = saved_session.as_deref() {
@@ -357,6 +357,16 @@ pub fn run(
     });
     let status = loop {
         while let Ok(event) = event_receiver.try_recv() {
+            if event["type"] == "session_started" {
+                if let Some(session) = event["data"]["session_id"].as_str().filter(|s| !s.is_empty()) {
+                    if let Err(error) = save_session(data_dir, mundusx_session_id, session) {
+                        process_group.terminate();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                }
+            }
             if let Some(callback) = event_callback.as_mut() {
                 callback(event);
             }
@@ -533,7 +543,7 @@ mod output_tests {
         assert!(STRUCTURED_BRIDGE.contains("PROJECT_COMPACTION_TOKENS = 16_384"));
         assert!(STRUCTURED_BRIDGE.contains("configure_project_compaction(agent)"));
         assert!(STRUCTURED_BRIDGE.contains("class RecoveryCheckpoint"));
-        assert!(STRUCTURED_BRIDGE.contains("checkpoint.record(name, arguments, result)"));
+        assert!(STRUCTURED_BRIDGE.contains("checkpoint.record(name, arguments, result, call_id)"));
         assert!(STRUCTURED_BRIDGE.contains("answer_stream.reset()"));
         assert!(STRUCTURED_BRIDGE.contains("child_workspace_path"));
         assert!(

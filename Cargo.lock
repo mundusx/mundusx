@@ -980,6 +980,7 @@ dependencies = [
  "libc",
  "mundusx-agent-core",
  "rand_core",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

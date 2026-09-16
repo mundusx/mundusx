@@ -6,6 +6,7 @@ import re
 import sys
 import traceback
 import time
+import threading
 
 
 class AnswerStream:
@@ -67,8 +68,10 @@ class RecoveryCheckpoint:
     def __init__(self, workspace, task_id):
         safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id or "project-task")[:96]
         self.path = os.path.join(workspace, ".hermes", "checkpoints", safe_id + ".json")
+        self.lock = threading.RLock()
         self.previous = self._load()
         self.events = list((self.previous or {}).get("events") or [])
+        self.pending = dict((self.previous or {}).get("pending") or {})
 
     def _load(self):
         try:
@@ -95,46 +98,58 @@ class RecoveryCheckpoint:
             "Recovery checkpoint from an interrupted run. Reconcile these completed "
             "boundaries with the workspace and continue without repeating them: "
             + json.dumps(compact, separators=(",", ":"))
+            + " Pending tool outcomes are UNKNOWN; inspect their effects before retrying: "
+            + json.dumps(self.pending, separators=(",", ":"))
         )
 
     def _write(self, state):
-        directory = os.path.dirname(self.path)
-        os.makedirs(directory, exist_ok=True)
-        payload = {
-            "schema_version": 1,
-            "state": state,
-            "updated_unix_ms": int(time.time() * 1000),
-            "events": self.events[-CHECKPOINT_EVENT_LIMIT:],
-        }
-        temporary = self.path + ".tmp-" + str(os.getpid())
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.path)
+        with self.lock:
+            directory = os.path.dirname(self.path)
+            os.makedirs(directory, exist_ok=True)
+            payload = {
+                "schema_version": 1,
+                "state": state,
+                "updated_unix_ms": int(time.time() * 1000),
+                "events": self.events[-CHECKPOINT_EVENT_LIMIT:],
+                "pending": self.pending,
+            }
+            temporary = self.path + ".tmp-" + str(os.getpid())
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
 
     def start(self):
         self._write("active")
 
-    def record(self, name, arguments, result):
-        target = None
-        if isinstance(arguments, dict):
-            for key in ("path", "file_path", "filename"):
-                value = arguments.get(key)
-                if isinstance(value, str) and value:
-                    target = value[-512:]
-                    break
-        command = arguments.get("command") if isinstance(arguments, dict) else None
-        self.events.append(
-            {
-                "tool": name,
-                "activity": tool_activity(name, arguments),
-                "success": tool_outcome(result, name),
-                "verification": is_verification_command(command),
-                "target": target,
-            }
-        )
-        self._write("active")
+    def begin(self, call_id, name, arguments):
+        with self.lock:
+            self.pending[str(call_id)] = {"tool": name, "activity": tool_activity(name, arguments)}
+            self._write("active")
+
+    def record(self, name, arguments, result, call_id=None):
+        with self.lock:
+            if call_id is not None:
+                self.pending.pop(str(call_id), None)
+            target = None
+            if isinstance(arguments, dict):
+                for key in ("path", "file_path", "filename"):
+                    value = arguments.get(key)
+                    if isinstance(value, str) and value:
+                        target = value[-512:]
+                        break
+            command = arguments.get("command") if isinstance(arguments, dict) else None
+            self.events.append(
+                {
+                    "tool": name,
+                    "activity": tool_activity(name, arguments),
+                    "success": tool_outcome(result, name),
+                    "verification": is_verification_command(command),
+                    "target": target,
+                }
+            )
+            self._write("active")
 
     def finish(self, succeeded):
         self._write("completed" if succeeded else "active")
@@ -307,6 +322,7 @@ def main():
         emit("MUNDUSX_EVENT=", {"type": str(kind), "data": payload})
 
     def tool_start_callback(call_id, name, arguments):
+        checkpoint.begin(call_id, name, arguments)
         answer_stream.flush()
         answer_stream.reset()
         command = arguments.get("command") if isinstance(arguments, dict) else None
@@ -329,7 +345,7 @@ def main():
             selected_skills.append(skill)
             emit("MUNDUSX_EVENT=", {"type": "skills_selected", "data": {"skills": [skill]}})
         command = arguments.get("command") if isinstance(arguments, dict) else None
-        checkpoint.record(name, arguments, result)
+        checkpoint.record(name, arguments, result, call_id)
         emit(
             "MUNDUSX_EVENT=",
             {
@@ -381,6 +397,8 @@ def main():
         skip_memory=True,
         load_soul_identity=False,
     )
+    emit("MUNDUSX_EVENT=", {"type": "session_started", "data": {
+        "session_id": getattr(agent, "session_id", None) or session_id}})
     configure_project_compaction(agent)
     try:
         result = agent.run_conversation(

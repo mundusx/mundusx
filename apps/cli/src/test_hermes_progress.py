@@ -54,6 +54,33 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(Agent.context_compressor.threshold_tokens, PROJECT_COMPACTION_TOKENS)
         self.assertFalse(configure_project_compaction(object()))
 
+    def test_shutdown_during_tool_preserves_unknown_outcome(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as workspace:
+            checkpoint = RecoveryCheckpoint(workspace, "task")
+            checkpoint.start()
+            checkpoint.begin("call-1", "write_file", {"path": "server.js"})
+            restarted = RecoveryCheckpoint(workspace, "task")
+            self.assertIn("UNKNOWN", restarted.recovery_note())
+            self.assertIn("call-1", restarted.pending)
+            restarted.record("write_file", {"path": "server.js"}, {"bytes_written": 12}, "call-1")
+            self.assertEqual(RecoveryCheckpoint(workspace, "task").pending, {})
+
+    def test_parallel_tool_boundaries_are_atomic(self):
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as workspace:
+            checkpoint = RecoveryCheckpoint(workspace, "parallel")
+            checkpoint.start()
+            def tool(i):
+                checkpoint.begin(str(i), "write_file", {"path": str(i)})
+                checkpoint.record("write_file", {"path": str(i)}, {"bytes_written": 1}, str(i))
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(tool, range(16)))
+            restored = RecoveryCheckpoint(workspace, "parallel")
+            self.assertEqual(restored.pending, {})
+            self.assertEqual(len(restored.events), 16)
+
     def test_skill_progress_requires_actual_success(self):
         self.assertEqual(loaded_skill("skill_view", '{"success":true,"name":"debugging"}'), "debugging")
         for result in [{"success": False, "name": "debugging"}, {"name": "debugging"}, {"success": True, "name": "debugging", "error": "failed"}, "bad json"]:

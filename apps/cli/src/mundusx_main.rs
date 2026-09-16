@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod chat_connector;
+mod task_journal;
 mod hermes_adapter;
 mod project_model_proxy;
 
@@ -22,6 +23,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect the last 100 locally journaled connector tasks (no execution)
+    Tasks,
     /// Run a task with the local MundusX agent
     Run {
         prompt: String,
@@ -501,6 +504,10 @@ fn manage_agent(command: AgentCommands) -> Result<(), String> {
 
 fn main() {
     let result = match Cli::parse().command {
+        Commands::Tasks => task_journal::TaskJournal::open(&data_dir()).and_then(|journal| {
+            println!("{}", serde_json::to_string_pretty(&journal.list()?).map_err(|e| e.to_string())?);
+            Ok(())
+        }),
         Commands::Run {
             prompt,
             runtime,
