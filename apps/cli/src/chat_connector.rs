@@ -1,4 +1,6 @@
 use serde_json::{json, Value};
+#[path = "project_browser.rs"]
+mod project_browser;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ impl Drop for ConnectorInstance {
 }
 
 #[cfg(windows)]
-fn acquire_connector_instance() -> Result<ConnectorInstance, String> {
+fn acquire_connector_instance(_data_dir: &Path) -> Result<ConnectorInstance, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
@@ -79,11 +81,21 @@ fn acquire_connector_instance() -> Result<ConnectorInstance, String> {
     Ok(ConnectorInstance(handle))
 }
 
-#[cfg(not(windows))]
-fn acquire_connector_instance() -> Result<(), String> {
-    Ok(())
+#[cfg(unix)]
+fn acquire_connector_instance(data_dir: &Path) -> Result<fs::File, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::create_dir_all(data_dir).map_err(|e| format!("could not create connector directory: {e}"))?;
+    let file = fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+        .open(data_dir.join("connector.lock")).map_err(|e| format!("could not open connector lock: {e}"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("the MundusX Chat connector is already running or its lock is unavailable".into());
+    }
+    // The OS releases the advisory lock on exit, including crashes. Never unlink it.
+    Ok(file)
 }
 
+#[derive(Clone)]
 pub struct ConnectorOptions {
     pub chat_url: String,
     pub token: String,
@@ -372,7 +384,7 @@ fn sanitized_events(session_id: &str) -> Vec<Value> {
             "model_requested" => json!({"provider": data["provider"], "model": data["model"]}),
             "tool_proposed" => json!({"tool": data["tool"]}),
             "approval_resolved" => json!({"approved": data["approved"]}),
-            "tool_completed" => json!({"is_error": data["is_error"]}),
+            "tool_completed" => json!({"tool": data["tool"], "is_error": data["is_error"]}),
             "context_compacted" => json!({"original_chars": data["original_chars"], "retained_chars": data["retained_chars"]}),
             "skill_loaded" => json!({"name": data["name"]}),
             "task_delegated" => json!({"destination": data["destination"]}),
@@ -382,13 +394,16 @@ fn sanitized_events(session_id: &str) -> Vec<Value> {
     }).collect()
 }
 
-fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
+pub(crate) fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
     let raw_type = item["type"].as_str().unwrap_or("agent_progress");
     let event_type = match raw_type {
         "tool_start" | "tool_started" => "tool_started",
         "tool_complete" | "tool_completed" => "tool_completed",
         "model_start" | "model_requested" => "model_requested",
         "model_complete" | "model_completed" => "model_turn_completed",
+        "model_response_received" => "model_turn_completed",
+        "model_failed" => "model_failed",
+        "assistant_snapshot" => "assistant_snapshot",
         "skills_selected" => "skills_selected",
         "skills_unavailable" => "skills_unavailable",
         _ => "agent_progress",
@@ -400,22 +415,45 @@ fn structured_hermes_event(item: &Value, sequence: u64) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let activity = item["data"]["activity"].as_str().unwrap_or("");
+    let action = match activity {
+        "skill_discovery" => "Finding relevant Hermes skills",
+        "skill_load" => "Loading Hermes skill instructions",
+        "build" => "Building the project",
+        "test" => "Running tests",
+        "lint" => "Checking code quality",
+        "dependencies" => "Installing project dependencies",
+        "run" => "Running the program",
+        "write" => "Updating project files",
+        "inspect" => "Inspecting the codebase",
+        "research" => "Looking up information",
+        "command" => "Running a local command",
+        _ => "Running a project tool",
+    };
+    let success = item["data"]["success"].as_bool();
     json!({
         "sequence": sequence,
         "event": {
             "type": event_type,
             "summary": match tool {
+                _ if event_type == "tool_started" && !activity.is_empty() => action.to_string(),
+                _ if event_type == "tool_completed" && !activity.is_empty() => format!("{} — {}", action, match success {Some(true)=>"succeeded",Some(false)=>"failed",None=>"finished"}),
                 Some(name) if event_type == "tool_started" => format!("Running {name}"),
-                Some(name) if event_type == "tool_completed" => format!("Completed {name}"),
+                Some(name) if event_type == "tool_completed" => format!("{} — {}", name, if success == Some(false) {"failed"} else {"finished"}),
                 _ if event_type == "skills_selected" && !skills.is_empty() => format!(
                     "Using {}",
                     skills.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
                 ),
                 _ if event_type == "model_requested" => "Asking the model for the next step".to_string(),
-                _ if event_type == "model_turn_completed" => "Model step completed".to_string(),
+                _ if event_type == "model_turn_completed" => "Model response received".to_string(),
+                _ if event_type == "model_failed" => "Model connection failed".to_string(),
                 _ => "Hermes is working".to_string(),
             },
-            "metadata": {"tool": tool, "skills": skills, "source_type": raw_type}
+            "metadata": {"tool": tool, "skills": skills, "source_type": raw_type,
+                "activity": activity, "success": success, "verification": item["data"]["verification"].as_bool(),
+                "call_id": item["data"]["call_id"].as_str(),
+                "text": if event_type == "assistant_snapshot" { item["data"]["text"].as_str() } else { None },
+                "truncated": event_type == "assistant_snapshot" && item["data"]["truncated"].as_bool().unwrap_or(false)}
         }
     })
 }
@@ -632,6 +670,16 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
     let task_workspace =
         bounded_task_workspace(&options.workspace, workspace_relative, allow_mutations)?;
 
+    if let Some(body) = prompt.strip_prefix(project_browser::PREFIX) {
+        if workspace_relative.is_none() { return Err("Project operations require a project".into()); }
+        let request: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        let result = project_browser::execute(&task_workspace, &request, allow_mutations)?;
+        post_remote(&options.chat_url, &options.token,
+            &format!("/api/agent/connector/tasks/{task_id}/complete"),
+            json!({"status": "completed", "result": result}))?;
+        return Ok(());
+    }
+
     // Project creation is a filesystem operation, not a model turn.  Keeping it
     // in the connector protocol makes the browser wait for proof that the
     // directory exists instead of optimistically creating browser-only state.
@@ -697,6 +745,7 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
             }
         })
         .unwrap_or_else(|| prompt.clone());
+    let bounded_prompt = format!("{}\n\n{}", project_browser::guidance(&task_workspace)?, bounded_prompt);
     let stop = Arc::new(AtomicBool::new(false));
     let heartbeat_stop = Arc::clone(&stop);
     let heartbeat_url = options.chat_url.clone();
@@ -918,8 +967,19 @@ fn run_task(options: &ConnectorOptions, connection_id: &str, task: &Value) -> Re
     Ok(())
 }
 
+fn run_and_report(options: &ConnectorOptions, connection_id: &str, task: &Value) {
+    if let Err(error) = run_task(options, connection_id, task) {
+        eprintln!("local task failed: {error}");
+        if let Some(task_id) = task["task_id"].as_str() {
+            let _ = post_remote(&options.chat_url, &options.token,
+                &format!("/api/agent/connector/tasks/{task_id}/complete"),
+                json!({"status":"failed", "error":error}));
+        }
+    }
+}
+
 pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), String> {
-    let _instance = acquire_connector_instance()?;
+    let _instance = acquire_connector_instance(data_dir)?;
     fs::create_dir_all(&options.workspace)
         .map_err(|error| format!("could not create connector workspace: {error}"))?;
     save_workspace(data_dir, &options.workspace)?;
@@ -954,6 +1014,8 @@ pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), Str
             "device_name": options.device_name,
             "capabilities": {
                 "protocol": "mundusx-agent-bridge/v1",
+                "project_browser": true,
+                "project_git": true,
                 "client_version": option_env!("MUNDUSX_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
                 "mutations": false,
                 "agent_runtimes": runtimes,
@@ -973,28 +1035,25 @@ pub fn connect(mut options: ConnectorOptions, data_dir: &Path) -> Result<(), Str
         "Connected local MundusX agent to {}. Press Ctrl+C to stop.",
         options.chat_url
     );
+    let mut worker: Option<thread::JoinHandle<()>> = None;
     loop {
+        if worker.as_ref().is_some_and(|handle| handle.is_finished()) {
+            if let Some(handle) = worker.take() { let _ = handle.join(); }
+        }
         match post_remote(
             &options.chat_url,
             &options.token,
             "/api/agent/connector/tasks/next",
-            json!({"connection_id": connection_id}),
+            json!({"connection_id": connection_id, "project_requests_only": worker.is_some()}),
         ) {
             Ok(payload) if !payload["task"].is_null() => {
-                if let Err(error) = run_task(&options, &connection_id, &payload["task"]) {
-                    eprintln!("local task failed: {error}");
-                    // Failures during workspace validation happen before
-                    // run_task's normal completion path. Report them so the
-                    // server does not lease and reclaim the same poisoned task
-                    // forever while Chat keeps displaying "working".
-                    if let Some(task_id) = payload["task"]["task_id"].as_str() {
-                        let _ = post_remote(
-                            &options.chat_url,
-                            &options.token,
-                            &format!("/api/agent/connector/tasks/{task_id}/complete"),
-                            json!({"status": "failed", "error": error}),
-                        );
-                    }
+                let task = payload["task"].clone();
+                if task["prompt"].as_str().unwrap_or("").starts_with(project_browser::PREFIX) {
+                    run_and_report(&options, &connection_id, &task);
+                } else {
+                    let task_options = options.clone();
+                    let task_connection = connection_id.clone();
+                    worker = Some(thread::spawn(move || run_and_report(&task_options, &task_connection, &task)));
                 }
             }
             Ok(_) => thread::sleep(Duration::from_secs(2)),
@@ -1014,6 +1073,20 @@ mod tests {
         successful_verification, transient_agent_failure, validate_chat_url, workspace_snapshot,
     };
     use std::fs;
+
+    #[test]
+    fn progress_preserves_observed_outcomes_without_command_contents() {
+        let event = structured_hermes_event(&serde_json::json!({"type":"tool_completed","data":{
+            "tool":"terminal", "activity":"test", "verification":true, "success":false,
+            "call_id":"step-a", "command":"secret command", "output":"private output"
+        }}), 4);
+        assert_eq!(event["event"]["metadata"]["success"], false);
+        assert_eq!(event["event"]["metadata"]["verification"], true);
+        assert_eq!(event["event"]["metadata"]["activity"], "test");
+        assert!(event["event"]["summary"].as_str().unwrap().contains("failed"));
+        assert!(!event.to_string().contains("secret command"));
+        assert!(!event.to_string().contains("private output"));
+    }
 
     #[test]
     fn watchdog_allows_normal_requests_and_retries_but_detects_stalls() {
@@ -1055,6 +1128,18 @@ mod tests {
                 .env(MODE, mode).status().unwrap();
             assert_eq!(status.code(), Some(expected));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connector_lock_prevents_duplicates_and_releases_on_exit() {
+        let dir = std::env::temp_dir().join(format!("mx-lock-{}", uuid::Uuid::new_v4()));
+        let first = super::acquire_connector_instance(&dir).unwrap();
+        assert!(super::acquire_connector_instance(&dir).is_err());
+        drop(first);
+        let second = super::acquire_connector_instance(&dir).unwrap();
+        drop(second);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
