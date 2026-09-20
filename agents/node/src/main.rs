@@ -26,6 +26,8 @@ use storage::{
     save_agent_config, save_agent_state, save_heartbeat, AgentConfig,
 };
 
+const TOOL_CAPABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "opengpu-agent",
@@ -1831,6 +1833,11 @@ fn refresh_contributed_tool_capability(config: &mut AgentConfig) -> bool {
     let Some(cluster) = config.contributed_cluster.as_mut() else {
         return false;
     };
+    // A successful probe is persisted. Do not spend inference tokens probing a
+    // capability that this agent has already verified.
+    if cluster.supports_tool_calls {
+        return false;
+    }
     let Some(model) = cluster
         .model
         .clone()
@@ -1899,6 +1906,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             eprintln!("failed to persist contributed tool capability: {error}");
         }
     }
+    let mut last_tool_capability_refresh = Instant::now();
     let identity = load_identity_or_exit();
     let runtime_parallel_slots = worker_readiness(&config).0.parallel_slots;
     let mut persistent_runtime = if json || !should_keep_runtime_warm(&config) {
@@ -2012,7 +2020,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
 
     loop {
         thread::sleep(Duration::from_secs(interval));
-        let latest_config = match load_agent_config() {
+        let mut latest_config = match load_agent_config() {
             Ok(Some(config)) => config,
             Ok(None) => {
                 eprintln!("agentStop: config missing; cooling persistent runtime");
@@ -2029,6 +2037,24 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
                 break;
             }
         };
+        if last_tool_capability_refresh.elapsed() >= TOOL_CAPABILITY_REFRESH_INTERVAL {
+            if refresh_contributed_tool_capability(&mut latest_config) {
+                match save_agent_config(&latest_config) {
+                    Ok(_) => println!("nativeToolCapability: verified"),
+                    Err(error) => {
+                        eprintln!("failed to persist contributed tool capability: {error}")
+                    }
+                }
+            } else if verbose
+                && latest_config
+                    .contributed_cluster
+                    .as_ref()
+                    .is_some_and(|cluster| !cluster.supports_tool_calls)
+            {
+                println!("nativeToolCapability: probe pending; retrying later");
+            }
+            last_tool_capability_refresh = Instant::now();
+        }
         if !should_agent_run(&latest_config) {
             let heartbeat = build_heartbeat(&latest_config);
             let _ = save_agent_state(&heartbeat);
