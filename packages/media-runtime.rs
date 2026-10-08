@@ -3,6 +3,8 @@ mod operation_progress;
 // Embedded media helper used by the CLI and local node worker.
 #[path = "contribution-memory.rs"]
 pub mod memory;
+#[path = "media-drain.rs"]
+pub mod drain;
 use serde_json::Value;
 use std::fs;
 use std::io::IsTerminal;
@@ -189,7 +191,7 @@ fn profile_verification_with_memory(
     let matches = value["profile_hash"].as_str() == Some(&hash)
         && value["cap_percent"].as_u64() == Some(u64::from(cap))
         && endpoint_matches
-        && !home.join("media/active-container.json").exists()
+        && (!home.join("media/active-container.json").exists() || drain::resident(home))
         && !home.join("media/active-native.json").exists();
     if !matches {
         value["ready"] = Value::Bool(false);

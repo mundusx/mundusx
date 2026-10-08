@@ -67,6 +67,13 @@ jobs:
           cargo test -p opengpu --bin opengpu lightning_queue_jobs_support_every_integer_duration --target "${TARGET}"
           python3 -m unittest workers.media.test_runtime.ProgressStageTests.test_lightning_durations_cover_one_through_ten_seconds
 
+      - name: Test persistent media lifecycle
+        run: |
+          python3 -m unittest workers.media.test_persistent_runtime
+          cargo test -p opengpu-node-agent --bin opengpu-node-agent media_drain --target "${TARGET}" -- --test-threads=1
+          cargo test -p opengpu-node-agent --bin opengpu-node-agent media_heartbeat --target "${TARGET}" -- --test-threads=1
+          cargo test -p opengpu --bin opengpu serving_ --target "${TARGET}" -- --test-threads=1
+
       - name: Test private media gateway authentication
         run: |
           cargo test -p mundusx-control-plane-auth --target "${TARGET}"
