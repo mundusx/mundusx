@@ -67,6 +67,16 @@ pub fn run_profile(
     video: bool,
     extra: &[String],
 ) -> Result<(), String> {
+    run_profile_with_owner(home, cap, endpoint, action, video, extra, None)
+}
+
+pub fn run_profile_with_owner(home: &Path, cap: u8, endpoint: Option<&str>, action: &str,
+                              video: bool, extra: &[String], owner: Option<&str>) -> Result<(), String> {
+    if let Some(owner) = owner {
+        if action != "generate" || drain::live_owner(home).as_deref() != Some(owner) {
+            return Err("Media retention requires the current serving lease".into());
+        }
+    }
     let progress = matches!(action, "setup" | "verify" | "generate").then(||
         operation_progress::OperationProgress::start(format!("Media {action}")));
     if matches!(action, "setup" | "verify" | "generate") {
@@ -122,6 +132,8 @@ pub fn run_profile(
         command.env("OPENGPU_MEDIA_HUMAN_PROGRESS", "1");
     }
     command.env("OPENGPU_MEDIA_ACTIVITY", "1");
+    command.env_remove("OPENGPU_MEDIA_PERSISTENT_OWNER");
+    if let Some(owner) = owner { command.env("OPENGPU_MEDIA_PERSISTENT_OWNER", owner); }
     // Strip any caller-supplied credential packet, and inject a saved,
     // endpoint-scoped token only into the upload helper (never a container).
     command.env_remove("OPENGPU_MEDIA_GATEWAY_AUTH");
@@ -242,6 +254,14 @@ pub fn verified_profiles(home: &Path, endpoint: Option<&str>, cap: u8) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retention_packet_requires_live_ownership_and_cannot_reach_upload() {
+        let home = std::env::temp_dir().join(format!("media-owner-{}", uuid::Uuid::new_v4()));
+        for action in ["generate", "upload", "stop"] {
+            assert!(run_profile_with_owner(&home, 80, None, action, false, &[], Some("stale-owner")).is_err());
+        }
+        assert!(!home.exists());
+    }
     #[test]
     fn profile_has_pinned_sources_and_only_image_generation() {
         let profile: Value = serde_json::from_str(PROFILE).unwrap();

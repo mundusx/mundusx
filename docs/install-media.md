@@ -97,8 +97,8 @@ the selected workloads drains the current media job before the worker releases
 its runtime. Stop the contributor before starting a separate vLLM recipe;
 `opengpu media stop` resets the runtime but does not stop queue polling.
 
-The serving worker renews a local lease every five seconds. Its managed container
-exits if renewal stops (at most 120 seconds plus the five-second watchdog poll),
+The serving worker renews a 120-second local lease every five seconds. Its managed
+container checks the lease every five seconds and exits if renewal stops,
 and the agent recovers stale owned containers before allowing an LLM handoff.
 External ComfyUI endpoints, native runtimes, `serve --once`, and standalone local
 generation retain their existing per-request lifecycle. A current node agent is

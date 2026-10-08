@@ -174,14 +174,14 @@ fn cleanup_completed_media(home: &std::path::Path, cleanup: &Value) -> Result<()
     Ok(())
 }
 
-fn execute(server: &str, cfg: &Config, id: &DeviceIdentity, job: &Value) -> Result<(), String> {
+fn execute(server: &str, cfg: &Config, id: &DeviceIdentity, job: &Value, owner: Option<&str>) -> Result<(), String> {
     execute_with(
         cfg,
         job,
         &config::config_dir(),
         server,
         |action, video, extra| {
-            media_runtime::run_profile(
+            media_runtime::run_profile_with_owner(
                 &config::config_dir(),
                 cfg.contribution_percent,
                 if action == "upload" {
@@ -192,6 +192,7 @@ fn execute(server: &str, cfg: &Config, id: &DeviceIdentity, job: &Value) -> Resu
                 action,
                 video,
                 extra,
+                if action == "generate" { owner } else { None },
             )
         },
         |action, body| request(server, id, &cfg.device_id, action, body),
@@ -351,6 +352,7 @@ fn process_stamp(pid: u32) -> Option<String> {
 
 struct WarmRuntime {
     home: PathBuf,
+    owner: String,
     cap: u8,
     stop: Arc<AtomicBool>,
     pulse: Option<thread::JoinHandle<()>>,
@@ -369,13 +371,13 @@ impl WarmRuntime {
         let renewal = |path: &Path, id: &str| atomic_value(path, &json!({"owner":id,"expires_at":now_seconds()+120,
             "pid":std::process::id(),"start_ticks":process_stamp(std::process::id())}));
         renewal(&lease, &owner)?;
-        std::env::set_var("OPENGPU_MEDIA_PERSISTENT_OWNER", &owner);
+        let pulse_owner = owner.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let pulse = thread::spawn(move || {
             while !stopped.load(Ordering::Acquire) {
                 if parent.is_some_and(|pid| process_stamp(pid) != parent_stamp) { break; }
-                if let Err(e) = renewal(&lease, &owner) { eprintln!("Media runtime lease: {e}"); break; }
+                if let Err(e) = renewal(&lease, &pulse_owner) { eprintln!("Media runtime lease: {e}"); break; }
                 for _ in 0..5 {
                     if stopped.load(Ordering::Acquire) { return; }
                     thread::sleep(Duration::from_secs(1));
@@ -384,7 +386,7 @@ impl WarmRuntime {
             // Revoking the file lets the in-container watchdog release GPU memory.
             let _ = fs::remove_file(&lease);
         });
-        Ok(Self {home:home.into(),cap,stop,pulse:Some(pulse)})
+        Ok(Self {home:home.into(),owner,cap,stop,pulse:Some(pulse)})
     }
 }
 impl Drop for WarmRuntime {
@@ -395,7 +397,6 @@ impl Drop for WarmRuntime {
             eprintln!("Media runtime cleanup: {e}; LLM handoff remains blocked until recovery");
         }
         let _ = fs::remove_file(self.home.join("media/lifecycle/lease.json"));
-        std::env::remove_var("OPENGPU_MEDIA_PERSISTENT_OWNER");
     }
 }
 
@@ -428,8 +429,6 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     lock.try_lock()
         .map_err(|_| "A media worker is already running")?;
-    // Never accept an inherited retention token from a previous worker instance.
-    std::env::remove_var("OPENGPU_MEDIA_PERSISTENT_OWNER");
     let initial = config::load_config().map_err(|e| e.to_string())?.ok_or("Missing contributor configuration")?;
     let warm = if !once && warm_eligible(&initial) {
         Some(WarmRuntime::start(&home, initial.contribution_percent)?)
@@ -529,7 +528,7 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
                     }
                 }
             });
-            let result = execute(&server, &cfg, &id, job);
+            let result = execute(&server, &cfg, &id, job, warm.as_ref().map(|runtime| runtime.owner.as_str()));
             done.store(true, Ordering::Relaxed);
             let _ = thread.join();
             if let Err(e) = result {
