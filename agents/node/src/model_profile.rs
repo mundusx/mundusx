@@ -10,7 +10,7 @@ model, tokenizer = load(sys.argv[1])
 prompt = tokenizer.apply_chat_template([{"role":"user","content":sys.argv[2]}], tokenize=False, add_generation_prompt=True)
 print(generate(model, tokenizer, prompt=prompt, max_tokens=int(sys.argv[3]),
     sampler=make_sampler(temp=float(sys.argv[4]), top_p=float(sys.argv[5]), top_k=20),
-    logits_processors=make_logits_processors(repetition_penalty=1.05, repetition_context_size=512), verbose=False))
+    logits_processors=make_logits_processors(repetition_penalty=1.1, repetition_context_size=512), verbose=False))
 "#;
 
 pub fn is_qwen3_coder(model: &str) -> bool {
@@ -47,6 +47,9 @@ pub fn apply(model: &str, payload: &mut Value) {
 /// MLX otherwise penalizes only the last 20 tokens, missing longer source loops.
 /// Keep this runtime-specific option away from vLLM/llama OpenAI endpoints.
 pub fn apply_mlx(model: &str, payload: &mut Value) {
+    if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
+        payload["repetition_penalty"] = json!(1.1);
+    }
     apply(model, payload);
     if is_qwen3_coder(model) && payload.get("repetition_context_size").is_none_or(Value::is_null) {
         payload["repetition_context_size"] = json!(512);
@@ -61,8 +64,10 @@ mod tests {
         let model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit";
         let mut mlx = json!({}); apply_mlx(model, &mut mlx);
         assert_eq!(mlx["repetition_context_size"], 512);
-        let mut explicit = json!({"repetition_context_size":64}); apply_mlx(model, &mut explicit);
+        assert_eq!(mlx["repetition_penalty"], 1.1);
+        let mut explicit = json!({"repetition_context_size":64,"repetition_penalty":1.0}); apply_mlx(model, &mut explicit);
         assert_eq!(explicit["repetition_context_size"], 64);
+        assert_eq!(explicit["repetition_penalty"], 1.0);
         let mut other_runtime = json!({}); apply(model, &mut other_runtime);
         assert!(other_runtime.get("repetition_context_size").is_none());
         let mut unknown = json!({}); apply_mlx("unknown", &mut unknown);
