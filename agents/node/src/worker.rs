@@ -2340,7 +2340,7 @@ fn run_vllm_completion(
     max_tokens: u32,
     temperature: f32,
     top_p: f32,
-    seed: u64,
+    seed: Option<u64>,
     structured: bool,
 ) -> Result<String, String> {
     let mut messages = Vec::new();
@@ -2360,8 +2360,11 @@ fn run_vllm_completion(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
-        "seed": seed,
     });
+    // MLX disables batching for seeded requests. Keep seeds opt-in.
+    if let Some(seed) = seed {
+        payload["seed"] = serde_json::json!(seed);
+    }
     let live_stream = live_delta_enabled() && !structured;
     // Muse's template defaults to high reasoning, even for a simple greeting.
     // This completion path is ordinary chat; native tool turns use their own path.
@@ -2453,6 +2456,25 @@ fn native_request_requires_tools(request: &WorkerLaunchRequest) -> bool {
 #[cfg(test)]
 mod structured_image_tests {
     use super::*;
+    #[test]
+    fn openai_chat_seed_is_optional_and_explicit_seed_is_preserved() {
+        for seed in [None, Some(42)] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.server_addr());
+            let handler = std::thread::spawn(move || {
+                let mut request = server.recv().unwrap();
+                let payload: serde_json::Value = serde_json::from_reader(request.as_reader()).unwrap();
+                assert_eq!(payload.get("seed").and_then(serde_json::Value::as_u64), seed);
+                assert_eq!(payload.get("seed").is_some(), seed.is_some());
+                request.respond(tiny_http::Response::from_string(serde_json::json!({
+                    "choices":[{"message":{"content":"Hello!"},"finish_reason":"stop"}]
+                }).to_string())).unwrap();
+            });
+            assert_eq!(super::run_openai_compatible_completion(&url, "qwen3-coder", "", "hello", 64, 0.7, 0.8, seed, false).unwrap(), "Hello!");
+            handler.join().unwrap();
+        }
+    }
+
     #[test]
     fn image_transport_does_not_grant_unverified_tool_calls() {
         let make=|body:serde_json::Value| WorkerLaunchRequest {
@@ -2852,7 +2874,7 @@ fn run_openai_compatible_completion(
     max_tokens: u32,
     temperature: f32,
     top_p: f32,
-    seed: u64,
+    seed: Option<u64>,
     structured: bool,
 ) -> Result<String, String> {
     match run_vllm_completion(
@@ -3616,7 +3638,7 @@ fn run_llama_request(
                 format!("System:\n{system_prompt}\n\nUser:\n{}", request.prompt)
             };
             let attempt_temperature = if attempt == 0 { temperature } else { 0.0 };
-            let attempt_seed = seed.saturating_add(attempt as u64);
+            let attempt_seed = request.seed.map(|value| value.saturating_add(attempt as u64));
             let warm_result = configured_mlx_server_url()
                 .as_deref()
                 .filter(|url| mlx_server_health_ok(url))
@@ -3798,7 +3820,7 @@ fn run_vllm_request(request: &WorkerLaunchRequest) -> Result<WorkerLaunchRespons
         .ok_or_else(|| "vLLM jobs require an explicit model".to_string())?;
     let max_tokens = request.max_tokens.unwrap_or(16).max(1);
     let (temperature, top_p) = crate::model_profile::sampling(model, request.temperature, request.top_p);
-    let seed = request.seed.unwrap_or(42);
+    let seed = request.seed;
     let speakai = is_speakai_request(request);
     let attempts = if speakai { SPEAKAI_MAX_ATTEMPTS } else { 1 };
     let base_system_prompt = effective_system_prompt(request);
@@ -3814,7 +3836,7 @@ fn run_vllm_request(request: &WorkerLaunchRequest) -> Result<WorkerLaunchRespons
         } else {
             temperature
         };
-        let attempt_seed = seed.saturating_add(attempt as u64);
+        let attempt_seed = seed.map(|value| value.saturating_add(attempt as u64));
         let generated = run_openai_compatible_completion(
             &url,
             model,
@@ -3842,7 +3864,7 @@ fn run_vllm_request(request: &WorkerLaunchRequest) -> Result<WorkerLaunchRespons
                     worker_id: format!("worker-{}", uuid::Uuid::new_v4().simple()),
                     status: "completed".to_string(),
                     output: format!(
-                        "vLLM mode=persistent-warm; model={model}; max_tokens={max_tokens}; temperature={attempt_temperature}; top_p={top_p}; seed={attempt_seed}{validation}; response={generated}"
+                        "vLLM mode=persistent-warm; model={model}; max_tokens={max_tokens}; temperature={attempt_temperature}; top_p={top_p}; seed={attempt_seed:?}{validation}; response={generated}"
                     ),
                     error: None,
                     backend: Backend::Vllm,
@@ -3924,7 +3946,7 @@ fn run_contributed_cluster_request(
 
     let max_tokens = request.max_tokens.unwrap_or(16).max(1);
     let (temperature, top_p) = crate::model_profile::sampling(model, request.temperature, request.top_p);
-    let seed = request.seed.unwrap_or(42);
+    let seed = request.seed;
     let attempts = if speakai { SPEAKAI_MAX_ATTEMPTS } else { 1 };
     let base_system_prompt = effective_system_prompt(request);
     let mut last_validation_error = None;
@@ -3939,7 +3961,7 @@ fn run_contributed_cluster_request(
         } else {
             temperature
         };
-        let attempt_seed = seed.saturating_add(attempt as u64);
+        let attempt_seed = seed.map(|value| value.saturating_add(attempt as u64));
         let generated = run_openai_compatible_completion(
             cluster.base_url.trim_end_matches('/'),
             model,
@@ -3967,7 +3989,7 @@ fn run_contributed_cluster_request(
                     worker_id: format!("worker-{}", uuid::Uuid::new_v4().simple()),
                     status: "completed".to_string(),
                     output: format!(
-                        "contributed-cluster kind={}; endpoint={}; model={model}; max_tokens={max_tokens}; temperature={attempt_temperature}; top_p={top_p}; seed={attempt_seed}{validation}; response={generated}",
+                        "contributed-cluster kind={}; endpoint={}; model={model}; max_tokens={max_tokens}; temperature={attempt_temperature}; top_p={top_p}; seed={attempt_seed:?}{validation}; response={generated}",
                         cluster.kind, cluster.base_url
                     ),
                     error: None,
@@ -4529,7 +4551,7 @@ mod tests {
                 }
             });
             let model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit";
-            assert_eq!(super::run_openai_compatible_completion(&url, model, "", "hello", 64, 0.7, 0.8, 42, true).unwrap(), "hello");
+            assert_eq!(super::run_openai_compatible_completion(&url, model, "", "hello", 64, 0.7, 0.8, Some(42), true).unwrap(), "hello");
             assert_eq!(super::run_llama_server_completion(&url, model, "", "hello", Backend::Vulkan, 64, 0.7, 0.8, 42, true).unwrap().0, "hello");
             responder.join().unwrap();
         });
@@ -4713,7 +4735,7 @@ mod tests {
             }).to_string())).unwrap();
         });
         assert_eq!(run_vllm_completion(&url, "muse-glimmer",
-            "", "Hello", 128, 0.0, 1.0, 42, false).unwrap(), "Hello!");
+            "", "Hello", 128, 0.0, 1.0, Some(42), false).unwrap(), "Hello!");
         handler.join().unwrap();
     }
 
@@ -4922,7 +4944,7 @@ mod tests {
                 32,
                 0.2,
                 0.9,
-                42,
+                Some(42),
                 false,
             )
             .expect("streaming completion")
