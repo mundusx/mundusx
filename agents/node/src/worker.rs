@@ -1772,6 +1772,9 @@ pub fn start_persistent_runtime(
             return Ok(None);
         };
         if let Ok(python) = probe_mlx_available() {
+            if crate::model_profile::is_qwen3_coder(model_name) {
+                crate::model_profile::verify_mlx_runtime(&python)?;
+            }
             let progress = crate::operation_progress::OperationProgress::start("Starting MLX server: waiting for HTTP endpoint");
             let timeout_seconds = env::var("OPENGPU_MLX_START_TIMEOUT_SECONDS")
                 .ok().and_then(|value| value.parse::<u64>().ok())
@@ -1790,6 +1793,7 @@ pub fn start_persistent_runtime(
                 drop(progress);
                 warm_mlx_runtime(&url, model_name, deadline.saturating_duration_since(Instant::now()))?;
                 env::set_var("OPENGPU_MLX_SERVER_URL", &url);
+                if crate::model_profile::is_qwen3_coder(model_name) { env::set_var("OPENGPU_VERIFIED_MLX_PROFILE_URL", &url); }
                 return Ok(None);
             }
 
@@ -1865,6 +1869,7 @@ pub fn start_persistent_runtime(
                     drop(progress);
                     warm_mlx_runtime(runtime.url(), model_name, deadline.saturating_duration_since(Instant::now()))
                         .map_err(|error| format!("{error}; startup budget {timeout_seconds}s; see {} (override with OPENGPU_MLX_START_TIMEOUT_SECONDS)", log_path.display()))?;
+                    if crate::model_profile::is_qwen3_coder(model_name) { env::set_var("OPENGPU_VERIFIED_MLX_PROFILE_URL", runtime.url()); }
                     return Ok(Some(runtime));
                 }
                 thread::sleep(Duration::from_millis(500));
@@ -3589,6 +3594,31 @@ fn is_llama_diagnostic_line(line: &str) -> bool {
         || line.starts_with('\t')
 }
 
+// Runtime imports and profile checks belong to startup. Child workers inherit
+// the verified endpoint; standalone/batch workers still perform validation.
+fn managed_mlx_profile_verified() -> bool {
+    let url = configured_mlx_server_url();
+    let verified = std::env::var("OPENGPU_VERIFIED_MLX_PROFILE_URL").ok();
+    mlx_profile_verification_matches(url.as_deref(), verified.as_deref())
+}
+
+fn mlx_profile_verification_matches(url: Option<&str>, verified: Option<&str>) -> bool {
+    url.is_some_and(|url| !url.is_empty() && Some(url) == verified)
+}
+
+#[cfg(test)]
+mod profile_verification_regression {
+    #[test]
+    fn reused_runtime_verification_is_endpoint_scoped() {
+        use super::mlx_profile_verification_matches as matches;
+        assert!(matches(Some("http://127.0.0.1:8790"), Some("http://127.0.0.1:8790")));
+        assert!(!matches(Some("http://127.0.0.1:8791"), Some("http://127.0.0.1:8790")));
+        assert!(!matches(Some("http://127.0.0.1:8790"), None));
+        assert!(!matches(None, None));
+        assert!(!matches(Some(""), Some("")));
+    }
+}
+
 fn run_llama_request(
     request: &WorkerLaunchRequest,
     backend: Backend,
@@ -3608,7 +3638,7 @@ fn run_llama_request(
         eprintln!("model-profile=qwen3-coder-instruct-v1; defaults temperature=0.7 top_p=0.8 top_k=20 repetition_penalty=1.05; explicit request settings preserved");
     }
 
-    if backend == Backend::M && crate::model_profile::is_qwen3_coder(&model_name) {
+    if backend == Backend::M && crate::model_profile::is_qwen3_coder(&model_name) && !managed_mlx_profile_verified() {
         crate::model_profile::verify_mlx_runtime(&probe_mlx_available()?)?;
     }
 
