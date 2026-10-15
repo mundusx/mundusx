@@ -2378,7 +2378,11 @@ fn run_vllm_completion(
             payload["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
         }
     }
-    crate::model_profile::apply(model, &mut payload);
+    if configured_mlx_server_url().as_deref() == Some(url) {
+        crate::model_profile::apply_mlx(model, &mut payload);
+    } else {
+        crate::model_profile::apply(model, &mut payload);
+    }
     if structured {
         payload["response_format"] = speakai_response_format();
     }
@@ -2502,7 +2506,11 @@ fn run_native_openai_tool_turn(
     let mut payload: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("native OpenAI tool turn is invalid JSON: {error}"))?;
     payload["model"] = serde_json::Value::String(model.to_string());
-    crate::model_profile::apply(model, &mut payload);
+    if configured_mlx_server_url().as_deref() == Some(url) {
+        crate::model_profile::apply_mlx(model, &mut payload);
+    } else {
+        crate::model_profile::apply(model, &mut payload);
+    }
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
