@@ -1626,6 +1626,7 @@ fn claim_next_job(config: &AgentConfig, identity: &DeviceIdentity) -> Option<Job
     // response. A remote cluster needs more than the generic five-second HTTP
     // timeout to receive that larger payload after the server reserves it.
     let agent = http::request_agent_with_timeouts(CLAIM_CONNECT_TIMEOUT, CLAIM_RESPONSE_TIMEOUT);
+    let claim_started = Instant::now();
     match signed_get_json_with_agent::<JobClaimResponse>(
         &agent,
         &config.control_plane_url,
@@ -1633,7 +1634,10 @@ fn claim_next_job(config: &AgentConfig, identity: &DeviceIdentity) -> Option<Job
         &config.device_id,
         identity,
     ) {
-        Ok(response) => response.job,
+        Ok(response) => {
+            if let Some(job) = response.job.as_ref() { println!("jobTiming: claimed {} http_ms={}", job.job_id, claim_started.elapsed().as_millis()); }
+            response.job
+        },
         Err(error) => {
             eprintln!("controlPlaneClaim: {error}");
             if is_unknown_node_error(&error) {
@@ -1942,9 +1946,11 @@ fn execute_claimed_job(
     // job was claimed. Re-running the full health probe here delays the first
     // response token even though the node is already admitted and ready.
     let worker_result = launch_admitted_worker_process(&config, request, json, delta_sender);
+    println!("jobTiming: worker {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
     if let Some(handle) = relay_handle {
         let _ = handle.join();
     }
+    println!("jobTiming: relay {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
     match worker_result {
         Ok(response) => {
             let completion = build_completion_from_worker_response(
@@ -1952,6 +1958,7 @@ fn execute_claimed_job(
                 started_at.elapsed().as_millis() as u64,
             );
             complete_job(&config, &identity, &completion);
+            println!("jobTiming: complete {} elapsed_ms={}", completion.job_id, started_at.elapsed().as_millis());
         }
         Err(error) => {
             let completion = build_worker_error_completion(
@@ -1991,6 +1998,7 @@ fn reap_finished_jobs(handles: &mut Vec<thread::JoinHandle<()>>) {
 
 fn process_pending_jobs(
     config: &AgentConfig,
+    identity: &DeviceIdentity,
     json: bool,
     verbose: bool,
     continuously_refill_slots: bool,
@@ -1998,7 +2006,8 @@ fn process_pending_jobs(
     heartbeat_snapshot: &Heartbeat,
 ) {
     if !config.contribution.llm_enabled() || media_drain::request(&storage::config_dir()).is_some() || settings_drain::active(&storage::config_dir()) { return; }
-    let identity = load_identity_or_exit();
+    // Reuse the identity loaded at startup rather than visiting secure storage
+    // again on every idle poll. Signing still uses the secure signing path.
     // Health probing can invoke slow external programs such as nvidia-smi and
     // contact a contributed runtime. The heartbeat path already performs those
     // probes and refreshes this policy. Re-probing before every one-second job
@@ -2151,6 +2160,7 @@ fn should_agent_run(config: &AgentConfig) -> bool {
 }
 
 fn clear_runtime_environment() {
+    std::env::remove_var("OPENGPU_VERIFIED_MLX_PROFILE_URL");
     std::env::remove_var("OPENGPU_LLAMA_SERVER_URL");
     std::env::remove_var("OPENGPU_MLX_SERVER_URL");
     std::env::remove_var("OPENGPU_VLLM_URL");
@@ -2328,7 +2338,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
         std::process::exit(2);
     }
     let mut media_worker = if once { None } else { Some(media_process::MediaProcess::start(&config)) };
-    process_pending_jobs(&config, json, verbose, !once, slot_pool.clone(), &heartbeat_snapshot);
+    process_pending_jobs(&config, &identity, json, verbose, !once, slot_pool.clone(), &heartbeat_snapshot);
 
     println!("{}", green(format!("connected {}", config.device_id)));
     println!("press Ctrl-C to stop");
@@ -2339,9 +2349,9 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
 
     loop {
         // Job claims should not wait for the five-second heartbeat cadence.
-        // Keep presence traffic at its normal rate while checking for work once
-        // per second so an idle, warm node starts streaming promptly.
-        thread::sleep(Duration::from_secs(1));
+        // Keep presence traffic at its normal rate while checking for work
+        // every 250 ms so an idle, warm node starts streaming promptly.
+        thread::sleep(Duration::from_millis(250));
         let mut latest_config = match load_agent_config() {
             Ok(Some(config)) => config,
             Ok(None) => {
@@ -2518,6 +2528,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
         if control_plane_blocks_jobs(control_plane_status.as_ref()).is_none() {
             process_pending_jobs(
                 &latest_config,
+                &identity,
                 json,
                 verbose,
                 true,
