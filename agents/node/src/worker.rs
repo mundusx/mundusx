@@ -77,6 +77,33 @@ fn native_chunk_has_token_progress(chunk: &serde_json::Value) -> bool {
                 call["function"][*key].as_str().is_some_and(|s|!s.is_empty()))))
 }
 
+fn validate_native_tool_schema(payload:&serde_json::Value,message:&serde_json::Value)->Result<(),String> {
+    fn check(value:&serde_json::Value,schema:&serde_json::Value,path:&str,depth:usize)->Result<(),String> {
+        if depth>16 {return Err(format!("{path}: schema depth exceeded"));}
+        if let Some(kind)=schema["type"].as_str() {
+            let valid=match kind {"string"=>value.is_string(),"integer"=>value.is_i64()||value.is_u64(),"number"=>value.is_number(),"object"=>value.is_object(),"array"=>value.is_array(),"boolean"=>value.is_boolean(),"null"=>value.is_null(),_=>true};
+            if !valid {return Err(format!("{path}: expected {kind}"));}
+        }
+        if let Some(variants)=schema["enum"].as_array() {if !variants.contains(value) {return Err(format!("{path}: value is outside enum"));}}
+        if let Some(object)=value.as_object() {
+            if let Some(required)=schema["required"].as_array() {for key in required.iter().filter_map(|v|v.as_str()) {if !object.contains_key(key) {return Err(format!("{path}.{key} is required"));}}}
+            if let Some(properties)=schema["properties"].as_object() {for (key,item) in object {if let Some(child)=properties.get(key) {check(item,child,&format!("{path}.{key}"),depth+1)?;}else if schema["additionalProperties"]==false {return Err(format!("{path}.{key}: unexpected property"));}}}
+        }
+        if let Some(items)=value.as_array() {if schema.get("items").is_some_and(|s|s.is_object()) {for item in items {check(item,&schema["items"],path,depth+1)?;}}}
+        if let Some(number)=value.as_f64() {if schema["minimum"].as_f64().is_some_and(|min|number<min)||schema["maximum"].as_f64().is_some_and(|max|number>max) {return Err(format!("{path}: outside numeric bounds"));}}
+        Ok(())
+    }
+    let Some(calls)=message["tool_calls"].as_array() else {return Ok(())};
+    let tools=payload["tools"].as_array().ok_or("native tool schema precondition failed: missing tool catalog")?;
+    for call in calls {
+        let name=call["function"]["name"].as_str().unwrap_or("");
+        let tool=tools.iter().find(|t|t["function"]["name"].as_str()==Some(name)).ok_or_else(||format!("native tool schema precondition failed: unregistered tool {name}"))?;
+        let args:serde_json::Value=serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("")).map_err(|_|"native tool schema precondition failed: malformed arguments")?;
+        check(&args,&tool["function"]["parameters"],name,0).map_err(|e|format!("native tool schema precondition failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn observed_file_key(path:&str)->Option<String> {
     let normalized=path.replace('\\',"/");
     if normalized.split('/').any(|part|part=="..") {return None;}
@@ -90,6 +117,7 @@ fn validate_native_edit_preconditions(payload:&serde_json::Value,message:&serde_
     let Some(tools)=payload["tools"].as_array() else {return Ok(())};
     if !["read_file","list_dir","replace_string_in_file"].iter().all(|name|
         tools.iter().any(|tool|tool["function"]["name"].as_str()==Some(name))) {return Ok(());}
+    validate_native_tool_schema(payload,message)?;
     let Some(calls)=message["tool_calls"].as_array() else {return Ok(())};
     let messages=payload["messages"].as_array().ok_or("native edit precondition failed: missing history")?;
     let start=messages.iter().rposition(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|s|s.contains("<userRequest>"))).map_or(0,|i|i+1);
@@ -2625,7 +2653,7 @@ mod structured_image_tests {
 mod edit_precondition_tests {
     use super::*;
     fn payload()->serde_json::Value {serde_json::json!({"tools":[
-        {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],
+        {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}},{"function":{"name":"create_file"}}],
         "messages":[{"role":"user","content":"<editorContext>D:/sample/models/Student.js</editorContext><userRequest>Fix D:/sample/routes/studentRoutes.js syntax</userRequest>"},
         {"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":"{\"filePath\":\"D:/sample/routes/studentRoutes.js\"}"}}]},
         {"role":"tool","tool_call_id":"read1","content":"router.delete/:id', controller.delete);"}]})}
@@ -2655,6 +2683,18 @@ mod edit_precondition_tests {
         assert!(validate_native_edit_preconditions(&p,&call).unwrap_err().contains("do not recreate"));
         let mut p=payload();p["messages"].as_array_mut().unwrap().truncate(1);
         assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/routes/studentRoutes.js")).is_err());
+    }
+    #[test]
+    fn tool_schema_blocks_missing_required_fields_and_wrong_types() {
+        let p=serde_json::json!({"tools":[{"function":{"name":"read_file","parameters":{
+            "type":"object","required":["filePath","startLine","endLine"],"properties":{
+                "filePath":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer"}
+            }
+        }}}]});
+        let make=|args:serde_json::Value|serde_json::json!({"tool_calls":[{"function":{"name":"read_file","arguments":args.to_string()}}]});
+        assert!(validate_native_tool_schema(&p,&make(serde_json::json!({"filePath":"C:/x.js"}))).unwrap_err().contains("startLine is required"));
+        assert!(validate_native_tool_schema(&p,&make(serde_json::json!({"filePath":"C:/x.js","startLine":"1","endLine":20}))).is_err());
+        assert!(validate_native_tool_schema(&p,&make(serde_json::json!({"filePath":"C:/x.js","startLine":1,"endLine":20}))).is_ok());
     }
     #[test]
     fn only_actual_tokens_count_as_progress_and_empty_results_fail() {
@@ -2749,7 +2789,8 @@ fn run_native_tool_attempts(
             if error.starts_with("native tool arguments are incomplete:")
                 || error.starts_with("native tool call exceeded generation limit")
                 || error.starts_with("native edit tool arguments exceed safe patch size:")
-                || error.starts_with("native edit precondition failed:") =>
+                || error.starts_with("native edit precondition failed:")
+                || error.starts_with("native tool schema precondition failed:") =>
         {
             let messages = payload["messages"]
                 .as_array_mut()
