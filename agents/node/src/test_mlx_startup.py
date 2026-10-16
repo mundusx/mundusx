@@ -13,6 +13,7 @@ class Array:
 class ProgressTests(unittest.TestCase):
     def test_argument_loop_detection_does_not_treat_ordinary_code_as_a_loop(self):
         self.assertTrue(repetitive_tool_tail('<tool_call><function=create_file><parameter=content>' + 'coverage/\n' * 35))
+        self.assertTrue(repetitive_tool_tail('<tool_call><function=create_file><parameter=content>' + ('coverage/lcov-report/*.yml\ncoverage/lcov-report/*.yaml\n' * 10)))
         self.assertTrue(repetitive_tool_tail('<tool_call><function=create_file><parameter=content>' + 'coverage/**/*.' + '*.' * 150))
         self.assertFalse(repetitive_tool_tail('coverage/\n' * 100))
         self.assertFalse(repetitive_tool_tail('<tool_call><function=read_file></function></tool_call>' + 'coverage/\n' * 100))
@@ -62,7 +63,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "version": 4})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "version": 5})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 
