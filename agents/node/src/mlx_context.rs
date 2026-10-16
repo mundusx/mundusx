@@ -7,6 +7,11 @@ use std::{
 };
 
 const GIB: u64 = 1 << 30;
+// Shared across all sessions, in addition to active per-slot KV caches.
+pub fn prompt_cache_bytes(physical_mb:u32, cap:u8)->u64 {
+    let budget = u64::from(physical_mb) * (1 << 20) * u64::from(cap.min(100)) / 100;
+    if budget >= 32 * GIB { 4 * GIB } else { 0 }
+}
 
 pub fn context_tokens(
     model: &ModelCapability,
@@ -162,7 +167,7 @@ fn limit(
         .checked_mul(u64::from(cap.min(100)))?
         / 100;
     // Leave room for prefill activations, allocator overhead and retained prefix cache.
-    let reserve = (4 * GIB).max(weights / 4);
+    let reserve = (4 * GIB).max(weights / 4) + prompt_cache_bytes(physical_mb, cap);
     let remaining = budget.checked_sub(weights)?.checked_sub(reserve)?;
     let memory_limit = remaining / per_token.checked_mul(u64::from(slots.max(1)))?;
     let tokens = maximum
@@ -181,14 +186,23 @@ mod tests {
     #[test]
     fn large_mac_can_fit_an_agent_turn_without_ignoring_parallel_cache_memory() {
         let tokens = limit(&qwen(), 16 * GIB, 65536, 70, 3, None).unwrap();
-        assert!(tokens >= 78443);
+        assert!(tokens >= 65536);
         assert!(tokens < limit(&qwen(), 16 * GIB, 65536, 70, 1, None).unwrap());
         assert!(limit(&qwen(), 16 * GIB, 32768, 70, 3, None).unwrap() < 78443);
+        // The real two-slot 64 GiB / 80% deployment still admits large agent turns.
+        assert!(limit(&qwen(), 16 * GIB, 65536, 80, 2, None).unwrap() >= 78443);
+    }
+    #[test]
+    fn retained_cache_is_disabled_when_the_contribution_budget_is_small() {
+        assert_eq!(prompt_cache_bytes(8192, 50), 0);
+        assert_eq!(prompt_cache_bytes(32768, 80), 0);
+        assert_eq!(prompt_cache_bytes(65536, 30), 0);
+        assert_eq!(prompt_cache_bytes(65536, 80), 4 * GIB);
     }
     #[test]
     fn override_is_clamped_to_model_and_memory_limits() {
         assert_eq!(
-            limit(&qwen(), 16 * GIB, 65536, 70, 3, Some(81920)),
+            limit(&qwen(), 16 * GIB, 65536, 80, 2, Some(81920)),
             Some(81920)
         );
         assert_eq!(

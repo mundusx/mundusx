@@ -9,6 +9,19 @@ PREFIX = "MUNDUSX_LOAD_PROGRESS:"
 BATCH_BYTES = 64 * 1024 * 1024
 
 
+def bounded_prompt_cache(cache_class, max_bytes):
+    """Cap retained prefixes on every insertion, including non-batched requests."""
+    if max_bytes < 0:
+        raise ValueError("Prompt cache byte budget must not be negative")
+
+    class BoundedPromptCache(cache_class):
+        def __init__(self, max_size=2, **kwargs):
+            kwargs["max_bytes"] = min(kwargs.get("max_bytes", max_bytes), max_bytes)
+            super().__init__(max_size=max_size, **kwargs)
+
+    return BoundedPromptCache
+
+
 def leaves(value):
     if isinstance(value, dict):
         for item in value.values():
@@ -46,6 +59,12 @@ def evaluate_weights(evaluate, parameters, report, batch_bytes=BATCH_BYTES):
 def main():
     import mlx.core as mx
     import mlx_lm.utils as utils
+    import mlx_lm.models.cache as cache_module
+
+    cache_module.LRUPromptCache = bounded_prompt_cache(
+        cache_module.LRUPromptCache,
+        int(os.environ["OPENGPU_MLX_PROMPT_CACHE_BYTES"]),
+    )
 
     state = threading.local()
     original_eval = mx.eval
