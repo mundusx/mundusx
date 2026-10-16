@@ -93,14 +93,19 @@ fn validate_native_edit_preconditions(payload:&serde_json::Value,message:&serde_
     let Some(calls)=message["tool_calls"].as_array() else {return Ok(())};
     let messages=payload["messages"].as_array().ok_or("native edit precondition failed: missing history")?;
     let start=messages.iter().rposition(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|s|s.contains("<userRequest>"))).map_or(0,|i|i+1);
+    // Mentioning a path in a negative instruction must not grant edit scope.
     let scoped_files:Vec<String>=start.checked_sub(1).and_then(|i|messages[i]["content"].as_str())
         .and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|(s,_)|s.trim()))
         .filter(|s|["fix ","edit ","update "].iter().any(|prefix|s.to_ascii_lowercase().starts_with(prefix)))
-        .map(|s|s.split_whitespace().filter_map(|word| {
-            let path=word.trim_matches(['\"','\'',',',';','?']).trim_end_matches('.');
+        .and_then(|s| {
+            let tail=s.split_once(' ')?.1.trim_start();
+            let path=if let Some(quote)=tail.chars().next().filter(|c|matches!(c,'"' | '\'' | '`')) {
+                tail[quote.len_utf8()..].split_once(quote)?.0
+            } else {tail.split_whitespace().next()?};
+            let path=path.trim_end_matches(['.',',',';','?']);
             if !path.rsplit(['/', '\\']).next().is_some_and(|name|name.contains('.')) {return None;}
             observed_file_key(path)
-        }).collect()).unwrap_or_default();
+        }).into_iter().collect();
     let mut changed=std::collections::HashSet::new();
     for call in calls {
         let name=call["function"]["name"].as_str().unwrap_or("");
@@ -2624,13 +2629,23 @@ mod edit_precondition_tests {
         "messages":[{"role":"user","content":"<editorContext>D:/sample/models/Student.js</editorContext><userRequest>Fix D:/sample/routes/studentRoutes.js syntax</userRequest>"},
         {"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":"{\"filePath\":\"D:/sample/routes/studentRoutes.js\"}"}}]},
         {"role":"tool","tool_call_id":"read1","content":"router.delete/:id', controller.delete);"}]})}
-    fn edit(path:&str)->serde_json::Value {serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"edit1","function":{"name":"replace_string_in_file","arguments":serde_json::json!({"filePath":path,"oldString":"router.delete/:id', controller.delete);","newString":"router.delete('/:id', controller.delete);"}).to_string()}}]})}
+    fn edit(path:&str)->serde_json::Value {serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"edit1","type":"function","function":{"name":"replace_string_in_file","arguments":serde_json::json!({"filePath":path,"oldString":"router.delete/:id', controller.delete);","newString":"router.delete('/:id', controller.delete);"}).to_string()}}]})}
     #[test]
     fn focus_does_not_authorize_a_different_file_even_after_reading_it() {
         let mut p=payload();
         assert!(validate_native_edit_preconditions(&p,&edit("d:/sample/routes/studentRoutes.js")).is_ok());
         p["messages"][1]["tool_calls"][0]["function"]["arguments"]=serde_json::json!("{\"filePath\":\"D:/sample/models/Student.js\"}");
         assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/models/Student.js")).unwrap_err().contains("outside the explicit files"));
+    }
+    #[test]
+    fn negative_path_mentions_do_not_expand_scope_and_quoted_paths_work() {
+        let mut p=payload();
+        p["messages"][0]["content"]=serde_json::json!("<userRequest>Fix D:/sample/routes/studentRoutes.js syntax. Do not edit D:/sample/models/Student.js</userRequest>");
+        p["messages"][1]["tool_calls"][0]["function"]["arguments"]=serde_json::json!("{\"filePath\":\"D:/sample/models/Student.js\"}");
+        assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/models/Student.js")).is_err());
+        p["messages"][0]["content"]=serde_json::json!("<userRequest>Fix `D:/sample/my routes.js` syntax</userRequest>");
+        p["messages"][1]["tool_calls"][0]["function"]["arguments"]=serde_json::json!("{\"filePath\":\"D:/sample/my routes.js\"}");
+        assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/my routes.js")).is_ok());
     }
     #[test]
     fn unobserved_stale_and_recreated_targets_are_rejected() {
