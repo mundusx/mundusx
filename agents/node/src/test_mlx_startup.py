@@ -1,6 +1,6 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint
+from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser
 from types import SimpleNamespace
 
 
@@ -29,7 +29,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "version": 2})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "version": 3})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 
@@ -44,6 +44,39 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(second.next_tokens([200, 201, 1]), [9])
         with self.assertRaises(ValueError):
             second.next_tokens([200, 201, 1, 8])
+
+    @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
+    def test_complete_qwen_call_survives_trailing_prose_with_exact_typed_arguments(self):
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"properties": {"filePath": {"type": "string"}, "startLine": {"type": "number"}, "endLine": {"type": "number"}}}}}]
+        raw = '<function=read_file>\n<parameter=filePath>\nD:\\sample\\test.js\n</parameter>\n<parameter=startLine>\n1\n</parameter>\n<parameter=endLine>\n15\n</parameter>\n</function>\n Kyle\n'
+        parsed = complete_qwen_call_parser(parse_tool_call)(raw, tools)
+        self.assertEqual(parsed, {"name": "read_file", "arguments": {"filePath": "D:\\sample\\test.js", "startLine": 1, "endLine": 15}})
+        self.assertEqual(complete_qwen_call_parser(parse_tool_call)(raw[:-6], tools), parsed)
+        for invalid in [raw.replace('</function>', ''), raw + '<function=other>', raw + '<function=other></function>', '<function=first><function=second></function> trailing', raw.replace('15', 'not-a-number')]:
+            with self.assertRaises(ValueError):
+                complete_qwen_call_parser(parse_tool_call)(invalid, tools)
+
+    def test_qwen_recovery_never_invents_a_missing_block_or_argument(self):
+        def strict(text, tools):
+            if text != '<function=read></function>':
+                raise ValueError('No function provided')
+            return {"name": "read", "arguments": {}}
+        parser = complete_qwen_call_parser(strict)
+        self.assertEqual(parser('<function=read></function> prose'), {"name": "read", "arguments": {}})
+        for text in ['', 'just prose', '<function=read>', '<function=read></function><parameter=x>', '<function=read></function><function=next>']:
+            with self.assertRaises(ValueError):
+                parser(text)
+
+    def test_other_model_parsers_are_not_changed(self):
+        class Formatter:
+            def __init__(self, parser, tools, streaming=False):
+                self.parser = parser
+        def original(text, tools):
+            return text
+        original.__module__ = 'other_model'
+        install_complete_qwen_parser(SimpleNamespace(ToolCallFormatter=Formatter))
+        self.assertIs(Formatter(original, []).parser, original)
 
     def test_required_tool_openings_are_bounded_and_independent_per_request(self):
         first, second = RequiredToolPrefix([1, 2, 3]), RequiredToolPrefix([1, 2, 3])

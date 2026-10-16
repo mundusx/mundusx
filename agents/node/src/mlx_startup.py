@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import re
 
 PREFIX = "MUNDUSX_LOAD_PROGRESS:"
 BATCH_BYTES = 64 * 1024 * 1024
@@ -96,7 +97,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "version": 2}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "version": 3}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -104,6 +105,36 @@ def install_capabilities_endpoint(server):
         self.wfile.write(payload)
 
     server.APIHandler.do_GET = get
+
+
+def complete_qwen_call_parser(parser):
+    """Keep complete calls when Qwen adds prose after the closing function."""
+    def parse(text, tools=None):
+        matches = list(re.finditer(r"<function=[^<>\s]+>[\s\S]*?</function>", text))
+        if len(matches) != 1:
+            raise ValueError("Expected one complete Qwen function block")
+        match = matches[0]
+        block = match.group(0)
+        if block.count("<function=") != 1 or block.count("<parameter=") != block.count("</parameter>"):
+            raise ValueError("Nested or incomplete Qwen function or parameter blocks")
+        remainder = text[:match.start()] + text[match.end():]
+        if re.search(r"</?(?:function|parameter|tool_call)(?:[=>\s]|$)", remainder):
+            raise ValueError("Incomplete or ambiguous extra Qwen tool markup")
+        # The original schema-aware parser still converts every argument.
+        # Never synthesize missing values, closing tags, or additional calls.
+        return parser(block, tools)
+    return parse
+
+
+def install_complete_qwen_parser(server):
+    original_init = server.ToolCallFormatter.__init__
+
+    def initialize(self, tool_parser, tools, streaming=False):
+        if getattr(tool_parser, "__module__", "").endswith("qwen3_coder"):
+            tool_parser = complete_qwen_call_parser(tool_parser)
+        original_init(self, tool_parser, tools, streaming)
+
+    server.ToolCallFormatter.__init__ = initialize
 
 
 def bounded_prompt_cache(cache_class, max_bytes):
@@ -198,6 +229,7 @@ def main():
     utils.load = measured_load
     import mlx_lm.server as server
     install_required_tool_opening(server, mx)
+    install_complete_qwen_parser(server)
     install_capabilities_endpoint(server)
     server.main()
 
