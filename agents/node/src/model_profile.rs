@@ -47,6 +47,7 @@ pub fn apply(model: &str, payload: &mut Value) {
 /// MLX otherwise penalizes only the last 20 tokens, missing longer source loops.
 /// Keep this runtime-specific option away from vLLM/llama OpenAI endpoints.
 pub fn apply_mlx(model: &str, payload: &mut Value) {
+    if is_qwen3_coder(model) { merge_leading_system_messages(payload); }
     if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
         payload["repetition_penalty"] = json!(1.1);
     }
@@ -65,9 +66,35 @@ pub fn apply_mlx(model: &str, payload: &mut Value) {
     }
 }
 
+// Qwen places its tool catalog after the first system message. Keep consecutive
+// plain system instructions together so changing a fallback tool does not
+// invalidate the much larger stable host-instruction prefix. Never move a
+// message across user/assistant/tool history or discard named later messages.
+fn merge_leading_system_messages(payload: &mut Value) {
+    let Some(messages) = payload["messages"].as_array_mut() else { return; };
+    let count = messages.iter().take_while(|message| message["role"] == "system"
+        && message["content"].is_string()
+        && message.as_object().is_some_and(|object| object.keys().all(|key| matches!(key.as_str(), "role" | "content" | "name")))).count();
+    if count < 2 || messages[1..count].iter().any(|message| message.get("name").is_some()) { return; }
+    let content = messages[..count].iter().map(|message| message["content"].as_str().unwrap()).collect::<Vec<_>>().join("\n\n");
+    messages[0]["content"] = json!(content);
+    messages.drain(1..count);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mlx_preserves_instruction_order_and_keeps_dynamic_tools_after_stable_system_prefix() {
+        let mut body = json!({"messages":[{"role":"system","name":"policy","content":"policy"},{"role":"system","content":"host"},{"role":"system","content":"harness"},{"role":"user","content":"request"},{"role":"system","content":"later"}],"tools":[{"type":"function","function":{"name":"read"}}]});
+        let tools = body["tools"].clone();
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit", &mut body);
+        assert_eq!(body["messages"],json!([{"role":"system","name":"policy","content":"policy\n\nhost\n\nharness"},{"role":"user","content":"request"},{"role":"system","content":"later"}]));
+        assert_eq!(body["tools"],tools);
+        for messages in [json!([{"role":"system","content":[{"type":"text","text":"host"}]},{"role":"user","content":"request"}]),json!([{"role":"system","content":"first"},{"role":"system","name":"separate","content":"second"}])] {
+            let mut payload=json!({"messages":messages});merge_leading_system_messages(&mut payload);assert_eq!(payload["messages"],messages);
+        }
+    }
     #[test]
     fn only_required_mlx_coder_tool_turns_get_the_runtime_requirement() {
         let model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit";
