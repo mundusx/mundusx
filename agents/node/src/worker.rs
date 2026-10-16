@@ -19,6 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1757,6 +1758,7 @@ pub fn start_persistent_runtime(
     model_name: Option<&str>,
     backend: Backend,
     parallel_slots: u8,
+    prompt_cache_bytes: u64,
 ) -> Result<Option<PersistentRuntimeHandle>, String> {
     if env::var("OPENGPU_PERSISTENT_RUNTIME")
         .map(|value| value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("false"))
@@ -1822,13 +1824,14 @@ pub fn start_persistent_runtime(
                 .arg(&wrapper)
                 .env("OPENGPU_MLX_READY_FILE", &ready_file)
                 .env("PYTHONUNBUFFERED", "1")
+                .env("OPENGPU_MLX_PROMPT_CACHE_BYTES", prompt_cache_bytes.to_string())
                 .args([
                     "--model",
                     model_name,
-                    // Retaining ten old long-context KV caches would invalidate
-                    // the per-slot memory budget. Active generation caches remain.
+                    // Reuse tool-turn prefixes; the startup wrapper enforces the
+                    // shared byte budget reserved by mlx_context as well as this count.
                     "--prompt-cache-size",
-                    "0",
+                    "2",
                     "--host",
                     "127.0.0.1",
                     "--port",
@@ -2663,6 +2666,9 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
     let mut assembled = native_stream::NativeStream::default();
     let mut usage = serde_json::Value::Null;
     let mut pending_tools = Vec::new();
+    let mut pending_content = String::new();
+    let mut sent_content = false;
+    let mut last_content_sent = Instant::now();
     let mut reason = None;
     let mut done = false;
     for line in reader.lines() {
@@ -2705,9 +2711,19 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
             // Tool arguments remain private until the entire batch is valid.
             // Prose still streams immediately; recovery must not duplicate it.
             if !retry {
-                if let Some(content) = delta["content"].as_str() {
+                if let Some(content) = delta["content"].as_str().filter(|s| !s.is_empty()) {
                     output.push_str(content);
-                    emit_stream_delta(&serde_json::json!({"content":content}).to_string());
+                    pending_content.push_str(content);
+                    // One signed HTTP relay per token can outlast generation.
+                    // Release the first fragment immediately, then coalesce prose
+                    // without changing or prematurely releasing any tool argument.
+                    if !sent_content || pending_content.len() >= 256
+                        || last_content_sent.elapsed() >= Duration::from_millis(250) {
+                        emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
+                        pending_content.clear();
+                        sent_content = true;
+                        last_content_sent = Instant::now();
+                    }
                 }
             }
         }
@@ -2715,6 +2731,9 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
     record_runtime_usage(&usage);
     if !done || reason.is_none() {
         return Err("native stream ended before terminal event".into());
+    }
+    if !pending_content.is_empty() {
+        emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
     }
     let mut message = assembled.message();
     validate_native_tool_message(&message, reason.as_deref())?;
@@ -4286,6 +4305,18 @@ pub fn launch_worker_with_stream(
     model_dir: &Path,
     delta_sender: Option<mpsc::Sender<String>>,
 ) -> Result<WorkerLaunchResponse, String> {
+    launch_worker_with_control(request, model_dir, delta_sender, None)
+}
+
+pub fn launch_worker_with_control(
+    request: &WorkerLaunchRequest,
+    model_dir: &Path,
+    delta_sender: Option<mpsc::Sender<String>>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<WorkerLaunchResponse, String> {
+    if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("worker assignment was cancelled before execution".into());
+    }
     if !request.operation.is_llm() {
         return Err(format!(
             "unsupported operation {}; media worker is not enabled",
@@ -4388,6 +4419,11 @@ pub fn launch_worker_with_stream(
     let idle_timeout = worker_idle_timeout();
     let hard_timeout = worker_hard_timeout();
     let status = loop {
+        if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            kill_process_tree(child.id());
+            let _ = child.wait();
+            return Err("worker stopped because its assignment was cancelled or replaced".into());
+        }
         while activity_receiver.try_recv().is_ok() {
             last_progress = Instant::now();
         }
@@ -5281,6 +5317,13 @@ mod tests {
             top_p: Some(0.9),
             seed: Some(42),
         }
+    }
+
+    #[test]
+    fn cancelled_assignment_never_starts_a_worker_or_contacts_a_runtime() {
+        let cancelled=Arc::new(AtomicBool::new(true));
+        let error=launch_worker_with_control(&speakai_request(None),Path::new("missing-model-directory"),None,Some(cancelled)).unwrap_err();
+        assert!(error.contains("cancelled before execution"));
     }
 
     #[test]
@@ -6419,6 +6462,21 @@ mod tests {
 #[cfg(test)]
 mod native_delta_tests {
     use super::*;
+    #[test]
+    fn native_prose_is_batched_without_losing_text_or_delaying_the_first_fragment() {
+        let mut wire = String::new();
+        for _ in 0..500 { wire.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"); }
+        wire.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+        let (tx, rx) = mpsc::channel();
+        let final_response = with_stream_delta_sender(Some(tx), || parse_native_openai_stream(std::io::Cursor::new(wire))).unwrap();
+        let events:Vec<serde_json::Value> = rx.try_iter().map(|s| serde_json::from_str(&s).unwrap()).collect();
+        assert!(events.len() <= 4, "500 model fragments should not require 500 HTTP relays");
+        assert_eq!(events[0]["content"], "x");
+        let text:String = events.iter().map(|e| e["content"].as_str().unwrap()).collect();
+        assert_eq!(text, "x".repeat(500));
+        let final_value:serde_json::Value = serde_json::from_str(final_response.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+        assert_eq!(final_value["message"]["content"], text);
+    }
     #[test]
     fn native_parser_releases_only_validated_tools_and_returns_complete_envelope() {
         let frames = [

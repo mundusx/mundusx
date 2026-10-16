@@ -1,6 +1,6 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights
+from mlx_startup import evaluate_weights, bounded_prompt_cache
 
 
 class Array:
@@ -10,6 +10,31 @@ class Array:
 
 
 class ProgressTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
+    def test_prefix_cache_is_bounded_and_sessions_get_independent_copies(self):
+        import mlx.core as mx
+        from mlx_lm.models.cache import LRUPromptCache, KVCache
+        mx.set_default_device(mx.cpu)
+        def entry():
+            cache = KVCache()
+            cache.update_and_fetch(mx.ones((1, 1, 4, 2)), mx.ones((1, 1, 4, 2)))
+            return cache
+        size = entry().nbytes
+        cache = bounded_prompt_cache(LRUPromptCache, size * 2)(max_size=2)
+        for tokens in ([1, 2, 3], [4, 5, 6], [7, 8, 9]):
+            cache.insert_cache('model', tokens, [entry()])
+            self.assertLessEqual(cache.nbytes, size * 2)
+            self.assertLessEqual(len(cache), 2)
+        first, rest = cache.fetch_nearest_cache('model', [7, 8, 9])
+        self.assertEqual(rest, [])
+        first[0].update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
+        second, _ = cache.fetch_nearest_cache('model', [7, 8, 9])
+        self.assertEqual(second[0].offset, 4)
+        too_small = bounded_prompt_cache(LRUPromptCache, 1)(max_size=2)
+        too_small.insert_cache('model', [1, 2, 3], [entry()])
+        self.assertEqual(too_small.nbytes, 0)
+        self.assertEqual(len(too_small), 0)
+
     def test_counts_only_completed_evaluation_and_preserves_all_arrays(self):
         arrays = [Array(3), Array(5), Array(2)]
         observed = []
