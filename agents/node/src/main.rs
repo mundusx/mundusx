@@ -2050,8 +2050,8 @@ fn process_pending_jobs(
     continuously_refill_slots: bool,
     slot_pool: Arc<local_api::SlotPool>,
     heartbeat_snapshot: &Heartbeat,
-) {
-    if !config.contribution.llm_enabled() || media_drain::request(&storage::config_dir()).is_some() || settings_drain::active(&storage::config_dir()) { return; }
+) -> bool {
+    if !config.contribution.llm_enabled() || media_drain::request(&storage::config_dir()).is_some() || settings_drain::active(&storage::config_dir()) { return false; }
     // Reuse the identity loaded at startup rather than visiting secure storage
     // again on every idle poll. Signing still uses the secure signing path.
     // Health probing can invoke slow external programs such as nvidia-smi and
@@ -2074,7 +2074,7 @@ fn process_pending_jobs(
         let _ = save_agent_state(&policy_heartbeat);
         let _ = save_heartbeat(&policy_heartbeat);
         send_heartbeat(config, &identity, &policy_heartbeat, verbose);
-        return;
+        return false;
     }
 
     if verbose {
@@ -2096,7 +2096,7 @@ fn process_pending_jobs(
         if verbose {
             println!("jobPoll: none");
         }
-        return;
+        return false;
     }
 
     let busy_heartbeat = heartbeat_from_snapshot(heartbeat_snapshot, config, AgentState::Busy);
@@ -2112,7 +2112,9 @@ fn process_pending_jobs(
 
     if continuously_refill_slots {
         while !handles.is_empty() {
-            thread::sleep(Duration::from_secs(1));
+            // A client can submit its next tool turn as soon as completion is
+            // acknowledged. Refill at the same cadence as idle job claiming.
+            thread::sleep(Duration::from_millis(250));
             reap_finished_jobs(&mut handles);
 
             let refill_config = match load_agent_config() {
@@ -2155,6 +2157,7 @@ fn process_pending_jobs(
     let _ = save_agent_state(&ready_heartbeat);
     let _ = save_heartbeat(&ready_heartbeat);
     send_heartbeat(config, &identity, &ready_heartbeat, verbose);
+    true
 }
 
 fn print_status(json: bool) {
@@ -2574,7 +2577,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             }
         }
         if control_plane_blocks_jobs(control_plane_status.as_ref()).is_none() {
-            process_pending_jobs(
+            if process_pending_jobs(
                 &latest_config,
                 &identity,
                 json,
@@ -2582,7 +2585,11 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
                 true,
                 slot_pool.clone(),
                 &heartbeat_snapshot,
-            );
+            ) {
+                // The worker loop just sent its final Ready heartbeat. Avoid
+                // sending it again before checking for the client's next turn.
+                last_heartbeat_sent = Instant::now();
+            }
         }
         let _ = io::stdout().flush();
     }
