@@ -57,6 +57,10 @@ pub fn apply_mlx(model: &str, payload: &mut Value) {
             ["read_file", "list_dir", "replace_string_in_file"].iter().all(|name|
                 tools.iter().any(|tool|tool["function"]["name"].as_str()==Some(name))));
     if native_files {
+        // A host may increase the conversation's answer budget to 8k or more.
+        // Serial file operations must remain small enough to finish or fail
+        // promptly; remaining modules belong in subsequent tool turns.
+        payload["max_tokens"]=json!(payload["max_tokens"].as_u64().unwrap_or(2048).min(2048));
         if payload["chat_template_kwargs"].is_null() {payload["chat_template_kwargs"]=json!({});}
         payload["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(true);
     }
@@ -99,6 +103,7 @@ mod tests {
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut payload);
         assert_eq!(payload["chat_template_kwargs"]["opengpu_native_tool_guard"],true);
         assert_eq!(payload["temperature"],0.1);
+        assert_eq!(payload["max_tokens"],2048);
         let mut parallel=json!({"tools":tools,"parallel_tool_calls":true});
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut parallel);
         assert!(parallel["chat_template_kwargs"].get("opengpu_native_tool_guard").is_none());

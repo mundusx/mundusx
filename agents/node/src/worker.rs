@@ -2832,6 +2832,9 @@ fn run_native_tool_attempts(
                 || error.starts_with("native edit precondition failed:")
                 || error.starts_with("native tool schema precondition failed:") =>
         {
+            if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
+                payload["max_tokens"]=serde_json::json!(payload["max_tokens"].as_u64().unwrap_or(1024).min(1024));
+            }
             let messages = payload["messages"]
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
