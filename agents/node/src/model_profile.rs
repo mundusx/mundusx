@@ -48,14 +48,16 @@ pub fn apply(model: &str, payload: &mut Value) {
 /// Keep this runtime-specific option away from vLLM/llama OpenAI endpoints.
 pub fn apply_mlx(model: &str, payload: &mut Value) {
     if is_qwen3_coder(model) { merge_leading_system_messages(payload); }
-    if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
-        payload["repetition_penalty"] = json!(1.1);
-    }
-    apply(model, payload);
     let native_files = is_qwen3_coder(model) && payload["parallel_tool_calls"] != true
         && payload["tools"].as_array().is_some_and(|tools|
             ["read_file", "list_dir", "replace_string_in_file"].iter().all(|name|
                 tools.iter().any(|tool|tool["function"]["name"].as_str()==Some(name))));
+    if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
+        // Exact source edits must be able to copy observed identifiers and literals.
+        // The native runtime guard independently stops actual argument loops.
+        payload["repetition_penalty"] = json!(if native_files {1.0} else {1.1});
+    }
+    apply(model, payload);
     if native_files {
         // A host may increase the conversation's answer budget to 8k or more.
         // Serial file operations must remain small enough to finish or fail
@@ -103,6 +105,10 @@ mod tests {
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut payload);
         assert_eq!(payload["chat_template_kwargs"]["opengpu_native_tool_guard"],true);
         assert_eq!(payload["temperature"],0.1);
+        assert_eq!(payload["repetition_penalty"],1.0);
+        let mut explicit=json!({"tools":tools,"repetition_penalty":1.2});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut explicit);
+        assert_eq!(explicit["repetition_penalty"],1.2);
         assert_eq!(payload["max_tokens"],2048);
         let mut parallel=json!({"tools":tools,"parallel_tool_calls":true});
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut parallel);
