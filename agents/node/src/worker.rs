@@ -24,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const STREAM_DELTA_PREFIX: &str = "MUNDUSX_STREAM_DELTA:";
+const MODEL_ACTIVITY_MARKER: &str = "MUNDUSX_MODEL_TOKEN_ACTIVITY_V1";
 const STREAM_TAIL_HOLD_CHARS: usize = 32;
 
 thread_local! {
@@ -65,6 +66,78 @@ fn emit_stream_delta(delta: &str) {
             let _ = sender.send(delta.to_string());
         }
     });
+}
+
+fn native_chunk_has_token_progress(chunk: &serde_json::Value) -> bool {
+    let Some(delta)=chunk.pointer("/choices/0/delta") else { return false; };
+    ["content","reasoning_content","reasoning"].iter().any(|key|
+        delta[*key].as_str().is_some_and(|s|!s.is_empty()))
+        || delta["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|call|
+            ["name","arguments"].iter().any(|key|
+                call["function"][*key].as_str().is_some_and(|s|!s.is_empty()))))
+}
+
+fn observed_file_key(path:&str)->Option<String> {
+    let normalized=path.replace('\\',"/");
+    if normalized.split('/').any(|part|part=="..") {return None;}
+    if normalized.as_bytes().get(1)==Some(&b':') {Some(normalized.to_ascii_lowercase())}
+    else if normalized.starts_with('/') {Some(normalized)} else {None}
+}
+
+/// The contributor has no filesystem authority. Validate against the client's
+/// observed read result, then let its exact-match edit tool check current disk.
+fn validate_native_edit_preconditions(payload:&serde_json::Value,message:&serde_json::Value)->Result<(),String> {
+    let Some(tools)=payload["tools"].as_array() else {return Ok(())};
+    if !["read_file","list_dir","replace_string_in_file"].iter().all(|name|
+        tools.iter().any(|tool|tool["function"]["name"].as_str()==Some(name))) {return Ok(());}
+    let Some(calls)=message["tool_calls"].as_array() else {return Ok(())};
+    let messages=payload["messages"].as_array().ok_or("native edit precondition failed: missing history")?;
+    let start=messages.iter().rposition(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|s|s.contains("<userRequest>"))).map_or(0,|i|i+1);
+    let scoped_files:Vec<String>=start.checked_sub(1).and_then(|i|messages[i]["content"].as_str())
+        .and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|(s,_)|s.trim()))
+        .filter(|s|["fix ","edit ","update "].iter().any(|prefix|s.to_ascii_lowercase().starts_with(prefix)))
+        .map(|s|s.split_whitespace().filter_map(|word| {
+            let path=word.trim_matches(['\"','\'',',',';','?']).trim_end_matches('.');
+            if !path.rsplit(['/', '\\']).next().is_some_and(|name|name.contains('.')) {return None;}
+            observed_file_key(path)
+        }).collect()).unwrap_or_default();
+    let mut changed=std::collections::HashSet::new();
+    for call in calls {
+        let name=call["function"]["name"].as_str().unwrap_or("");
+        if name=="insert_edit_into_file" || name=="multi_replace_string_in_file" {
+            return Err("native edit precondition failed: use one read-grounded replace_string_in_file per turn".into());
+        }
+        if name!="replace_string_in_file" && name!="create_file" {continue;}
+        let args:serde_json::Value=serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or(""))
+            .map_err(|_|"native edit precondition failed: invalid arguments")?;
+        let key=args["filePath"].as_str().and_then(observed_file_key)
+            .ok_or("native edit precondition failed: expected an absolute filePath without traversal")?;
+        if !scoped_files.is_empty() && !scoped_files.contains(&key) {
+            return Err("native edit precondition failed: mutation target is outside the explicit files in the current userRequest; editor focus does not authorize a different target".into());
+        }
+        if !changed.insert(key.clone()) {return Err("native edit precondition failed: multiple mutations of the same path require separate observed turns".into());}
+        let observed=messages[start..].iter().rev().find_map(|result| {
+            if result["role"]!="tool" {return None;}
+            let id=result["tool_call_id"].as_str()?;
+            let read=messages[start..].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|
+                c["id"].as_str()==Some(id) && c["function"]["name"]=="read_file")?;
+            let read_args:serde_json::Value=serde_json::from_str(read["function"]["arguments"].as_str()?).ok()?;
+            if read_args["filePath"].as_str().and_then(observed_file_key).as_ref()!=Some(&key) {return None;}
+            let text=result["content"].as_str()?;
+            if text.trim_start().to_ascii_lowercase().starts_with("error") {return Some(None);}
+            Some(Some(text))
+        }).flatten();
+        if name=="create_file" {
+            if observed.is_some() {return Err("native edit precondition failed: target was already read; do not recreate it".into());}
+        } else {
+            let old=args["oldString"].as_str().filter(|s|!s.is_empty())
+                .ok_or("native edit precondition failed: oldString must be nonempty")?;
+            if !observed.is_some_and(|text|text.contains(old)) {
+                return Err("native edit precondition failed: read the exact target and use its observed oldString before replacing it".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -2543,6 +2616,47 @@ mod structured_image_tests {
     }
 }
 
+#[cfg(test)]
+mod edit_precondition_tests {
+    use super::*;
+    fn payload()->serde_json::Value {serde_json::json!({"tools":[
+        {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],
+        "messages":[{"role":"user","content":"<editorContext>D:/sample/models/Student.js</editorContext><userRequest>Fix D:/sample/routes/studentRoutes.js syntax</userRequest>"},
+        {"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":"{\"filePath\":\"D:/sample/routes/studentRoutes.js\"}"}}]},
+        {"role":"tool","tool_call_id":"read1","content":"router.delete/:id', controller.delete);"}]})}
+    fn edit(path:&str)->serde_json::Value {serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"edit1","function":{"name":"replace_string_in_file","arguments":serde_json::json!({"filePath":path,"oldString":"router.delete/:id', controller.delete);","newString":"router.delete('/:id', controller.delete);"}).to_string()}}]})}
+    #[test]
+    fn focus_does_not_authorize_a_different_file_even_after_reading_it() {
+        let mut p=payload();
+        assert!(validate_native_edit_preconditions(&p,&edit("d:/sample/routes/studentRoutes.js")).is_ok());
+        p["messages"][1]["tool_calls"][0]["function"]["arguments"]=serde_json::json!("{\"filePath\":\"D:/sample/models/Student.js\"}");
+        assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/models/Student.js")).unwrap_err().contains("outside the explicit files"));
+    }
+    #[test]
+    fn unobserved_stale_and_recreated_targets_are_rejected() {
+        let mut p=payload();p["messages"][2]["content"]=serde_json::json!("different current text");
+        assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/routes/studentRoutes.js")).is_err());
+        let p=payload();let mut call=edit("D:/sample/routes/studentRoutes.js");call["tool_calls"][0]["function"]["name"]=serde_json::json!("create_file");
+        assert!(validate_native_edit_preconditions(&p,&call).unwrap_err().contains("do not recreate"));
+        let mut p=payload();p["messages"].as_array_mut().unwrap().truncate(1);
+        assert!(validate_native_edit_preconditions(&p,&edit("D:/sample/routes/studentRoutes.js")).is_err());
+    }
+    #[test]
+    fn only_actual_tokens_count_as_progress_and_empty_results_fail() {
+        for chunk in [serde_json::json!({"choices":[]}),serde_json::json!({"choices":[{"delta":{"role":"assistant","content":""}}]}),serde_json::json!({"usage":{"completion_tokens":1}})] {assert!(!native_chunk_has_token_progress(&chunk));}
+        for delta in [serde_json::json!({"content":"a"}),serde_json::json!({"reasoning_content":"thinking"}),serde_json::json!({"tool_calls":[{"function":{"arguments":"{"}}]})] {assert!(native_chunk_has_token_progress(&serde_json::json!({"choices":[{"delta":delta}]})));}
+        assert!(normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]})).unwrap_err().contains("without content"));
+    }
+    #[test]
+    fn rejected_batch_releases_no_tool_fragments() {
+        let mut assembled=edit("D:/sample/models/Student.js");assembled["tool_calls"][0]["index"]=serde_json::json!(0);
+        let wire=format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",serde_json::json!({"choices":[{"delta":assembled}]}),serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+        let (tx,rx)=mpsc::channel();
+        let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&payload())));
+        assert!(result.is_err());assert!(rx.try_recv().is_err());
+    }
+}
+
 fn run_native_openai_tool_turn(
     url: &str,
     model: &str,
@@ -2580,10 +2694,11 @@ fn run_native_openai_tool_turn(
         .send_json(payload)
         .map_err(|error| format!("native OpenAI tool completion failed: {error}"))?;
         if streaming {
-            return parse_native_openai_stream_with_output(
+            return parse_native_openai_stream_with_context(
                 BufReader::new(response.into_reader()),
                 output,
                 retry,
+                Some(payload),
             );
         }
         let value = response.into_json::<serde_json::Value>().map_err(|error| {
@@ -2594,6 +2709,7 @@ fn run_native_openai_tool_turn(
             &value["choices"][0]["message"],
             value["choices"][0]["finish_reason"].as_str(),
         )?;
+        validate_native_edit_preconditions(payload,&value["choices"][0]["message"])?;
         if retry
             && value["choices"][0]["message"]["tool_calls"]
                 .as_array()
@@ -2617,13 +2733,14 @@ fn run_native_tool_attempts(
         Err(error)
             if error.starts_with("native tool arguments are incomplete:")
                 || error.starts_with("native tool call exceeded generation limit")
-                || error.starts_with("native edit tool arguments exceed safe patch size:") =>
+                || error.starts_with("native edit tool arguments exceed safe patch size:")
+                || error.starts_with("native edit precondition failed:") =>
         {
             let messages = payload["messages"]
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
-            messages.push(serde_json::json!({"role":"system", "content":
-                "Your previous tool-call generation was rejected before any tool was executed because its JSON arguments were incomplete. Generate a fresh valid tool call for the original task. For file edits, use one small targeted patch (prefer under 2000 characters of changed text) instead of rewriting a whole file; continue remaining edits in subsequent tool turns. Preserve all required tool arguments and use only the available tools. Do not claim the task is complete. No introductory prose is needed."}));
+            messages.push(serde_json::json!({"role":"system", "content":format!(
+                "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate a fresh valid tool call for the original task. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Use one small targeted patch (prefer under 2000 characters of changed text); continue remaining edits in subsequent turns. Preserve required arguments and use only available tools. Do not claim completion. No introductory prose is needed.")}));
             attempt(&payload, &mut output, true).map_err(|retry_error| {
                 format!("native tool recovery failed after one retry: {retry_error}")
             })
@@ -2636,6 +2753,12 @@ fn validate_native_tool_message(
     message: &serde_json::Value,
     reason: Option<&str>,
 ) -> Result<(), String> {
+    if message["content"].as_str().is_none_or(|s|s.trim().is_empty())
+        && message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()) {
+        return Err(if reason==Some("length") {
+            "native model exhausted its generation budget without content or a tool call"
+        } else {"native model returned no content or tool call"}.into());
+    }
     if let Some(calls) = message["tool_calls"]
         .as_array()
         .filter(|calls| !calls.is_empty())
@@ -2704,6 +2827,12 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
     output: &mut String,
     retry: bool,
 ) -> Result<String, String> {
+    parse_native_openai_stream_with_context(reader,output,retry,None)
+}
+
+fn parse_native_openai_stream_with_context<R: BufRead>(
+    reader:R, output:&mut String, retry:bool, payload:Option<&serde_json::Value>,
+) -> Result<String,String> {
     let mut assembled = native_stream::NativeStream::default();
     let mut usage = serde_json::Value::Null;
     let mut pending_tools = Vec::new();
@@ -2712,6 +2841,7 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
     let mut last_content_sent = Instant::now();
     let mut reason = None;
     let mut done = false;
+    let mut last_activity:Option<Instant>=None;
     for line in reader.lines() {
         let line = line.map_err(|e| format!("native stream read failed: {e}"))?;
         let Some(data) = line.strip_prefix("data:") else {
@@ -2727,6 +2857,14 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
         }
         let chunk: serde_json::Value =
             serde_json::from_str(data).map_err(|e| format!("invalid native stream JSON: {e}"))?;
+        if native_chunk_has_token_progress(&chunk)
+            && last_activity.is_none_or(|last|last.elapsed()>=Duration::from_secs(1)) {
+            // Private parent-child liveness only. Never expose buffered tool
+            // arguments or reasoning as public assistant output.
+            let mut stderr=io::stderr().lock();
+            let _=writeln!(stderr,"{MODEL_ACTIVITY_MARKER}");let _=stderr.flush();
+            last_activity=Some(Instant::now());
+        }
         if chunk.get("usage").is_some_and(|value| !value.is_null()) { usage=chunk["usage"].clone(); }
         if let Some(error) = chunk.get("error") {
             return Err(format!("native stream error: {error}"));
@@ -2778,6 +2916,7 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
     }
     let mut message = assembled.message();
     validate_native_tool_message(&message, reason.as_deref())?;
+    if let Some(payload)=payload {validate_native_edit_preconditions(payload,&message)?;}
     if retry
         && message["tool_calls"]
             .as_array()
@@ -2814,6 +2953,7 @@ fn normalize_native_openai_tool_response(value: &serde_json::Value) -> Result<St
                 "stop"
             }
         });
+    validate_native_tool_message(&message,Some(finish_reason))?;
     if finish_reason == "tool_calls"
         && !message
             .get("tool_calls")
@@ -4436,6 +4576,10 @@ pub fn launch_worker_with_control(
                 Ok(0) => break,
                 Ok(_) => {
                     let text = String::from_utf8_lossy(&line);
+                    if text.trim()==MODEL_ACTIVITY_MARKER {
+                        let _=activity_sender.send(());
+                        continue;
+                    }
                     if let Some(encoded) = text.trim().strip_prefix(STREAM_DELTA_PREFIX) {
                         if let Ok(bytes) = hex::decode(encoded) {
                             if let Ok(delta) = String::from_utf8(bytes) {
