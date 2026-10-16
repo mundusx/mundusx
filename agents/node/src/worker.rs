@@ -19,6 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -4304,6 +4305,18 @@ pub fn launch_worker_with_stream(
     model_dir: &Path,
     delta_sender: Option<mpsc::Sender<String>>,
 ) -> Result<WorkerLaunchResponse, String> {
+    launch_worker_with_control(request, model_dir, delta_sender, None)
+}
+
+pub fn launch_worker_with_control(
+    request: &WorkerLaunchRequest,
+    model_dir: &Path,
+    delta_sender: Option<mpsc::Sender<String>>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<WorkerLaunchResponse, String> {
+    if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("worker assignment was cancelled before execution".into());
+    }
     if !request.operation.is_llm() {
         return Err(format!(
             "unsupported operation {}; media worker is not enabled",
@@ -4406,6 +4419,11 @@ pub fn launch_worker_with_stream(
     let idle_timeout = worker_idle_timeout();
     let hard_timeout = worker_hard_timeout();
     let status = loop {
+        if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            kill_process_tree(child.id());
+            let _ = child.wait();
+            return Err("worker stopped because its assignment was cancelled or replaced".into());
+        }
         while activity_receiver.try_recv().is_ok() {
             last_progress = Instant::now();
         }
@@ -5299,6 +5317,13 @@ mod tests {
             top_p: Some(0.9),
             seed: Some(42),
         }
+    }
+
+    #[test]
+    fn cancelled_assignment_never_starts_a_worker_or_contacts_a_runtime() {
+        let cancelled=Arc::new(AtomicBool::new(true));
+        let error=launch_worker_with_control(&speakai_request(None),Path::new("missing-model-directory"),None,Some(cancelled)).unwrap_err();
+        assert!(error.contains("cancelled before execution"));
     }
 
     #[test]

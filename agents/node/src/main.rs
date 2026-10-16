@@ -34,6 +34,7 @@ use serde::Serialize;
 use std::fs;
 use std::io::{self, Write};
 use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool,Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
@@ -1418,9 +1419,19 @@ fn launch_admitted_worker_process(
     json: bool,
     delta_sender: Option<mpsc::Sender<String>>,
 ) -> Result<contracts::WorkerLaunchResponse, String> {
+    launch_admitted_worker_process_with_control(config,request,json,delta_sender,None)
+}
+
+fn launch_admitted_worker_process_with_control(
+    config: &AgentConfig,
+    request: WorkerLaunchRequest,
+    json: bool,
+    delta_sender: Option<mpsc::Sender<String>>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<contracts::WorkerLaunchResponse, String> {
     let model_dir = config.effective_model_dir();
 
-    match worker::launch_worker_with_stream(&request, &model_dir, delta_sender) {
+    match worker::launch_worker_with_control(&request, &model_dir, delta_sender, cancelled) {
         Ok(response) => {
             if json {
                 emit_json_line(&response);
@@ -1896,6 +1907,30 @@ fn stop_busy_heartbeat_supervisor(stop_tx: mpsc::Sender<()>, handle: thread::Joi
     let _ = handle.join();
 }
 
+fn start_assignment_monitor(
+    config:AgentConfig,identity:DeviceIdentity,job_id:String,assignment_id:String,cancelled:Arc<AtomicBool>,
+)->mpsc::Sender<()> {
+    let (stop,receiver)=mpsc::channel();
+    // Assignment checks carry no prompt, output, progress evidence or usage.
+    // A transient network failure is not evidence of cancellation.
+    thread::spawn(move || {
+        let agent=http::request_agent_with_timeouts(Duration::from_secs(3),Duration::from_secs(5));
+        loop {
+            if receiver.recv_timeout(Duration::from_secs(2))!=Err(mpsc::RecvTimeoutError::Timeout) { break; }
+            let payload=serde_json::json!({"job_id":job_id,"node_id":config.device_id,"assignment_id":assignment_id});
+            match signed_post_json_body_with_agent::<_,serde_json::Value>(&agent,&config.control_plane_url,
+                "/v1/jobs/assignment",&config.device_id,&identity,&payload) {
+                Ok(value) if value["active"].as_bool()==Some(false) => {
+                    cancelled.store(true,Ordering::Release);break;
+                }
+                Err(error) if error.starts_with("HTTP 404") || error.starts_with("HTTP 405") => break,
+                _ => {},
+            }
+        }
+    });
+    stop
+}
+
 fn execute_claimed_job(
     config: AgentConfig,
     identity: DeviceIdentity,
@@ -1903,6 +1938,12 @@ fn execute_claimed_job(
     json: bool,
     _permit: local_api::SlotPermit,
 ) {
+    let cancelled=Arc::new(AtomicBool::new(false));
+    let monitor = if job.stream && config.contributed_cluster.is_none() {
+        job.assigned_at.as_ref().map(|assignment| {
+            start_assignment_monitor(config.clone(),identity.clone(),job.job_id.clone(),assignment.clone(),cancelled.clone())
+        })
+    } else { None };
     let request = WorkerLaunchRequest {
         operation: job.operation,
         job_id: job.job_id.clone(),
@@ -1945,12 +1986,17 @@ fn execute_claimed_job(
     // Admission was already checked from the latest health snapshot before the
     // job was claimed. Re-running the full health probe here delays the first
     // response token even though the node is already admitted and ready.
-    let worker_result = launch_admitted_worker_process(&config, request, json, delta_sender);
+    let worker_result = launch_admitted_worker_process_with_control(&config, request, json, delta_sender,Some(cancelled.clone()));
+    if let Some(stop)=monitor { let _=stop.send(()); }
     println!("jobTiming: worker {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
     if let Some(handle) = relay_handle {
         let _ = handle.join();
     }
     println!("jobTiming: relay {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
+    if cancelled.load(Ordering::Acquire) {
+        println!("jobCancelled: {} released its execution slot",job.job_id);
+        return;
+    }
     match worker_result {
         Ok(response) => {
             let completion = build_completion_from_worker_response(
