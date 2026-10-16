@@ -1146,6 +1146,43 @@ fn mlx_server_health_ok(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn mlx_required_tools_ready(url: &str) -> bool {
+    ureq::get(&format!("{url}/v1/opengpu/runtime-capabilities"))
+        .timeout(Duration::from_secs(2)).call().ok()
+        .and_then(|response| response.into_json::<serde_json::Value>().ok())
+        .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true))
+}
+
+fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
+    let args: Vec<_> = command.split_whitespace().collect();
+    // ps's command string is not safely tokenizable for paths containing spaces.
+    // Refuse ambiguous ownership rather than stopping an unrelated process.
+    wrapper.to_str().is_some_and(|path| !path.chars().any(char::is_whitespace)
+        && args.get(1).copied() == Some(path)
+        && args.windows(2).any(|pair| pair == ["--port", port.to_string().as_str()]))
+}
+
+fn retire_outdated_managed_mlx(url: &str, port: u16) -> Result<(), String> {
+    let state = read_persistent_runtime_state()?.filter(|state|
+        state.url == url && state.environment_variable == "OPENGPU_MLX_SERVER_URL" && state.container_name.is_none()
+    ).ok_or("Existing MLX server lacks required-tool support and is not a recorded managed runtime. Restart that server with the updated MLX wrapper; it was not stopped automatically.")?;
+    let wrapper = opengpu_home_dir().join("runtimes/mlx/measured_startup.py");
+    let output = Command::new("ps").args(["-p", &state.pid.to_string(), "-o", "command="])
+        .output().map_err(|error| format!("Cannot verify old MLX runtime ownership: {error}"))?;
+    if !output.status.success() || !managed_mlx_command_matches(&String::from_utf8_lossy(&output.stdout), &wrapper, port) {
+        return Err("Existing MLX server lacks required-tool support; recorded process ownership could not be verified. Restart it manually; no process was stopped.".into());
+    }
+    println!("persistentRuntime: restarting outdated managed MLX runtime for required tool calls");
+    stop_persistent_runtime_process(state.pid, None);
+    remove_persistent_runtime_state();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mlx_server_health_ok(url) {
+        if Instant::now() >= deadline { return Err("Old managed MLX server did not stop".into()); }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// Read the served per-slot context, only for the selected cached GGUF.
 pub fn served_llama_context_tokens(model_dir: &Path, model: &str) -> Option<u32> {
     let expected = resolve_model_path(model_dir, Some(model)).ok()?;
@@ -1789,7 +1826,10 @@ pub fn start_persistent_runtime(
                 .filter(|port| *port > 0)
                 .unwrap_or(8790);
             let url = format!("http://127.0.0.1:{port}");
-            if mlx_server_health_ok(&url) {
+            let healthy = mlx_server_health_ok(&url);
+            if healthy && crate::model_profile::is_qwen3_coder(model_name) && !mlx_required_tools_ready(&url) {
+                retire_outdated_managed_mlx(&url, port)?;
+            } else if healthy {
                 // A reused local server may be live but still cold.
                 env::remove_var("OPENGPU_MLX_SERVER_URL");
                 drop(progress);
@@ -4558,6 +4598,14 @@ fn kill_process_tree(pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outdated_mlx_restart_requires_exact_managed_wrapper_and_port() {
+        let wrapper = std::path::Path::new("/home/a/.opengpu/runtimes/mlx/measured_startup.py");
+        assert!(super::managed_mlx_command_matches("/usr/bin/python /home/a/.opengpu/runtimes/mlx/measured_startup.py --port 8790 --model qwen", wrapper, 8790));
+        for command in ["/usr/bin/python -m mlx_lm.server --port 8790", "/usr/bin/python /other/measured_startup.py --port 8790", "/usr/bin/python /home/a/.opengpu/runtimes/mlx/measured_startup.py --port 9000"] {
+            assert!(!super::managed_mlx_command_matches(command, wrapper, 8790));
+        }
+    }
     #[test]
     fn battery_policy_allows_configured_caps_and_preserves_health_checks() {
         with_temp_runtime_home(|home| {

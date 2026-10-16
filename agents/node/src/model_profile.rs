@@ -54,11 +54,38 @@ pub fn apply_mlx(model: &str, payload: &mut Value) {
     if is_qwen3_coder(model) && payload.get("repetition_context_size").is_none_or(Value::is_null) {
         payload["repetition_context_size"] = json!(512);
     }
+    // mlx-lm 0.32 ignores tool_choice. The managed wrapper enforces only the
+    // required call opening; argument validation and execution remain upstream.
+    if is_qwen3_coder(model) && payload["tool_choice"] == "required"
+        && payload["tools"].as_array().is_some_and(|tools| !tools.is_empty()) {
+        if payload["chat_template_kwargs"].is_null() { payload["chat_template_kwargs"] = json!({}); }
+        if let Some(kwargs) = payload["chat_template_kwargs"].as_object_mut() {
+            kwargs.insert("opengpu_require_tool_call".into(), json!(true));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_required_mlx_coder_tool_turns_get_the_runtime_requirement() {
+        let model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit";
+        let body = json!({"tool_choice":"required","tools":[{"type":"function"}],"chat_template_kwargs":{"enable_thinking":false}});
+        let mut required = body.clone(); apply_mlx(model, &mut required);
+        assert_eq!(required["chat_template_kwargs"]["opengpu_require_tool_call"], true);
+        assert_eq!(required["chat_template_kwargs"]["enable_thinking"], false);
+        for choice in ["auto", "none"] {
+            let mut optional = body.clone(); optional["tool_choice"] = json!(choice); apply_mlx(model,&mut optional);
+            assert!(optional["chat_template_kwargs"].get("opengpu_require_tool_call").is_none());
+        }
+        let mut empty = body.clone(); empty["tools"] = json!([]); apply_mlx(model,&mut empty);
+        assert!(empty["chat_template_kwargs"].get("opengpu_require_tool_call").is_none());
+        let mut unknown = body.clone(); apply_mlx("other",&mut unknown);
+        assert_eq!(unknown,body);
+        let mut vllm = body; apply(model,&mut vllm);
+        assert!(vllm["chat_template_kwargs"].get("opengpu_require_tool_call").is_none());
+    }
     #[test]
     fn mlx_source_repetition_window_is_runtime_specific_and_overridable() {
         let model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit";
