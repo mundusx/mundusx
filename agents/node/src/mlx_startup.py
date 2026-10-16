@@ -50,6 +50,12 @@ def repetitive_tool_tail(text):
     """Reject long low-entropy argument loops, not ordinary repeated syntax."""
     if '<tool_call>' not in text or text.rfind('<tool_call>') < text.rfind('</tool_call>'):
         return False
+    lines=[line.strip() for line in text[text.rfind('<tool_call>'):].splitlines() if line.strip()][-24:]
+    growing=0
+    for previous,current in zip(lines,lines[1:]):
+        growing=growing+1 if len(previous)>=8 and current.startswith(previous) and 0<len(current)-len(previous)<=16 else 0
+        if growing>=6:
+            return True
     tail = re.sub(r'\s+', '', text[text.rfind('<tool_call>'):])[-1024:]
     if len(tail) < 192:
         return False
@@ -139,7 +145,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "version": 6}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "version": 7}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
