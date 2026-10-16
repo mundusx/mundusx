@@ -1285,7 +1285,7 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .and_then(|response| response.into_json::<serde_json::Value>().ok())
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 5))
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 6))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
