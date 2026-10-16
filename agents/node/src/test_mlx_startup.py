@@ -1,6 +1,7 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights, bounded_prompt_cache
+from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint
+from types import SimpleNamespace
 
 
 class Array:
@@ -10,6 +11,88 @@ class Array:
 
 
 class ProgressTests(unittest.TestCase):
+    def test_capability_endpoint_is_narrow_and_does_not_handle_other_routes(self):
+        import io
+        class Handler:
+            def do_GET(self):
+                return "original route"
+            def send_response(self, status):
+                self.status = status
+            def send_header(self, name, value):
+                pass
+            def end_headers(self):
+                pass
+        install_capabilities_endpoint(SimpleNamespace(APIHandler=Handler))
+        handler = Handler()
+        handler.path = "/v1/opengpu/runtime-capabilities"
+        handler.wfile = io.BytesIO()
+        handler.do_GET()
+        self.assertEqual(handler.status, 200)
+        import json
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "version": 2})
+        handler.path = "/v1/models"
+        self.assertEqual(handler.do_GET(), "original route")
+
+    def test_registered_name_choice_branches_and_isolates_requests(self):
+        first = RegisteredToolOpening([[1, 2, 3], [1, 4, 3]])
+        second = RegisteredToolOpening([[1, 9, 3]])
+        self.assertEqual(first.next_tokens([100]), [1])
+        self.assertEqual(second.next_tokens([200, 201]), [1])
+        self.assertEqual(first.next_tokens([100, 1]), [2, 4])
+        self.assertEqual(first.next_tokens([100, 1, 4]), [3])
+        self.assertIsNone(first.next_tokens([100, 1, 4, 3]))
+        self.assertEqual(second.next_tokens([200, 201, 1]), [9])
+        with self.assertRaises(ValueError):
+            second.next_tokens([200, 201, 1, 8])
+
+    def test_required_tool_openings_are_bounded_and_independent_per_request(self):
+        first, second = RequiredToolPrefix([1, 2, 3]), RequiredToolPrefix([1, 2, 3])
+        self.assertEqual(first.next_token(100), 1)
+        self.assertEqual(second.next_token(200), 1)
+        self.assertEqual(first.next_token(101), 2)
+        self.assertEqual(second.next_token(201), 2)
+        self.assertEqual(first.next_token(102), 3)
+        self.assertIsNone(first.next_token(103))
+        self.assertEqual(second.next_token(202), 3)
+        with self.assertRaises(ValueError):
+            first.next_token(99)
+        with self.assertRaises(ValueError):
+            RequiredToolPrefix([])
+
+    @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
+    def test_required_opening_masks_only_prefix_tokens_and_leaves_chat_unchanged(self):
+        import mlx.core as mx
+        class Generator:
+            def _tokenize(self, tokenizer, request, args):
+                self.seen_options = args.chat_template_kwargs
+                return "original prompt"
+        def parser(*_):
+            pass
+        parser.__module__ = "mlx_lm.tool_parsers.qwen3_coder"
+        tokenizer = SimpleNamespace(has_tool_calling=True, tool_parser=parser, encode=lambda text, **kwargs: [1, 2, 3])
+        server = SimpleNamespace(ResponseGenerator=Generator, _make_logits_processors=lambda _: [])
+        install_required_tool_opening(server, mx)
+        request = SimpleNamespace(request_type="chat", tools=[{"type": "function", "function": {"name": "test"}}])
+        args = SimpleNamespace(chat_template_kwargs={"opengpu_require_tool_call": True, "enable_thinking": False})
+        generator = Generator()
+        self.assertEqual(generator._tokenize(tokenizer, request, args), "original prompt")
+        self.assertEqual(generator.seen_options, {"enable_thinking": False})
+        processors = server._make_logits_processors(args)
+        self.assertEqual(len(processors), 1)
+        logits = mx.arange(8).astype(mx.float32)
+        for length, expected in [(10, 1), (11, 2), (12, 3)]:
+            masked = processors[0](mx.array(list(range(10)) + [1, 2, 3][:length-10]), logits)
+            self.assertEqual(mx.argmax(masked).item(), expected)
+            self.assertEqual(mx.sum(mx.isfinite(masked)).item(), 1)
+        self.assertIs(processors[0](mx.array(list(range(10)) + [1, 2, 3]), logits), logits)
+        self.assertIs(processors[0](mx.arange(20), logits), logits)
+        plain = SimpleNamespace(chat_template_kwargs=None)
+        generator._tokenize(tokenizer, request, plain)
+        self.assertEqual(server._make_logits_processors(plain), [])
+        request.tools = []
+        with self.assertRaisesRegex(ValueError, "tool-capable"):
+            generator._tokenize(tokenizer, request, SimpleNamespace(chat_template_kwargs={"opengpu_require_tool_call": True}))
+
     @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
     def test_prefix_cache_is_bounded_and_sessions_get_independent_copies(self):
         import mlx.core as mx
