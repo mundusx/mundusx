@@ -1,6 +1,6 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, install_required_tool_opening, install_capabilities_endpoint
+from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint
 from types import SimpleNamespace
 
 
@@ -29,9 +29,21 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "version": 1})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "version": 2})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
+
+    def test_registered_name_choice_branches_and_isolates_requests(self):
+        first = RegisteredToolOpening([[1, 2, 3], [1, 4, 3]])
+        second = RegisteredToolOpening([[1, 9, 3]])
+        self.assertEqual(first.next_tokens([100]), [1])
+        self.assertEqual(second.next_tokens([200, 201]), [1])
+        self.assertEqual(first.next_tokens([100, 1]), [2, 4])
+        self.assertEqual(first.next_tokens([100, 1, 4]), [3])
+        self.assertIsNone(first.next_tokens([100, 1, 4, 3]))
+        self.assertEqual(second.next_tokens([200, 201, 1]), [9])
+        with self.assertRaises(ValueError):
+            second.next_tokens([200, 201, 1, 8])
 
     def test_required_tool_openings_are_bounded_and_independent_per_request(self):
         first, second = RequiredToolPrefix([1, 2, 3]), RequiredToolPrefix([1, 2, 3])
@@ -60,7 +72,7 @@ class ProgressTests(unittest.TestCase):
         tokenizer = SimpleNamespace(has_tool_calling=True, tool_parser=parser, encode=lambda text, **kwargs: [1, 2, 3])
         server = SimpleNamespace(ResponseGenerator=Generator, _make_logits_processors=lambda _: [])
         install_required_tool_opening(server, mx)
-        request = SimpleNamespace(request_type="chat", tools=[{"type": "function"}])
+        request = SimpleNamespace(request_type="chat", tools=[{"type": "function", "function": {"name": "test"}}])
         args = SimpleNamespace(chat_template_kwargs={"opengpu_require_tool_call": True, "enable_thinking": False})
         generator = Generator()
         self.assertEqual(generator._tokenize(tokenizer, request, args), "original prompt")
@@ -69,10 +81,11 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(len(processors), 1)
         logits = mx.arange(8).astype(mx.float32)
         for length, expected in [(10, 1), (11, 2), (12, 3)]:
-            masked = processors[0](mx.arange(length), logits)
+            masked = processors[0](mx.array(list(range(10)) + [1, 2, 3][:length-10]), logits)
             self.assertEqual(mx.argmax(masked).item(), expected)
             self.assertEqual(mx.sum(mx.isfinite(masked)).item(), 1)
-        self.assertIs(processors[0](mx.arange(13), logits), logits)
+        self.assertIs(processors[0](mx.array(list(range(10)) + [1, 2, 3]), logits), logits)
+        self.assertIs(processors[0](mx.arange(20), logits), logits)
         plain = SimpleNamespace(chat_template_kwargs=None)
         generator._tokenize(tokenizer, request, plain)
         self.assertEqual(server._make_logits_processors(plain), [])

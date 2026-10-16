@@ -25,6 +25,26 @@ class RequiredToolPrefix:
         return self.tokens[offset] if offset < len(self.tokens) else None
 
 
+class RegisteredToolOpening:
+    """Constrain only the opening and registered function name, never values."""
+    def __init__(self, sequences):
+        if not sequences or any(not sequence for sequence in sequences):
+            raise ValueError("Registered tool openings must not be empty")
+        self.sequences = tuple(tuple(sequence) for sequence in sequences)
+        self.start = None
+
+    def next_tokens(self, history):
+        if self.start is None:
+            self.start = len(history)
+        generated = tuple(history[self.start:])
+        candidates = [sequence for sequence in self.sequences if sequence[:len(generated)] == generated]
+        if not candidates:
+            raise ValueError("Generated tool opening left the registered tool set")
+        if any(len(sequence) == len(generated) for sequence in candidates):
+            return None
+        return sorted({sequence[len(generated)] for sequence in candidates})
+
+
 def install_required_tool_opening(server, mx):
     original_tokenize = server.ResponseGenerator._tokenize
     original_processors = server._make_logits_processors
@@ -37,21 +57,30 @@ def install_required_tool_opening(server, mx):
                 raise ValueError("Required tool opening needs a tool-capable chat request")
             if not tokenizer.tool_parser.__module__.endswith("qwen3_coder"):
                 raise ValueError("Required tool opening supports the Qwen3-Coder parser only")
-            args._opengpu_required_prefix = tuple(tokenizer.encode("<tool_call>\n<function=", add_special_tokens=False))
+            names = [tool.get("function", {}).get("name") for tool in request.tools]
+            if any(not isinstance(name, str) or not name for name in names):
+                raise ValueError("Required tool opening needs registered function names")
+            args._opengpu_required_openings = tuple(tuple(tokenizer.encode("<tool_call>\n<function=" + name + ">\n", add_special_tokens=False)) for name in names)
         args.chat_template_kwargs = {key: value for key, value in options.items() if key != "opengpu_require_tool_call"}
         return original_tokenize(self, tokenizer, request, args)
 
     def processors(args):
         result = list(original_processors(args))
-        tokens = getattr(args, "_opengpu_required_prefix", None)
-        if tokens:
-            prefix = RequiredToolPrefix(tokens)
+        openings = getattr(args, "_opengpu_required_openings", None)
+        if openings:
+            prefix = RegisteredToolOpening(openings)
+            finished = False
 
             def force_opening(history, logits):
-                token = prefix.next_token(history.size)
-                if token is None:
+                nonlocal finished
+                if finished:
                     return logits
-                return mx.where(mx.arange(logits.shape[-1]) == token, mx.zeros_like(logits), mx.full_like(logits, -float("inf")))
+                tokens = prefix.next_tokens(history.tolist())
+                if tokens is None:
+                    finished = True
+                    return logits
+                allowed = mx.any(mx.arange(logits.shape[-1])[:, None] == mx.array(tokens)[None, :], axis=1)
+                return mx.where(allowed, logits, mx.full_like(logits, -float("inf")))
 
             result.append(force_opening)
         return result
@@ -67,7 +96,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "version": 1}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "version": 2}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
