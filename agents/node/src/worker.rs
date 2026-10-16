@@ -1281,7 +1281,8 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .timeout(Duration::from_secs(2)).call().ok()
         .and_then(|response| response.into_json::<serde_json::Value>().ok())
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 3))
+            && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 4))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
@@ -2796,6 +2797,9 @@ fn run_native_openai_tool_turn(
             format!("native OpenAI tool completion returned invalid JSON: {error}")
         })?;
         record_runtime_usage(&value["usage"]);
+        if let Some(error)=value.pointer("/choices/0/opengpu_tool_error").and_then(|v|v.as_str()) {
+            return Err(format!("native tool arguments are incomplete: runtime rejected {error}"));
+        }
         validate_native_tool_message(
             &value["choices"][0]["message"],
             value["choices"][0]["finish_reason"].as_str(),
@@ -2832,7 +2836,7 @@ fn run_native_tool_attempts(
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
             messages.push(serde_json::json!({"role":"system", "content":format!(
-                "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate a fresh valid tool call for the original task. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Use one small targeted patch (prefer under 2000 characters of changed text); continue remaining edits in subsequent turns. Preserve required arguments and use only available tools. Do not claim completion. No introductory prose is needed.")}));
+                "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
             attempt(&payload, &mut output, true).map_err(|retry_error| {
                 format!("native tool recovery failed after one retry: {retry_error}")
             })
@@ -2914,6 +2918,24 @@ fn parse_native_openai_stream<R: BufRead>(reader: R) -> Result<String, String> {
     parse_native_openai_stream_with_output(reader, &mut String::new(), false)
 }
 
+#[test]
+fn rejected_runtime_tool_markup_is_retried_without_releasing_tools() {
+    let wire="data: {\"choices\":[{\"delta\":{},\"opengpu_tool_error\":\"repetitive tool argument\"}]}\n\n";
+    let (tx,rx)=mpsc::channel();
+    let error=with_stream_delta_sender(Some(tx),||parse_native_openai_stream(io::Cursor::new(wire))).unwrap_err();
+    assert!(error.starts_with("native tool arguments are incomplete:"));
+    assert!(rx.try_recv().is_err());
+    let mut count=0;
+    let result=run_native_tool_attempts(serde_json::json!({"messages":[]}),|payload,_,retry| {
+        count+=1;
+        if !retry {Err(error.clone())}else {
+            assert!(payload["messages"][0]["content"].as_str().unwrap().contains("exactly ONE"));
+            Ok("valid complete call".into())
+        }
+    });
+    assert_eq!(result.unwrap(),"valid complete call");assert_eq!(count,2);
+}
+
 fn parse_native_openai_stream_with_output<R: BufRead>(
     reader: R,
     output: &mut String,
@@ -2960,6 +2982,9 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
         if chunk.get("usage").is_some_and(|value| !value.is_null()) { usage=chunk["usage"].clone(); }
         if let Some(error) = chunk.get("error") {
             return Err(format!("native stream error: {error}"));
+        }
+        if let Some(error)=chunk.pointer("/choices/0/opengpu_tool_error").and_then(|v|v.as_str()) {
+            return Err(format!("native tool arguments are incomplete: runtime rejected {error}"));
         }
         if let Some(finish) = chunk
             .pointer("/choices/0/finish_reason")
@@ -6867,7 +6892,7 @@ mod native_delta_tests {
                     assert!(sent["messages"][1]["content"]
                         .as_str()
                         .unwrap()
-                        .contains("small targeted patch"));
+                        .contains("exactly ONE complete valid tool call"));
                 }
                 let wire = &wires[count];
                 count += 1;

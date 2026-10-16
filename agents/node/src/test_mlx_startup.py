@@ -1,6 +1,6 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser
+from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
 from types import SimpleNamespace
 
 
@@ -11,6 +11,39 @@ class Array:
 
 
 class ProgressTests(unittest.TestCase):
+    def test_argument_loop_detection_does_not_treat_ordinary_code_as_a_loop(self):
+        self.assertTrue(repetitive_tool_tail('<tool_call><function=create_file><parameter=content>' + 'coverage/\n' * 35))
+        self.assertTrue(repetitive_tool_tail('<tool_call><function=create_file><parameter=content>' + 'coverage/**/*.' + '*.' * 150))
+        self.assertFalse(repetitive_tool_tail('coverage/\n' * 100))
+        self.assertFalse(repetitive_tool_tail('<tool_call><function=read_file></function></tool_call>' + 'coverage/\n' * 100))
+        self.assertFalse(repetitive_tool_tail('<tool_call><function=create_file><parameter=content>' + '\n'.join(f'function f{i}() {{ return {i}; }}' for i in range(100))))
+
+    def test_guard_finishes_one_call_and_keeps_requests_independent(self):
+        tokenizer = SimpleNamespace(encode=lambda *a, **kw: [8, 9], decode=lambda ids: ''.join(chr(i) for i in ids))
+        first, second = NativeToolGuard(tokenizer), NativeToolGuard(tokenizer)
+        self.assertFalse(first.stop([1, 2]))
+        self.assertFalse(second.stop([3]))
+        self.assertFalse(first.stop([1, 2, 8]))
+        self.assertTrue(first.stop([1, 2, 8, 9]))
+        self.assertFalse(second.stop([3, 7]))
+
+    def test_rejected_runtime_markup_is_an_explicit_private_error(self):
+        class Formatter:
+            def __init__(self, parser, tools, streaming=False): self.parser=parser
+        def parser(text, tools): return {'name':'read','arguments':{}}
+        parser.__module__='mlx_lm.tool_parsers.qwen3_coder'
+        class Handler:
+            def handle_completion(self):
+                try: Formatter(parser, []).parser('<function=read>', [])
+                except ValueError: pass
+                return self.generate_response()
+            def generate_response(self): return {'choices':[{'message':{'content':'I will read'}}]}
+        install_complete_qwen_parser(SimpleNamespace(ToolCallFormatter=Formatter,APIHandler=Handler))
+        handler=Handler();handler.body={'chat_template_kwargs':{'opengpu_native_tool_guard':True}}
+        self.assertIn('opengpu_tool_error',handler.handle_completion()['choices'][0])
+        handler.body={}
+        self.assertNotIn('opengpu_tool_error',handler.handle_completion()['choices'][0])
+
     def test_capability_endpoint_is_narrow_and_does_not_handle_other_routes(self):
         import io
         class Handler:
@@ -29,7 +62,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "version": 3})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "version": 4})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 
