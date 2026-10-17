@@ -146,7 +146,10 @@ pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
 
 fn history(payload: &Value) -> Option<&[Value]> {
     let messages = payload["messages"].as_array()?;
-    let start = messages.iter().rposition(|m| m["role"] == "user")? + 1;
+    // VS Code can insert user-role reminders between host tool results. They
+    // must not erase evidence of edits made for the current tagged request.
+    let start = messages.iter().rposition(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))
+        .or_else(||messages.iter().rposition(|m|m["role"]=="user"))? + 1;
     Some(&messages[start..])
 }
 
@@ -376,5 +379,15 @@ mod tests {
         assert!(compilation(&p,&json!({"content":"Created the requested record"})).unwrap().is_none());
         observe(&mut p,call("create_file",json!({"filePath":"/src/server.js"}),"write_"),"Created");
         assert!(compilation(&p,&json!({"content":"Created"})).is_err(),"real source changes still require validation");
+    }
+    #[test]
+    fn host_reminders_keep_source_verification_scoped_to_the_actual_request() {
+        let mut p=payload();p["messages"][0]["content"]=json!("<userRequest>Create the project</userRequest>");
+        p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+        observe(&mut p,call("create_file",json!({"filePath":"/src/server.js"}),"write_"),"Created");
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"Host reminder: continue the current task"}));
+        assert!(compilation(&p,&json!({"content":"Done"})).is_err());
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Send an API request using curl</userRequest>"}));
+        assert!(compilation(&p,&json!({"content":"HTTP result"})).unwrap().is_none());
     }
 }
