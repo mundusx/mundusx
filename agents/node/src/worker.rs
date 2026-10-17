@@ -6,6 +6,8 @@ mod native_stream;
 mod native_tool_workflow;
 #[path = "native_http_bridge.rs"]
 mod native_http_bridge;
+#[path = "native_line_edit.rs"]
+mod native_line_edit;
 use crate::contracts::{
     Backend, ModelCapability, WorkerHealthReport, WorkerLaunchRequest, WorkerLaunchResponse,
     WorkerPolicyReport,
@@ -2871,7 +2873,7 @@ fn run_native_openai_tool_turn(
             .as_secs()
             .max(30),
         ))
-        .send_json(native_http_bridge::prepare(payload))
+        .send_json(native_line_edit::prepare(&native_http_bridge::prepare(payload)))
         .map_err(|error| format!("native OpenAI tool completion failed: {error}"))?;
         if streaming {
             return parse_native_openai_stream_with_context(
@@ -2912,6 +2914,7 @@ const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     let compiled=native_http_bridge::compile(payload,message)?;
+    let compiled=native_line_edit::compile(payload,&compiled)?;
     native_workflow_message_checked(payload,&compiled).map(|(out,changed)|(out,changed || compiled!=*message)).map_err(|error| {
         // Private diagnostic context for the bounded recovery attempt. It must
         // never be emitted as a host tool call or included in a public error.
@@ -3018,6 +3021,22 @@ fn rejected_edit_stream_returns_read_without_releasing_patch_or_success_prose() 
     assert!(repaired["message"]["content"].as_str().unwrap().contains("NOT executed"));
     let emitted=rx.try_iter().collect::<Vec<_>>().join("");
     assert!(emitted.contains("read_file"));assert!(!emitted.contains("invented"));assert!(!emitted.contains("Fixed successfully"));
+}
+
+#[test]
+fn observed_line_stream_compiles_to_a_registered_grounded_host_edit() {
+    use serde_json::json;
+    let p=json!({"messages":[{"role":"user","content":"<userRequest>Add the requested feature to this project</userRequest>"},{"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":json!({"filePath":"D:/sample/main.rs","startLine":1,"endLine":20}).to_string()}}]},{"role":"tool","tool_call_id":"read1","content":"// source\r\nreturn 1;\r\n// end\r\n"}],"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}},"required":["filePath","oldString","newString"]}}}]});
+    let private=json!({"id":"span1","index":0,"type":"function","function":{"name":native_line_edit::NAME,"arguments":json!({"filePath":"D:/sample/main.rs","startLine":2,"endLine":2,"newText":"return 2;"}).to_string()}});
+    let chunk=json!({"choices":[{"delta":{"content":"Already fixed!","tool_calls":[private]},"finish_reason":"tool_calls"}]});
+    let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
+    let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p))).unwrap();
+    let parsed:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();let message=&parsed["message"];
+    validate_native_edit_preconditions(&p,message).unwrap();
+    assert_eq!(message["tool_calls"][0]["function"]["name"],"replace_string_in_file");
+    let args:serde_json::Value=serde_json::from_str(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["oldString"],"return 1;\r\n");assert_eq!(args["newString"],"return 2;\r\n");
+    let emitted=rx.try_iter().collect::<Vec<_>>().join("");assert!(!emitted.contains(native_line_edit::NAME));assert!(!emitted.contains("Already fixed"));assert!(emitted.contains("replace_string_in_file"));
 }
 
 #[cfg(test)]
