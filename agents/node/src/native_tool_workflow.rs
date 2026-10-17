@@ -103,7 +103,8 @@ pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
         for c in m["tool_calls"].as_array().into_iter().flatten() {
             if !h.iter().any(|r|r["role"]=="tool"&&r["tool_call_id"]==c["id"]) {continue;}
             match c["function"]["name"].as_str() {
-                Some("create_file"|"replace_string_in_file"|"get_errors")=>{reads=0;paths.clear();},
+                Some("create_file"|"replace_string_in_file")=>{reads=0;rounds=0;paths.clear();},
+                Some("get_errors")=>{reads+=1;rounds+=1;},
                 Some("read_file"|"list_dir"|"file_search"|"grep_search")=>{
                     reads+=1;
                     if let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) {
@@ -111,7 +112,6 @@ pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
                     }
                 },_=>{}
             }
-            if c["id"].as_str().is_some_and(|id|id.starts_with("call_verify_progress_")) {rounds+=1;}
         }
     }
     if reads<8 || paths.is_empty() {return None;}
@@ -291,6 +291,16 @@ mod tests {
         let check=inspection_progress(&p,&read).unwrap();assert_eq!(check["tool_calls"][0]["function"]["name"],"get_errors");
         observe(&mut p,check,"<compileError>Syntax error</compileError>");
         for _ in 0..8 {observe(&mut p,read.clone(),"source");}
+        assert!(inspection_progress(&p,&read).unwrap()["content"].as_str().unwrap().contains("Verification incomplete"));
+    }
+    #[test]
+    fn model_diagnostics_cannot_reset_an_inspection_loop_without_a_write() {
+        let mut p=payload();
+        let read=call("read_file",json!({"filePath":"/src/main.rs","startLine":1,"endLine":50}),"read_");
+        for _ in 0..4 {
+            observe(&mut p,read.clone(),"source");
+            observe(&mut p,call("get_errors",json!({"filePaths":["/src/main.rs"]}),"model_check_"),"No errors found");
+        }
         assert!(inspection_progress(&p,&read).unwrap()["content"].as_str().unwrap().contains("Verification incomplete"));
     }
     #[test]
