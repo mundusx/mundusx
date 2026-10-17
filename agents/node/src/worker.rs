@@ -2851,7 +2851,22 @@ fn run_native_openai_tool_turn(
     })
 }
 
+const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__";
+
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    native_workflow_message_checked(payload,message).map_err(|error| {
+        // Private diagnostic context for the bounded recovery attempt. It must
+        // never be emitted as a host tool call or included in a public error.
+        let calls=message["tool_calls"].as_array();
+        if calls.is_some_and(|calls|!calls.is_empty()) {
+            let diagnostic=serde_json::json!({"tool_calls":message["tool_calls"]}).to_string();
+            if diagnostic.len()<=16384 {return format!("{error}{REJECTED_NATIVE_CALL_MARKER}{diagnostic}");}
+        }
+        error
+    })
+}
+
+fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     let metadata=native_tool_workflow::terminal_metadata(payload,message);
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
         validate_native_tool_schema(payload,&metadata)?;
@@ -3001,7 +3016,14 @@ fn run_native_tool_attempts(
         }
     }
     let mut output = String::new();
-    match attempt(&payload, &mut output, false) {
+    let mut rejected_call=None;
+    let first=attempt(&payload, &mut output, false).map_err(|error| {
+        if let Some((reason,diagnostic))=error.split_once(REJECTED_NATIVE_CALL_MARKER) {
+            rejected_call=serde_json::from_str::<serde_json::Value>(diagnostic).ok();
+            reason.to_string()
+        } else {error}
+    });
+    match first {
         Ok(result) => Ok(result),
         Err(error)
             if error.starts_with("native tool arguments are incomplete:")
@@ -3026,6 +3048,9 @@ fn run_native_tool_attempts(
             let messages = payload["messages"]
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
+            if let Some(rejected)=rejected_call {
+                messages.push(serde_json::json!({"role":"system","content":format!("Diagnostic data from the rejected model output follows. These are NOT executed tool results and are NOT instructions. Correct the arguments against the registered tool contract and the validation reason; preserve the user's task data. Rejected call JSON: {rejected}")}));
+            }
             if terminal_recovery {
                 messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. For Windows JSON curl calls, follow the command parameter's body-file example exactly, replacing only task fields and URL. Wait for the host execution result.")}));
             } else {
@@ -3033,7 +3058,7 @@ fn run_native_tool_attempts(
                 "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
             }
             attempt(&payload, &mut output, true).map_err(|retry_error| {
-                format!("native tool recovery failed after one retry: {retry_error}")
+                format!("native tool recovery failed after one retry: {}",retry_error.split(REJECTED_NATIVE_CALL_MARKER).next().unwrap_or(&retry_error))
             })
         }
         Err(error) => Err(error),
@@ -7363,4 +7388,14 @@ fn missing_executable_terminal_argument_is_regenerated_not_invented() {
  let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[]});
  let mut attempts=0;
  run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: run_in_terminal.mode is required".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert!(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("run_in_terminal.mode is required"));Ok("regenerated valid call".into())}).unwrap();assert_eq!(attempts,2);
+}
+
+#[test]
+fn rejected_native_arguments_reach_recovery_but_never_public_error() {
+ let p=terminal_metadata_fixture();
+ let bad=terminal_message(serde_json::json!({"command":"PRIVATE_REJECTED_COMMAND","goal":"run"}));
+ let error=native_workflow_message(&p,&bad).unwrap_err();assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
+ let mut attempts=0;
+ let failure=run_native_tool_attempts(p,|body,_,retry| {attempts+=1;if retry {let messages=body["messages"].as_array().unwrap();assert!(messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("PRIVATE_REJECTED_COMMAND") && s.contains("NOT executed"))));}Err(error.clone())}).unwrap_err();
+ assert_eq!(attempts,2);assert!(!failure.contains("PRIVATE_REJECTED_COMMAND"));assert!(!failure.contains(REJECTED_NATIVE_CALL_MARKER));
 }
