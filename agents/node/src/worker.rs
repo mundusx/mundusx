@@ -2959,6 +2959,19 @@ fn streamed_terminal_call_releases_one_valid_call_with_metadata() {
 
 // Only retry rejected, unexecuted tool calls. Never replay transport failures or
 // repair JSON by inventing missing file contents.
+fn native_terminal_runtime_feedback(payload:&serde_json::Value)->Option<&'static str> {
+    let messages=payload["messages"].as_array()?;
+    let result=messages.iter().rev().find(|m|m["role"]=="tool")?["content"].as_str()?.to_ascii_lowercase();
+    let shell_quoting_error=result.contains("curl:") && (result.contains("unmatched close brace") || result.contains("port number was not a decimal") || result.contains("bad hostname"));
+    if shell_quoting_error {
+        return Some("The host terminal reported a real PowerShell curl quoting error. Do not repeat the failed command unchanged or add more backslashes. Preserve the task's URL and values; change the quoting approach. PowerShell structure: $body = @{field='actual task value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Use the actual requested fields, values and method. Before retrying an uncertain mutation, inspect the actual prior HTTP result and avoid duplicating an already successful operation. Do not claim success before receiving it.");
+    }
+    if result.contains("invoke-rrestmethod") && result.contains("not recognized") {
+        return Some("The host reports an unknown command. The PowerShell JSON HTTP cmdlet is spelled Invoke-RestMethod, not Invoke-RRestMethod. Do not nest powershell.exe when the host already provides PowerShell. Correct the actual command and preserve task data; await its result.");
+    }
+    None
+}
+
 fn run_native_tool_attempts(
     mut payload: serde_json::Value,
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
@@ -2967,6 +2980,9 @@ fn run_native_tool_attempts(
         if let Some(messages)=payload["messages"].as_array_mut() {
             messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe for native curl flags or Invoke-RestMethod for JSON APIs. Use PowerShell-compatible JSON quoting such as ConvertTo-Json and a body file. Include all registered terminal arguments. After the host returns an execution error, use the actual error to correct the command. After a successful mutation, inspect the result and do not replay it merely for verification. Preserve the requested operation and task data."}));
         }
+    }
+    if let Some(feedback)=native_terminal_runtime_feedback(&payload) {
+        if let Some(messages)=payload["messages"].as_array_mut() {messages.push(serde_json::json!({"role":"system","content":feedback}));}
     }
     let mut output = String::new();
     let mut rejected_call=None;
@@ -7357,4 +7373,12 @@ fn rejected_native_arguments_reach_recovery_but_never_public_error() {
 fn native_generation_keeps_exact_registered_tool_schemas() {
  let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
  run_native_tool_attempts(p.clone(),|body,_,_| {assert_eq!(body["tools"],p["tools"]);Ok("host call".into())}).unwrap();
+}
+
+#[test]
+fn actual_curl_runtime_errors_receive_guidance_without_replaying_success() {
+ let mut p=serde_json::json!({"messages":[{"role":"tool","content":"Exit code: 1. curl: (3) unmatched close brace/bracket in position 61"}]});
+ assert!(native_terminal_runtime_feedback(&p).unwrap().contains("Do not repeat"));
+ p["messages"][0]["content"]=serde_json::json!("Exit code: 0. HTTP 201 Created");assert!(native_terminal_runtime_feedback(&p).is_none());
+ p["messages"].as_array_mut().unwrap().push(serde_json::json!({"role":"tool","content":"Exit code: 0. Student created"}));assert!(native_terminal_runtime_feedback(&p).is_none());
 }
