@@ -2860,10 +2860,17 @@ fn run_native_openai_tool_turn(
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
-    if let Some(read)=native_line_edit::preflight(&payload) {
-        let (message,_)=native_workflow_message(&payload,&read)?;
-        if streaming {emit_stream_delta(&serde_json::json!({"tool_calls":message["tool_calls"]}).to_string());}
-        return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"tool_calls"}]}));
+    if let Some(automatic)=native_tool_workflow::validator_after_edit(&payload).or_else(||native_line_edit::preflight(&payload)) {
+        if let Ok((message,_))=native_workflow_message(&payload,&automatic) {
+            if streaming {
+                let mut calls=message["tool_calls"].clone();
+                if let Some(calls)=calls.as_array_mut() {
+                    for (index,call) in calls.iter_mut().enumerate() {call["index"]=serde_json::json!(index);}
+                }
+                emit_stream_delta(&serde_json::json!({"tool_calls":calls}).to_string());
+            }
+            return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"tool_calls"}]}));
+        }
     }
     run_native_tool_attempts(payload, |payload, output, retry| {
         let response = ureq::post(&format!(
@@ -3067,6 +3074,32 @@ fn terminal_metadata_fixture()->serde_json::Value {
 #[cfg(test)]
 fn terminal_message(args:serde_json::Value)->serde_json::Value {
     serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"terminal1","index":0,"type":"function","function":{"name":"run_in_terminal","arguments":args.to_string()}}]})
+}
+
+#[test]
+fn observed_validator_streams_a_registered_recheck_without_model_inference() {
+    let mut p=terminal_metadata_fixture();
+    for name in ["read_file","list_dir","replace_string_in_file"] {
+        p["tools"].as_array_mut().unwrap().push(serde_json::json!({"type":"function","function":{"name":name,"parameters":{"type":"object"}}}));
+    }
+    let args=serde_json::json!({"command":"node --check /src/main.js","goal":"Check syntax","explanation":"Validate repair","mode":"sync"});
+    p["messages"]=serde_json::json!([
+        {"role":"user","content":"<userRequest>Fix source and rerun its check</userRequest>"},
+        terminal_message(args.clone()),
+        {"role":"tool","tool_call_id":"terminal1","content":"/src/main.js:42\nSyntaxError\nCommand exited with code 1"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"edit1","type":"function","function":{"name":"replace_string_in_file","arguments":"{\"filePath\":\"/src/main.js\",\"oldString\":\"broken\",\"newString\":\"fixed\"}"}}]},
+        {"role":"tool","tool_call_id":"edit1","content":"Applied edit"}
+    ]);
+    let request:WorkerLaunchRequest=serde_json::from_value(serde_json::json!({"job_id":"test","node_id":"test","backend":"m","stream":true,"prompt":format!("{OPENAI_TOOL_TURN_PREFIX}{p}")})).unwrap();
+    let (tx,rx)=mpsc::channel();
+    let output=with_stream_delta_sender(Some(tx),||run_native_openai_tool_turn("http://127.0.0.1:1","mock-coder",&request)).unwrap();
+    let mut stream=native_stream::NativeStream::default();
+    for delta in rx.try_iter() {stream.push(&serde_json::from_str::<serde_json::Value>(&delta).unwrap()).unwrap();}
+    let message=stream.message();
+    assert_eq!(message["tool_calls"][0]["function"]["name"],"run_in_terminal");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap(),args);
+    let envelope:serde_json::Value=serde_json::from_str(&output[output.find('{').unwrap()..]).unwrap();
+    assert_eq!(message["tool_calls"],envelope["message"]["tool_calls"]);
 }
 
 #[test]

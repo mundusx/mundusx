@@ -117,6 +117,29 @@ pub fn compiler_failure(payload:&Value)->Option<String> {
     None
 }
 
+/// Repeat an observed finite validator only after a confirmed edit to the
+/// same compiler-reported source. No model call, shell rewrite, or new command.
+pub fn validator_after_edit(payload:&Value)->Option<Value> {
+    let tools=catalog(payload)?;tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")?;
+    let h=history(payload)?;let mut write=None;let mut check=None;
+    for (i,result) in h.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
+        let Some(id)=result["tool_call_id"].as_str().filter(|s|!s.is_empty()) else {continue;};
+        let Some(c)=h[..i].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"].as_str()==Some(id)) else {continue;};
+        let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let Some(text)=result["content"].as_str() else {continue;};
+        if matches!(c["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file"))&&successful_result(text) {if let Some(path)=a["filePath"].as_str().and_then(key) {write=Some((i,path));}}
+        if c["function"]["name"]=="run_in_terminal"&&a["command"].as_str().is_some_and(validation_command) {check=Some((i,a,text.to_string(),terminal_exit(text)));}
+    }
+    let (write_index,path)=write?;let (check_index,args,result,exit)=check?;
+    if write_index<=check_index||exit!=Some(false)||args["mode"]!="sync" {return None;}
+    let command=args["command"].as_str()?;
+    if command.contains([';','|','&','\n','\r','$','`','<','>']) {return None;}
+    let mut diagnostic=result.replace('\\',"/");while diagnostic.contains("//") {diagnostic=diagnostic.replace("//","/");}
+    if path.as_bytes().get(1)==Some(&b':') {diagnostic=diagnostic.to_ascii_lowercase();}
+    if !diagnostic.contains(&format!("{path}:"))&&!diagnostic.contains(&format!("{path}("))&&!diagnostic.contains(&format!("\"{path}\", line ")) {return None;}
+    Some(call("run_in_terminal",args,"call_recheck_observed_"))
+}
+
 /// Host execution remains permission controlled. A language-service cache is
 /// not a compiler result. Ask the model to select its project's real validator
 /// when that host tool is available; otherwise report the verification gap.
@@ -463,6 +486,19 @@ mod tests {
         for _ in 0..2 {observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"same_"),"/src/main.js:5\nSyntaxError\nCommand exited with code 1");}
         assert!(compilation(&p,&json!({"content":"Done"})).unwrap().unwrap()["content"].as_str().unwrap().contains("without diagnostic progress"));
         observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"pass_"),"Command exited with code 0");assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
+    }
+    #[test]
+    fn observed_validator_rechecks_after_same_file_edits_without_replaying_mutations() {
+        let mut p=payload();p["messages"][0]["content"]=json!("<userRequest>Fix source and rerun its check</userRequest>");p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+        let a=json!({"command":"node --check /src/main.js","goal":"Check source","explanation":"Check syntax","mode":"sync"});
+        observe(&mut p,call("run_in_terminal",a.clone(),"check_"),"/src/main.js:42\nSyntaxError\nCommand exited with code 1");assert!(validator_after_edit(&p).is_none());
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"write_"),"Applied edit");
+        let retry=validator_after_edit(&p).unwrap();assert_eq!(retry["tool_calls"][0]["function"]["name"],"run_in_terminal");assert_eq!(args(&retry),a);
+        for choice in [json!("none"),json!({"type":"function","function":{"name":"read_file"}})] {let mut explicit=p.clone();explicit["tool_choice"]=choice;assert!(validator_after_edit(&explicit).is_none());}
+        observe(&mut p,retry,"Command exited with code 0");assert!(validator_after_edit(&p).is_none());
+        for (command,file) in [("node --check /src/main.js; echo mutation","/src/main.js"),("node --check /src/main.js","/src/other.js"),("curl.exe -X POST http://localhost/api","/src/main.js")] {
+            let mut q=payload();q["tools"]=p["tools"].clone();observe(&mut q,call("run_in_terminal",json!({"command":command,"mode":"sync"}),"check_"),"/src/main.js:42\nCommand exited with code 1");observe(&mut q,call("replace_string_in_file",json!({"filePath":file}),"write_"),"Applied edit");assert!(validator_after_edit(&q).is_none());
+        }
     }
     #[test]
     fn host_reminders_keep_source_verification_scoped_to_the_actual_request() {
