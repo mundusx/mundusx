@@ -107,6 +107,7 @@ pub fn compiler_failure(payload:&Value)->Option<String> {
     let h=history(payload)?;
     for result in h.iter().rev().filter(|m|m["role"]=="tool") {
         let Some(call)=h.iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==result["tool_call_id"]) else {continue;};
+        if matches!(call["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file")) && result["content"].as_str().is_some_and(successful_result) {return None;}
         if call["function"]["name"]!="run_in_terminal" {continue;}
         let args:Value=serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
         if !args["command"].as_str().is_some_and(validation_command) {continue;}
