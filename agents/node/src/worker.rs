@@ -185,6 +185,9 @@ fn validate_native_edit_preconditions(payload:&serde_json::Value,message:&serde_
         } else {
             let old=args["oldString"].as_str().filter(|s|!s.is_empty())
                 .ok_or("native edit precondition failed: oldString must be nonempty")?;
+            if args["newString"].as_str().is_some_and(|new|new.replace("\r\n","\n")==old.replace("\r\n","\n")) {
+                return Err("native edit precondition failed: oldString and newString are identical; the edit changes nothing. Propose an actual correction using observed source, or report that verification remains incomplete".into());
+            }
             if !observed.is_some_and(|text|text.replace("\r\n","\n").contains(&old.replace("\r\n","\n"))) {
                 return Err("native edit precondition failed: read the exact target and use its observed oldString before replacing it".into());
             }
@@ -2849,14 +2852,16 @@ fn run_native_openai_tool_turn(
 }
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
-    let replacement = match validate_native_edit_preconditions(payload,message) {
-        Ok(()) => native_tool_workflow::inspection_progress(payload,message).or_else(||native_tool_workflow::verification(payload,message)),
-        Err(error) => Some(native_tool_workflow::recover_read(payload,message,&error).ok_or(error)?),
+    let canonical=native_tool_workflow::canonical_paths(payload,message);
+    let replacement = match validate_native_edit_preconditions(payload,&canonical) {
+        Ok(()) => native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)),
+        Err(error) => Some(native_tool_workflow::recover_read(payload,&canonical,&error).ok_or(error)?),
     };
     if let Some(replacement)=replacement {
+        let replacement=native_tool_workflow::canonical_paths(payload,&replacement);
         validate_native_edit_preconditions(payload,&replacement)?;
         Ok((replacement,true))
-    } else { Ok((message.clone(),false)) }
+    } else { let changed=canonical!=*message;Ok((canonical,changed)) }
 }
 
 #[test]

@@ -19,6 +19,34 @@ fn catalog(payload: &Value) -> Option<&Vec<Value>> {
 
 pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
+/// Equivalent Windows paths must name the same host document URI as well as
+/// compare equally in the guard. Never rewrite source text or relative paths.
+pub fn canonical_paths(payload:&Value,message:&Value)->Value {
+    if catalog(payload).is_none() {return message.clone();}
+    fn canonical(path:&str)->Option<String> {
+        let bytes=path.as_bytes();
+        if !bytes.first().is_some_and(u8::is_ascii_alphabetic)||bytes.get(1)!=Some(&b':')||!matches!(bytes.get(2),Some(b'/'|b'\\')) {return None;}
+        key(path)?;
+        let rest=path[2..].split(['/', '\\']).filter(|s|!s.is_empty()).collect::<Vec<_>>().join("\\");
+        Some(format!("{}:\\{rest}",path[..1].to_ascii_uppercase()))
+    }
+    let mut result=message.clone();
+    for c in result["tool_calls"].as_array_mut().into_iter().flatten() {
+        let Some(name)=c["function"]["name"].as_str() else {continue;};
+        if !matches!(name,"read_file"|"create_file"|"replace_string_in_file"|"get_errors"|"list_dir") {continue;}
+        let Ok(mut a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        for field in ["filePath","path"] {if let Some(p)=a[field].as_str().and_then(canonical) {a[field]=json!(p);}}
+        if let Some(paths)=a["filePaths"].as_array_mut() {for p in paths {if let Some(s)=p.as_str().and_then(canonical) {*p=json!(s);}}}
+        c["function"]["arguments"]=json!(a.to_string());
+    }
+    result
+}
+
+fn successful_result(text:&str)->bool {
+    let lower=text.trim_start().to_ascii_lowercase();
+    !["error","string replacement failed:","tool execution failed","failed to"].iter().any(|s|lower.starts_with(s))
+}
+
 /// Repeated inspection without a write or diagnostics is not progress. Return
 /// actual host errors once, then stop rather than rereading indefinitely.
 pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
@@ -102,16 +130,21 @@ pub fn verification(payload: &Value, message: &Value) -> Option<Value> {
     if schema.pointer("/properties/filePaths/type")?.as_str()? != "array" { return None; }
     let h = history(payload)?;
     let mut pending = std::collections::BTreeMap::new();
+    let mut failed = std::collections::BTreeSet::new();
     let mut rounds = 0;
     for m in h {
         let Some(calls) = m["tool_calls"].as_array() else { continue; };
         for c in calls {
             let Ok(args) = serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else { continue; };
             let result = h.iter().find(|r| r["role"] == "tool" && r["tool_call_id"] == c["id"]);
-            let Some(text) = result.and_then(|r| r["content"].as_str()).filter(|s| !s.trim_start().to_ascii_lowercase().starts_with("error")) else { continue; };
+            let Some(text) = result.and_then(|r| r["content"].as_str()) else { continue; };
+            if !successful_result(text) {
+                if matches!(c["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file")) {if let Some(k)=args["filePath"].as_str().and_then(key) {failed.insert(k);}}
+                continue;
+            }
             match c["function"]["name"].as_str() {
                 Some("create_file" | "replace_string_in_file") => {
-                    if let Some(path) = args["filePath"].as_str() { if let Some(k) = key(path) { pending.insert(k, path.to_string()); } }
+                    if let Some(path) = args["filePath"].as_str() { if let Some(k) = key(path) { failed.remove(&k);pending.insert(k, path.to_string()); } }
                 }
                 Some("get_errors") => {
                     if c["id"].as_str().is_some_and(|id| id.starts_with("call_verify_final_")) { rounds += 1; }
@@ -125,6 +158,7 @@ pub fn verification(payload: &Value, message: &Value) -> Option<Value> {
             }
         }
     }
+    if !failed.is_empty() {return Some(incomplete("a file write failed and no subsequent successful repair of that target was observed."));}
     if pending.is_empty() { return None; }
     if rounds >= 3 { return Some(incomplete("diagnostics did not clear within three verification rounds.")); }
     Some(call("get_errors", json!({"filePaths":pending.into_values().take(32).collect::<Vec<_>>()}), "call_verify_final_"))
@@ -214,5 +248,24 @@ mod tests {
         observe(&mut p,check,"<compileError>Syntax error</compileError>");
         for _ in 0..8 {observe(&mut p,read.clone(),"source");}
         assert!(inspection_progress(&p,&read).unwrap()["content"].as_str().unwrap().contains("Verification incomplete"));
+    }
+    #[test]
+    fn equivalent_windows_paths_use_one_host_document_without_rewriting_source() {
+        let p=payload();
+        let message=call("replace_string_in_file",json!({"filePath":r"d:\\sample\\main.py","oldString":r"literal d:\\path","newString":r"literal d:\\other"}),"edit_");
+        let normalized=canonical_paths(&p,&message);let a=args(&normalized);
+        assert_eq!(a["filePath"],r"D:\sample\main.py");
+        assert_eq!(a["oldString"],args(&message)["oldString"]);
+        let diagnostics=call("get_errors",json!({"filePaths":["d://sample//main.py","/src/main.rs"]}),"check_");
+        assert_eq!(args(&canonical_paths(&p,&diagnostics))["filePaths"],json!([r"D:\sample\main.py","/src/main.rs"]));
+    }
+    #[test]
+    fn failed_write_cannot_be_presented_as_verified_even_if_diagnostics_are_empty() {
+        let mut p=payload();let path="/src/main.py";
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":path}),"bad_"),"String replacement failed: Input and output are identical");
+        observe(&mut p,call("get_errors",json!({"filePaths":[path]}),"check_"),"No errors found");
+        assert!(verification(&p,&json!({"content":"Fixed"})).unwrap()["content"].as_str().unwrap().contains("file write failed"));
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":path}),"fixed_"),"Applied edit");
+        assert_eq!(verification(&p,&json!({"content":"Fixed"})).unwrap()["tool_calls"][0]["function"]["name"],"get_errors");
     }
 }
