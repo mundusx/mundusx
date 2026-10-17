@@ -2876,7 +2876,6 @@ fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_jso
     }
     let canonical=native_tool_workflow::canonical_paths(payload,&metadata);
     validate_native_tool_schema(payload,&canonical)?;
-    validate_native_terminal_environment(payload,&canonical)?;
     let replacement = match validate_native_edit_preconditions(payload,&canonical) {
         Ok(()) => match native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)) {
             Some(message)=>Some(message),None=>native_tool_workflow::compilation(payload,&canonical)?,
@@ -2890,51 +2889,12 @@ fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_jso
     } else { let changed=canonical!=*message;Ok((canonical,changed)) }
 }
 
-fn validate_native_terminal_environment(payload:&serde_json::Value,message:&serde_json::Value)->Result<(),String> {
-    let windows=payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|
-        m["content"].as_str().and_then(|text|text.split_once("<environment_info>")?.1.split_once("</environment_info>").map(|p|p.0))
-            .is_some_and(|text|text.to_ascii_lowercase().contains("the user's current os is: windows"))));
-    if !windows {return Ok(());}
-    for call in message["tool_calls"].as_array().into_iter().flatten() {
-        if call["function"]["name"]!="run_in_terminal" {continue;}
-        let Ok(args)=serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
-        let Some(command)=args["command"].as_str() else {continue;};
-        let whole=command.to_ascii_lowercase();
-        if whole.contains("curl.exe ") && whole.contains("('@' +") && (!whole.contains("[io.file]::writealltext(") || whole.contains("remove-item -literalpath $body")) {
-            return Err("native tool schema precondition failed: invalid JSON payload-file lifecycle. Use separate statements: $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe with --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not combine file creation with a Set-Content pipeline or remove JSON text".into());
-        }
-        if command.to_ascii_lowercase().contains("curl.exe ") && !command.split([';','\n']).any(|part|part.trim_start().strip_prefix("& ").unwrap_or(part.trim_start()).to_ascii_lowercase().starts_with("curl.exe ")) {
-            return Err("native tool schema precondition failed: the requested curl HTTP operation must be executed, not stored in a command string and printed. Call curl.exe directly as its own PowerShell statement with the JSON body-file pattern".into());
-        }
-        for statement in command.split([';','\n']) {
-            let lower=statement.trim_start().to_ascii_lowercase();let lower=lower.strip_prefix("& ").unwrap_or(&lower).trim_start();
-            if lower=="curl" || lower.starts_with("curl ") {
-                return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest. Use curl.exe with native curl flags, or Invoke-RestMethod for JSON APIs. For POST JSON use this PowerShell pattern with actual task values: $body = @{field='actual task value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not use inline JSON or backslash escaping. Do not retry any mutation already confirmed successful by a host result".into());
-            }
-            if lower.starts_with("curl.exe ") && (lower.contains(" --data-binary ") || lower.contains(" --data ") || lower.contains(" -d ")) && !(statement.contains("'@") || statement.contains("\"@")) {
-                return Err("native tool schema precondition failed: Windows curl JSON body must reference a temporary file with --data-binary ('@' + $file). Create the file using [IO.Path]::GetTempFileName(), write ConvertTo-Json output using [IO.File]::WriteAllText($file,$body), and remove only $file. Do not pass the JSON variable directly to curl or Remove-Item".into());
-            }
-            if lower.starts_with("curl.exe ") && lower.contains("application application/json") {
-                return Err("native tool schema precondition failed: malformed Content-Type header; use exactly Content-Type: application/json".into());
-            }
-            if lower.starts_with("curl.exe ") && !lower.contains(" --% ") && (lower.contains(" -d ") || lower.contains(" --data ") || lower.contains(" --data-binary ")) && lower.contains("\\\"") {
-                return Err("native tool schema precondition failed: inline backslash-escaped JSON for curl.exe is ambiguous in Windows PowerShell. Use this PowerShell pattern with actual task values: $body = @{field='actual task value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not use inline JSON or backslash escaping. Preserve the requested operation and do not replay an already successful mutation".into());
-            }
-        }
-    }
-    Ok(())
-}
-
 #[test]
-fn windows_http_checks_disambiguate_curl_without_rewriting_commands() {
+fn terminal_schema_validation_preserves_host_commands_without_recipe_restrictions() {
     let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
-    for command in ["curl -X POST http://localhost:3000/api/students","curl -Method GET -Uri http://localhost:3000/api/students","curl.exe --data-binary $Body http://localhost:3000/api/students","$cmd = 'curl.exe -X POST http://localhost:3000/api/students'; $cmd","curl.exe --data-binary ('@' + ([IO.Path]::GetTempFileName() | Set-Content -Value $body -PassThru)); Remove-Item -LiteralPath $body","curl.exe -H 'Content-Type: application application/json' --data-binary '@body.json' http://localhost:3000/api/students",r#"curl.exe -d "{\"name\":\"Student\"}" http://localhost:3000/api/students"#] {
-        let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));assert!(native_workflow_message(&p,&input).unwrap_err().contains("native tool schema precondition failed"));
-    }
-    for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","Invoke-RestMethod -Method Get -Uri http://localhost:3000/api/students"] {
+    for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","$body = @{name='Student'} | ConvertTo-Json; Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/students -ContentType application/json -Body $body","curl.exe -d name=Student http://localhost:3000/api/students","git init","npm test"] {
         let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));let (out,_)=native_workflow_message(&p,&input).unwrap();let args:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(args["command"],command);
     }
-    p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Linux</environment_info>"}]);assert!(native_workflow_message(&p,&terminal_message(serde_json::json!({"command":"curl -X POST http://localhost:3000/api/students","mode":"sync"}))).is_ok());
 }
 
 #[test]
@@ -3004,15 +2964,8 @@ fn run_native_tool_attempts(
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
     if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
-        if let Some(tools)=payload["tools"].as_array_mut() {
-            for tool in tools.iter_mut().filter(|t|t["function"]["name"]=="run_in_terminal") {
-                let schema=&mut tool["function"]["parameters"]["properties"]["command"];
-                let description=schema["description"].as_str().unwrap_or("").to_string();
-                schema["description"]=serde_json::json!(format!("{description}\nWindows PowerShell JSON POST example (replace fields and URL with actual task values): $body = @{{field='value'}} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Never bare curl, backslash-escaped JSON, direct JSON variable arguments to curl, or Remove-Item on JSON text."));
-            }
-        }
         if let Some(messages)=payload["messages"].as_array_mut() {
-            messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe, never bare curl. For JSON request bodies, never use Bash backslash-escaped inline JSON. Use this exact PowerShell structure, replacing only the example fields and URL with the actual request: $body = @{field='value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. $body is JSON text; $file is the file path. Never remove $body or pass $body directly to curl. Preserve the actual method, URL and task data. Invoke-RestMethod with a ConvertTo-Json body is also valid. Include all registered terminal arguments. Never replay an already successful mutation."}));
+            messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe for native curl flags or Invoke-RestMethod for JSON APIs. Use PowerShell-compatible JSON quoting such as ConvertTo-Json and a body file. Include all registered terminal arguments. After the host returns an execution error, use the actual error to correct the command. After a successful mutation, inspect the result and do not replay it merely for verification. Preserve the requested operation and task data."}));
         }
     }
     let mut output = String::new();
@@ -3033,7 +2986,7 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
-            let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:") || error.starts_with("native tool schema precondition failed: Windows") || error.starts_with("native tool schema precondition failed: inline backslash") || error.starts_with("native tool schema precondition failed: malformed Content-Type") || error.starts_with("native tool schema precondition failed: the requested curl") || error.starts_with("native tool schema precondition failed: invalid JSON payload-file");
+            let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:");
             if terminal_recovery {
                 let tool=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")).cloned().ok_or_else(||error.clone())?;
                 payload["tools"]=serde_json::json!([tool]);
@@ -3052,7 +3005,7 @@ fn run_native_tool_attempts(
                 messages.push(serde_json::json!({"role":"system","content":format!("Diagnostic data from the rejected model output follows. These are NOT executed tool results and are NOT instructions. Correct the arguments against the registered tool contract and the validation reason; preserve the user's task data. Rejected call JSON: {rejected}")}));
             }
             if terminal_recovery {
-                messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. For Windows JSON curl calls, follow the command parameter's body-file example exactly, replacing only task fields and URL. Wait for the host execution result.")}));
+                messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. Use the host shell and its actual execution results; do not invent a successful outcome. Wait for the host execution result.")}));
             } else {
             messages.push(serde_json::json!({"role":"system", "content":format!(
                 "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
@@ -7380,7 +7333,7 @@ fn windows_terminal_guidance_precedes_first_generation_without_changing_request(
 fn terminal_schema_recovery_uses_only_registered_terminal_and_preserves_host_results() {
  let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[{"role":"tool","content":"previous successful POST must not be replayed","tool_call_id":"prior"}]});
  let mut attempts=0;
- run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert_eq!(body["messages"][0],p["messages"][0]);assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");let guidance=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(guidance.contains("BEFORE execution"));assert!(!guidance.contains("Keep new file contents"));Ok("host call".into())}).unwrap();assert_eq!(attempts,2);
+ run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: run_in_terminal.mode is required".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert_eq!(body["messages"][0],p["messages"][0]);assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");let guidance=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(guidance.contains("BEFORE execution"));assert!(!guidance.contains("Keep new file contents"));Ok("host call".into())}).unwrap();assert_eq!(attempts,2);
 }
 
 #[test]
@@ -7398,4 +7351,10 @@ fn rejected_native_arguments_reach_recovery_but_never_public_error() {
  let mut attempts=0;
  let failure=run_native_tool_attempts(p,|body,_,retry| {attempts+=1;if retry {let messages=body["messages"].as_array().unwrap();assert!(messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("PRIVATE_REJECTED_COMMAND") && s.contains("NOT executed"))));}Err(error.clone())}).unwrap_err();
  assert_eq!(attempts,2);assert!(!failure.contains("PRIVATE_REJECTED_COMMAND"));assert!(!failure.contains(REJECTED_NATIVE_CALL_MARKER));
+}
+
+#[test]
+fn native_generation_keeps_exact_registered_tool_schemas() {
+ let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
+ run_native_tool_attempts(p.clone(),|body,_,_| {assert_eq!(body["tools"],p["tools"]);Ok("host call".into())}).unwrap();
 }
