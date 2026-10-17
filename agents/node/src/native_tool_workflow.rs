@@ -70,6 +70,31 @@ fn successful_result(text:&str)->bool {
     !["error","string replacement failed:","tool execution failed","failed to"].iter().any(|s|lower.starts_with(s))
 }
 
+fn terminal_exit(text:&str)->Option<bool> {
+    // Header-based hosts precede program output; VS Code's native terminal
+    // appends its status after the output instead.
+    text.lines().find_map(|line| {
+        let line=line.trim().to_ascii_lowercase().replace(' ',"");
+        line.strip_prefix("exitcode:").or_else(||line.strip_prefix("processexitedwithcode")).map(|code|code.trim_end_matches('.')=="0")
+    }).or_else(||text.lines().rev().find(|line|!line.trim().is_empty()).and_then(|line| {
+        let line=line.trim().to_ascii_lowercase().replace(' ',"");
+        line.strip_prefix("commandexitedwithcode").map(|code|code.trim_end_matches('.')=="0")
+    }))
+}
+
+pub fn compiler_failure(payload:&Value)->Option<String> {
+    let h=history(payload)?;
+    for result in h.iter().rev().filter(|m|m["role"]=="tool") {
+        let Some(call)=h.iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==result["tool_call_id"]) else {continue;};
+        if call["function"]["name"]!="run_in_terminal" {continue;}
+        let args:Value=serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
+        if !args["command"].as_str().is_some_and(validation_command) {continue;}
+        let text=result["content"].as_str()?;
+        return (terminal_exit(text)==Some(false)).then(||text.chars().take(3000).collect());
+    }
+    None
+}
+
 /// Host execution remains permission controlled. A language-service cache is
 /// not a compiler result. Ask the model to select its project's real validator
 /// when that host tool is available; otherwise report the verification gap.
@@ -92,11 +117,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
                     attempts+=1;
                     // The host's exit header wins over any code-looking text
                     // printed later by the program under test.
-                    verified=result.lines().find_map(|line| {
-                        let line=line.trim().to_ascii_lowercase().replace(' ',"");
-                        line.strip_prefix("exitcode:").or_else(||line.strip_prefix("processexitedwithcode"))
-                            .map(|code|code.trim_end_matches('.')=="0")
-                    }).unwrap_or(false);
+                    verified=terminal_exit(result).unwrap_or(false);
                 }
             }
         }
@@ -112,7 +133,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
 fn validation_command(command:&str)->bool {
     command.split([';','\n']).flat_map(|part|part.split("&&")).any(|part| {
         let command=part.trim().to_ascii_lowercase();
-        ["node --check ","node -c ","npx --no-install tsc","tsc ","cargo check","cargo test","python -m py_compile ","python3 -m py_compile ","python -m compileall ","python3 -m compileall ","pytest","python -m pytest","python3 -m pytest","npm test","npm run build","npm run typecheck","pnpm test","pnpm build","pnpm typecheck","mvn test","mvn compile","mvn verify","./gradlew build","./gradlew test","gradle build","gradle test","dotnet build","dotnet test","go build","go test","cmake --build ","make ","gcc ","g++ ","clang ","clang++ ","javac ","kotlinc ","swift build","swift test","ruby -c ","php -l "].iter().any(|p|command.starts_with(p))
+        ["node --check ","node -c ","node --test","npx --no-install tsc","tsc ","cargo check","cargo test","python -m py_compile ","python3 -m py_compile ","python -m compileall ","python3 -m compileall ","pytest","python -m pytest","python3 -m pytest","npm test","npm run build","npm run typecheck","pnpm test","pnpm build","pnpm typecheck","mvn test","mvn compile","mvn verify","./gradlew build","./gradlew test","gradle build","gradle test","dotnet build","dotnet test","go build","go test","cmake --build ","make ","gcc ","g++ ","clang ","clang++ ","javac ","kotlinc ","swift build","swift test","ruby -c ","php -l "].iter().any(|p|command.starts_with(p))
     })
 }
 
@@ -386,6 +407,19 @@ mod tests {
         assert!(compilation(&p,&json!({"content":"Created the requested record"})).unwrap().is_none());
         observe(&mut p,call("create_file",json!({"filePath":"/src/server.js"}),"write_"),"Created");
         assert!(compilation(&p,&json!({"content":"Created"})).is_err(),"real source changes still require validation");
+    }
+    #[test]
+    fn native_vscode_compiler_footer_and_node_tests_are_observed() {
+        let mut p=payload();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+        observe(&mut p,call("create_file",json!({"filePath":"/src/main.js"}),"write_"),"Created");
+        let failure="/src/main.js:42\nSyntaxError: Invalid or unexpected token\n\nCommand exited with code 1\n";
+        observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"check_"),failure);
+        assert_eq!(compiler_failure(&p).as_deref(),Some(failure));
+        assert!(compilation(&p,&json!({"content":"Done"})).is_err());
+        observe(&mut p,call("run_in_terminal",json!({"command":"node --test tests/course.test.js"}),"test_"),"tests 12\npass 12\nCommand exited with code 0\n");
+        assert!(compiler_failure(&p).is_none());assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
+        assert_eq!(terminal_exit("Exit Code: 1\nOutput:\nCommand exited with code 0"),Some(false));
+        assert_eq!(terminal_exit("output mentions Command exited with code 0, but is not a status"),None);
     }
     #[test]
     fn host_reminders_keep_source_verification_scoped_to_the_actual_request() {
