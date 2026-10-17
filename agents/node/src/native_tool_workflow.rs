@@ -47,6 +47,44 @@ fn successful_result(text:&str)->bool {
     !["error","string replacement failed:","tool execution failed","failed to"].iter().any(|s|lower.starts_with(s))
 }
 
+/// Host execution remains permission controlled. A language-service cache is
+/// not a compiler result. Ask the model to select its project's real validator
+/// when that host tool is available; otherwise report the verification gap.
+pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> {
+    let Some(tools)=catalog(payload) else {return Ok(None);};
+    if message["tool_calls"].as_array().is_some_and(|c|!c.is_empty()) {return Ok(None);}
+    if message["content"].as_str().is_some_and(|s|s.starts_with("Verification incomplete:")) {return Ok(None);}
+    let Some(h)=history(payload) else {return Ok(None);};
+    let mut needs=payload["messages"].as_array().is_some_and(|m|m.iter().any(|m|m["name"]=="mundusx_native_coding_policy"));
+    let mut verified=false;let mut attempts=0;
+    for m in h {
+        for c in m["tool_calls"].as_array().into_iter().flatten() {
+            let Some(result)=h.iter().find(|r|r["role"]=="tool"&&r["tool_call_id"]==c["id"]).and_then(|r|r["content"].as_str()) else {continue;};
+            if matches!(c["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file")) && successful_result(result) {needs=true;verified=false;}
+            if c["function"]["name"]=="run_in_terminal" {
+                let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+                if a["command"].as_str().is_some_and(validation_command) {
+                    attempts+=1;
+                    verified=result.lines().any(|line|matches!(line.trim().to_ascii_lowercase().replace(' ',"").as_str(),"exitcode:0"|"exitcode:0."|"processexitedwithcode0"));
+                }
+            }
+        }
+    }
+    if !needs||verified {return Ok(None);}
+    if !tools.iter().any(|t|t["function"]["name"]=="run_in_terminal") {
+        return Ok(Some(incomplete("file edits and editor diagnostics were checked, but compiler/build and runtime validation were not run because command execution is unavailable for this turn.")));
+    }
+    if attempts>=3 {return Ok(Some(incomplete("compiler/build validation did not pass within three attempts. Inspect the host's actual errors before continuing.")));}
+    Err("native compilation verification required: editor diagnostics alone do not verify source. Choose the project's actual compiler/typecheck/build or test command using run_in_terminal; inspect its real errors and fix the source before claiming completion. Do not run unrelated commands or claim a command was executed without a host result".into())
+}
+
+fn validation_command(command:&str)->bool {
+    command.split([';','\n']).flat_map(|part|part.split("&&")).any(|part| {
+        let command=part.trim().to_ascii_lowercase();
+        ["node --check ","node -c ","npx --no-install tsc","tsc ","cargo check","cargo test","python -m py_compile ","python3 -m py_compile ","python -m compileall ","python3 -m compileall ","pytest","python -m pytest","python3 -m pytest","npm test","npm run build","npm run typecheck","pnpm test","pnpm build","pnpm typecheck","mvn test","mvn compile","mvn verify","./gradlew build","./gradlew test","gradle build","gradle test","dotnet build","dotnet test","go build","go test","cmake --build ","make ","gcc ","g++ ","clang ","clang++ ","javac ","kotlinc ","swift build","swift test","ruby -c ","php -l "].iter().any(|p|command.starts_with(p))
+    })
+}
+
 /// Repeated inspection without a write or diagnostics is not progress. Return
 /// actual host errors once, then stop rather than rereading indefinitely.
 pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
@@ -267,5 +305,21 @@ mod tests {
         assert!(verification(&p,&json!({"content":"Fixed"})).unwrap()["content"].as_str().unwrap().contains("file write failed"));
         observe(&mut p,call("replace_string_in_file",json!({"filePath":path}),"fixed_"),"Applied edit");
         assert_eq!(verification(&p,&json!({"content":"Fixed"})).unwrap()["tool_calls"][0]["function"]["name"],"get_errors");
+    }
+    #[test]
+    fn compiler_feedback_is_required_but_terminal_authority_is_never_added() {
+        let mut p=payload();observe(&mut p,call("create_file",json!({"filePath":"/src/main.rs"}),"write_"),"Created");
+        let answer=json!({"content":"Everything works"});
+        assert!(compilation(&p,&answer).unwrap().unwrap()["content"].as_str().unwrap().contains("not run"));
+        p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+        assert!(compilation(&p,&answer).unwrap_err().contains("verification required"));
+        observe(&mut p,call("run_in_terminal",json!({"command":"echo cargo check"}),"not_validation_"),"Exit Code: 0");
+        assert!(compilation(&p,&answer).is_err());
+        observe(&mut p,call("run_in_terminal",json!({"command":"cargo check"}),"validation_"),"Exit Code: 1\ncompiler error");
+        assert!(compilation(&p,&answer).is_err());
+        observe(&mut p,call("run_in_terminal",json!({"command":"cargo check"}),"validation_"),"Exit Code: 0");
+        assert!(compilation(&p,&answer).unwrap().is_none());
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.rs"}),"write_"),"Applied");
+        assert!(compilation(&p,&answer).is_err());
     }
 }

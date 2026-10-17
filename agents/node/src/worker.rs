@@ -2852,9 +2852,17 @@ fn run_native_openai_tool_turn(
 }
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
+        validate_native_tool_schema(payload,message)?;
+        if message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
+            return Err(format!("native tool schema precondition failed: expected the explicitly selected function {name}"));
+        }
+    }
     let canonical=native_tool_workflow::canonical_paths(payload,message);
     let replacement = match validate_native_edit_preconditions(payload,&canonical) {
-        Ok(()) => native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)),
+        Ok(()) => match native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)) {
+            Some(message)=>Some(message),None=>native_tool_workflow::compilation(payload,&canonical)?,
+        },
         Err(error) => Some(native_tool_workflow::recover_read(payload,&canonical,&error).ok_or(error)?),
     };
     if let Some(replacement)=replacement {
@@ -2894,8 +2902,17 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool call exceeded generation limit")
                 || error.starts_with("native edit tool arguments exceed safe patch size:")
                 || error.starts_with("native edit precondition failed:")
-                || error.starts_with("native tool schema precondition failed:") =>
+                || error.starts_with("native tool schema precondition failed:")
+                || error.starts_with("native compilation verification required:") =>
         {
+            if error.starts_with("native compilation verification required:") {
+                let tool=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")).cloned().ok_or_else(||error.clone())?;
+                payload["tools"]=serde_json::json!([tool]);
+                payload["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
+                if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
+                    payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(true);
+                }
+            }
             if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
                 payload["max_tokens"]=serde_json::json!(payload["max_tokens"].as_u64().unwrap_or(4096).min(4096));
             }
@@ -2910,6 +2927,22 @@ fn run_native_tool_attempts(
         }
         Err(error) => Err(error),
     }
+}
+
+#[test]
+fn compilation_retry_selects_only_existing_host_terminal_and_never_executes_it() {
+    let payload=serde_json::json!({"messages":[],"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal"}}],"chat_template_kwargs":{"opengpu_native_tool_guard":true}});
+    let mut attempts=0;
+    let result=run_native_tool_attempts(payload,|p,_,retry| {
+        attempts+=1;
+        if !retry {return Err("native compilation verification required: run the actual compiler".into());}
+        assert_eq!(p["tools"].as_array().unwrap().len(),1);
+        assert_eq!(p["tools"][0]["function"]["name"],"run_in_terminal");
+        assert_eq!(p["tool_choice"]["function"]["name"],"run_in_terminal");
+        assert_eq!(p["chat_template_kwargs"]["opengpu_require_tool_call"],true);
+        Ok("host tool selection only".into())
+    }).unwrap();
+    assert_eq!(attempts,2);assert_eq!(result,"host tool selection only");
 }
 
 fn validate_native_tool_message(
