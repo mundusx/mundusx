@@ -65,7 +65,13 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
                 let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
                 if a["command"].as_str().is_some_and(validation_command) {
                     attempts+=1;
-                    verified=result.lines().any(|line|matches!(line.trim().to_ascii_lowercase().replace(' ',"").as_str(),"exitcode:0"|"exitcode:0."|"processexitedwithcode0"));
+                    // The host's exit header wins over any code-looking text
+                    // printed later by the program under test.
+                    verified=result.lines().find_map(|line| {
+                        let line=line.trim().to_ascii_lowercase().replace(' ',"");
+                        line.strip_prefix("exitcode:").or_else(||line.strip_prefix("processexitedwithcode"))
+                            .map(|code|code.trim_end_matches('.')=="0")
+                    }).unwrap_or(false);
                 }
             }
         }
@@ -317,6 +323,11 @@ mod tests {
         assert!(compilation(&p,&answer).is_err());
         observe(&mut p,call("run_in_terminal",json!({"command":"cargo check"}),"validation_"),"Exit Code: 1\ncompiler error");
         assert!(compilation(&p,&answer).is_err());
+        observe(&mut p,call("run_in_terminal",json!({"command":"cargo check"}),"validation_"),"Exit Code: 1\nOutput:\nExit Code: 0");
+        assert!(compilation(&p,&answer).is_err());
+        // Use a fresh fixture to verify successful feedback independently.
+        p=payload();observe(&mut p,call("create_file",json!({"filePath":"/src/main.rs"}),"write_"),"Created");
+        p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
         observe(&mut p,call("run_in_terminal",json!({"command":"cargo check"}),"validation_"),"Exit Code: 0");
         assert!(compilation(&p,&answer).unwrap().is_none());
         observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.rs"}),"write_"),"Applied");
