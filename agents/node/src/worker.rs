@@ -2850,7 +2850,7 @@ fn run_native_openai_tool_turn(
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     let replacement = match validate_native_edit_preconditions(payload,message) {
-        Ok(()) => native_tool_workflow::verification(payload,message),
+        Ok(()) => native_tool_workflow::inspection_progress(payload,message).or_else(||native_tool_workflow::verification(payload,message)),
         Err(error) => Some(native_tool_workflow::recover_read(payload,message,&error).ok_or(error)?),
     };
     if let Some(replacement)=replacement {

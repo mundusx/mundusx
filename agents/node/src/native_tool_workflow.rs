@@ -19,6 +19,34 @@ fn catalog(payload: &Value) -> Option<&Vec<Value>> {
 
 pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
+/// Repeated inspection without a write or diagnostics is not progress. Return
+/// actual host errors once, then stop rather than rereading indefinitely.
+pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
+    let tools=catalog(payload)?;
+    tools.iter().find(|t|t["function"]["name"]=="get_errors")?;
+    let calls=message["tool_calls"].as_array()?;
+    if calls.len()!=1 || !matches!(calls[0]["function"]["name"].as_str(),Some("read_file"|"list_dir"|"file_search"|"grep_search")) {return None;}
+    let h=history(payload)?;let mut reads=0;let mut rounds=0;let mut paths=std::collections::BTreeMap::new();
+    for m in h {
+        for c in m["tool_calls"].as_array().into_iter().flatten() {
+            if !h.iter().any(|r|r["role"]=="tool"&&r["tool_call_id"]==c["id"]) {continue;}
+            match c["function"]["name"].as_str() {
+                Some("create_file"|"replace_string_in_file"|"get_errors")=>{reads=0;paths.clear();},
+                Some("read_file"|"list_dir"|"file_search"|"grep_search")=>{
+                    reads+=1;
+                    if let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) {
+                        if let Some(path)=a["filePath"].as_str() {if let Some(k)=key(path) {paths.insert(k,path.to_string());}}
+                    }
+                },_=>{}
+            }
+            if c["id"].as_str().is_some_and(|id|id.starts_with("call_verify_progress_")) {rounds+=1;}
+        }
+    }
+    if reads<8 || paths.is_empty() {return None;}
+    if rounds>=1 {return Some(incomplete("inspection repeated without repairs after actionable host diagnostics."));}
+    Some(call("get_errors",json!({"filePaths":paths.into_values().take(32).collect::<Vec<_>>()}),"call_verify_progress_"))
+}
+
 fn history(payload: &Value) -> Option<&[Value]> {
     let messages = payload["messages"].as_array()?;
     let start = messages.iter().rposition(|m| m["role"] == "user")? + 1;
@@ -176,5 +204,15 @@ mod tests {
             assert!(verification(&p,&json!({"content":"answer"})).is_none());
             assert!(!is_file_turn(&p));
         }
+    }
+    #[test]
+    fn inspection_loop_requests_diagnostics_then_stops_without_inventing_repairs() {
+        let mut p=payload();
+        let read=call("read_file",json!({"filePath":"/src/main.rs","startLine":1,"endLine":50}),"read_");
+        for _ in 0..8 {observe(&mut p,read.clone(),"source");}
+        let check=inspection_progress(&p,&read).unwrap();assert_eq!(check["tool_calls"][0]["function"]["name"],"get_errors");
+        observe(&mut p,check,"<compileError>Syntax error</compileError>");
+        for _ in 0..8 {observe(&mut p,read.clone(),"source");}
+        assert!(inspection_progress(&p,&read).unwrap()["content"].as_str().unwrap().contains("Verification incomplete"));
     }
 }
