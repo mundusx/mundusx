@@ -3011,7 +3011,8 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
-            if error.starts_with("native compilation verification required:") {
+            let terminal_recovery=error.starts_with("native compilation verification required:") || error.starts_with("native tool schema precondition failed: Windows") || error.starts_with("native tool schema precondition failed: inline backslash") || error.starts_with("native tool schema precondition failed: malformed Content-Type") || error.starts_with("native tool schema precondition failed: the requested curl") || error.starts_with("native tool schema precondition failed: invalid JSON payload-file");
+            if terminal_recovery {
                 let tool=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")).cloned().ok_or_else(||error.clone())?;
                 payload["tools"]=serde_json::json!([tool]);
                 payload["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
@@ -3025,8 +3026,12 @@ fn run_native_tool_attempts(
             let messages = payload["messages"]
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
+            if terminal_recovery {
+                messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. For Windows JSON curl calls, follow the command parameter's body-file example exactly, replacing only task fields and URL. Wait for the host execution result.")}));
+            } else {
             messages.push(serde_json::json!({"role":"system", "content":format!(
                 "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
+            }
             attempt(&payload, &mut output, true).map_err(|retry_error| {
                 format!("native tool recovery failed after one retry: {retry_error}")
             })
@@ -7344,4 +7349,11 @@ mod native_delta_tests {
 fn windows_terminal_guidance_precedes_first_generation_without_changing_request() {
  let p=serde_json::json!({"messages":[{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info><userRequest>create a record using curl</userRequest>"}]});
  run_native_tool_attempts(p.clone(),|body,_,retry| {assert!(!retry);assert_eq!(body["messages"][0],p["messages"][0]);assert!(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("ConvertTo-Json"));Ok("valid call".into())}).unwrap();
+}
+
+#[test]
+fn terminal_schema_recovery_uses_only_registered_terminal_and_preserves_host_results() {
+ let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[{"role":"tool","content":"previous successful POST must not be replayed","tool_call_id":"prior"}]});
+ let mut attempts=0;
+ run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert_eq!(body["messages"][0],p["messages"][0]);assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");let guidance=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(guidance.contains("BEFORE execution"));assert!(!guidance.contains("Keep new file contents"));Ok("host call".into())}).unwrap();assert_eq!(attempts,2);
 }
