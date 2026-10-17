@@ -30,6 +30,50 @@ fn compiler_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<(String,
     }
     None
 }
+
+/// A compiler location in a file already observed by this turn authorizes a
+/// fresh registered read of that same path, not a speculative model/tool call.
+pub fn preflight(p:&Value)->Option<Value> {
+    if !compatible(p) {return None;}
+    let mut failure=super::native_tool_workflow::compiler_failure(p)?.replace('\\',"/");
+    while failure.contains("//") {failure=failure.replace("//","/");}
+    let messages=p["messages"].as_array()?;
+    let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>"))).map_or(0,|i|i+1);
+    let mut known=BTreeMap::new();let mut mutations=BTreeMap::new();
+    for (i,result) in messages.iter().enumerate().skip(start) {
+        if result["role"]!="tool"||result["content"].as_str().is_none_or(|s|s.trim().is_empty()||s.trim_start().starts_with("Error")) {continue;}
+        let Some(id)=result["tool_call_id"].as_str().filter(|s|!s.is_empty()) else {continue;};
+        let Some(call)=messages[start..i].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"].as_str()==Some(id)) else {continue;};
+        let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        if let Some(path)=a["filePath"].as_str() {if let Some(k)=key(path) {
+            if call["function"]["name"]=="read_file" {known.insert(k,(path.to_string(),a,i));}
+            else if matches!(call["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file")) {mutations.insert(k,i);}
+        }}
+    }
+    let fresh=snapshots(p);
+    let tool=p["tools"].as_array()?.iter().find(|t|t["function"]["name"]=="read_file")?;
+    let schema=&tool["function"]["parameters"];
+    if schema["required"].as_array()?.iter().any(|k|!matches!(k.as_str(),Some("filePath"|"startLine"|"endLine"))) {return None;}
+    let maximum=schema["properties"]["endLine"]["maximum"].as_u64().unwrap_or(1024).min(1024);
+    for (k,(path,last_read,read_index)) in known {
+        let text=if k.as_bytes().get(1)==Some(&b':') {failure.to_ascii_lowercase()} else {failure.clone()};
+        for line in text.lines() {
+            let Some(index)=line.find(&k) else {continue;};
+            if index>0&&line[..index].chars().last().is_some_and(|c|c.is_alphanumeric()||c=='/') {continue;}
+            let rest=line[index+k.len()..].trim_start_matches(['\'', '"']);
+            let Some(rest)=rest.strip_prefix(':').or_else(||rest.strip_prefix('(')).or_else(||rest.strip_prefix(", line ")) else {continue;};
+            let digits:String=rest.chars().take_while(char::is_ascii_digit).collect();let Ok(number)=digits.parse::<u64>() else {continue;};
+            if number==0||number>maximum {continue;}
+            if fresh.get(&k).is_some_and(|s|s.text.split_inclusive('\n').count() as u64>=number) {continue;}
+            // Do not repeat a read that already covers the location but has an
+            // unsupported host wrapper or a now-stale out-of-file diagnostic.
+            if last_read["startLine"]==1&&last_read["endLine"].as_u64().is_some_and(|end|end>=number)&&mutations.get(&k).is_none_or(|write|read_index>*write) {continue;}
+            let end=number.saturating_add(20).max(200).min(maximum);
+            return Some(json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_read_compiler_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":"read_file","arguments":json!({"filePath":path,"startLine":1,"endLine":end}).to_string()}}]}));
+        }
+    }
+    None
+}
 fn delimiter_hint(line:&str)->&'static str {
     let mut escaped=false;let mut quotes=Vec::new();
     for ch in line.chars() {
@@ -214,5 +258,17 @@ mod tests {
             assert!(super::super::native_tool_workflow::compiler_failure(&p).is_none());
             assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));
         }
+    }
+    #[test]
+    fn compiler_preflight_reads_only_known_targets_and_does_not_loop() {
+        let mut p=payload("one\ntwo\n");p["tools"][0]["function"]["parameters"]=json!({"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer","maximum":400}},"required":["filePath","startLine","endLine"]});
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","tool_calls":[{"id":"write1","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/app/main.js"}).to_string()}}]}));
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"write1","content":"Applied edit"}));
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","tool_calls":[{"id":"check1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --check D:/app/main.js"}).to_string()}}]}));
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"check1","content":"D:/app/main.js:42\nSyntaxError\nCommand exited with code 1"}));
+        let read=preflight(&p).unwrap();assert_eq!(read["tool_calls"][0]["function"]["name"],"read_file");let a=args(&read);assert_eq!(a,json!({"filePath":"D:/app/main.js","startLine":1,"endLine":200}));
+        let mut unknown=p.clone();unknown["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("D:/private/secret.js:42\nCommand exited with code 1");assert!(preflight(&unknown).is_none());
+        let mut explicit=p.clone();explicit["tool_choice"]=json!("none");assert!(preflight(&explicit).is_none());
+        p["messages"].as_array_mut().unwrap().push(read.clone());p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":read["tool_calls"][0]["id"],"content":"```unsupported host wrapper```"}));assert!(preflight(&p).is_none());
     }
 }

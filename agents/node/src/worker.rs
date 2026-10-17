@@ -2859,6 +2859,11 @@ fn run_native_openai_tool_turn(
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
+    if let Some(read)=native_line_edit::preflight(&payload) {
+        let (message,_)=native_workflow_message(&payload,&read)?;
+        if streaming {emit_stream_delta(&serde_json::json!({"tool_calls":message["tool_calls"]}).to_string());}
+        return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"tool_calls"}]}));
+    }
     run_native_tool_attempts(payload, |payload, output, retry| {
         let response = ureq::post(&format!(
             "{}/v1/chat/completions",
