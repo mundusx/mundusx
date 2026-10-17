@@ -215,9 +215,17 @@ pub fn preflight(p: &Value) -> Option<Value> {
             if number == 0 || number > maximum {
                 continue;
             }
+            let lookahead = fresh
+                .get(&k)
+                .and_then(|s| s.text.split_inclusive('\n').nth(number as usize - 1))
+                .filter(|s| {
+                    delimiter_hint(s).starts_with("The reported source line has mismatched")
+                })
+                .map_or(20, |_| 2);
+            let through = number.saturating_add(lookahead).min(maximum);
             if fresh
                 .get(&k)
-                .is_some_and(|s| s.text.split_inclusive('\n').count() as u64 >= number)
+                .is_some_and(|s| s.text.split_inclusive('\n').count() as u64 >= through)
             {
                 continue;
             }
@@ -226,7 +234,7 @@ pub fn preflight(p: &Value) -> Option<Value> {
             if last_read["startLine"] == 1
                 && last_read["endLine"]
                     .as_u64()
-                    .is_some_and(|end| end >= number)
+                    .is_some_and(|end| end >= through)
                 && mutations.get(&k).is_none_or(|write| read_index > *write)
             {
                 continue;
@@ -480,13 +488,28 @@ pub fn prepare(p: &Value) -> Value {
     }
     if let Some((path, line)) = &focus {
         let source = &sources[path];
-        let hint = delimiter_hint(
-            source
-                .text
-                .split_inclusive('\n')
-                .nth(line - 1)
-                .unwrap_or(""),
-        );
+        let diagnostic = super::native_tool_workflow::compiler_failure(p).unwrap_or_default();
+        let duplicate = [
+            "already been declared",
+            "already defined",
+            "defined multiple times",
+            "redefinition",
+            "duplicate definition",
+            "duplicate declaration",
+        ]
+        .iter()
+        .any(|s| diagnostic.to_ascii_lowercase().contains(s));
+        let hint = if duplicate {
+            "The compiler reports a duplicate definition. Keep one intended complete definition and remove genuinely redundant complete definitions, preserving required exports and behavior. For a block definition, remove its whole balanced block, not only its declaration header. Use empty newText to delete an observed line range. Do not repeat an unchanged declaration or rename symbols merely to hide the duplicate."
+        } else {
+            delimiter_hint(
+                source
+                    .text
+                    .split_inclusive('\n')
+                    .nth(line - 1)
+                    .unwrap_or(""),
+            )
+        };
         let radius = if hint.starts_with("The reported source line has mismatched") {
             2
         } else {
@@ -869,5 +892,21 @@ mod tests {
         let mut expected = text.lines().map(str::to_string).collect::<Vec<_>>();
         expected[31] = "changed".into();
         assert_eq!(actual, expected.join("\n") + "\n");
+    }
+    #[test]
+    fn duplicate_repairs_can_remove_a_complete_observed_declaration() {
+        let mut p = payload("const item = 1;\nconst item = 1;\n");
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","tool_calls":[{"id":"check1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --check D:/app/main.js"}).to_string()}}]}));
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"check1","content":"D:/app/main.js:2\nSyntaxError: Identifier 'item' has already been declared\nCommand exited with code 1"}));
+        let prepared = prepare(&p);
+        assert!(
+            prepared["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("empty newText")
+        );
+        let a = args(&compile(&p, &edit(2, 2, "")).unwrap());
+        assert_eq!(a["oldString"], "const item = 1;\nconst item = 1;\n");
+        assert_eq!(a["newString"], "const item = 1;\n");
     }
 }
