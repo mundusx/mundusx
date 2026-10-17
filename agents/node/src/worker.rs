@@ -2884,6 +2884,10 @@ fn validate_native_terminal_environment(payload:&serde_json::Value,message:&serd
         if call["function"]["name"]!="run_in_terminal" {continue;}
         let Ok(args)=serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         let Some(command)=args["command"].as_str() else {continue;};
+        let whole=command.to_ascii_lowercase();
+        if whole.contains("curl.exe ") && whole.contains("('@' +") && (!whole.contains("[io.file]::writealltext(") || whole.contains("remove-item -literalpath $body")) {
+            return Err("native tool schema precondition failed: invalid JSON payload-file lifecycle. Use separate statements: $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe with --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not combine file creation with a Set-Content pipeline or remove JSON text".into());
+        }
         if command.to_ascii_lowercase().contains("curl.exe ") && !command.split([';','\n']).any(|part|part.trim_start().strip_prefix("& ").unwrap_or(part.trim_start()).to_ascii_lowercase().starts_with("curl.exe ")) {
             return Err("native tool schema precondition failed: the requested curl HTTP operation must be executed, not stored in a command string and printed. Call curl.exe directly as its own PowerShell statement with the JSON body-file pattern".into());
         }
@@ -2909,7 +2913,7 @@ fn validate_native_terminal_environment(payload:&serde_json::Value,message:&serd
 #[test]
 fn windows_http_checks_disambiguate_curl_without_rewriting_commands() {
     let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
-    for command in ["curl -X POST http://localhost:3000/api/students","curl -Method GET -Uri http://localhost:3000/api/students","curl.exe --data-binary $Body http://localhost:3000/api/students","$cmd = 'curl.exe -X POST http://localhost:3000/api/students'; $cmd","curl.exe -H 'Content-Type: application application/json' --data-binary '@body.json' http://localhost:3000/api/students",r#"curl.exe -d "{\"name\":\"Student\"}" http://localhost:3000/api/students"#] {
+    for command in ["curl -X POST http://localhost:3000/api/students","curl -Method GET -Uri http://localhost:3000/api/students","curl.exe --data-binary $Body http://localhost:3000/api/students","$cmd = 'curl.exe -X POST http://localhost:3000/api/students'; $cmd","curl.exe --data-binary ('@' + ([IO.Path]::GetTempFileName() | Set-Content -Value $body -PassThru)); Remove-Item -LiteralPath $body","curl.exe -H 'Content-Type: application application/json' --data-binary '@body.json' http://localhost:3000/api/students",r#"curl.exe -d "{\"name\":\"Student\"}" http://localhost:3000/api/students"#] {
         let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));assert!(native_workflow_message(&p,&input).unwrap_err().contains("native tool schema precondition failed"));
     }
     for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","Invoke-RestMethod -Method Get -Uri http://localhost:3000/api/students"] {
