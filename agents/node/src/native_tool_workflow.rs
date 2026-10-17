@@ -19,6 +19,27 @@ fn catalog(payload: &Value) -> Option<&Vec<Value>> {
 
 pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
+pub fn task_constraints(payload:&Value,message:&Value)->Result<(),String> {
+    let text=payload["messages"].as_array().and_then(|m|m.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(s,_)|s)))).unwrap_or("").to_ascii_lowercase();
+    if !["do not install","don't install","without installing","without reinstalling","do not reinstall","don't reinstall","reuse installed"].iter().any(|s|text.contains(s)) {return Ok(());}
+    for call in message["tool_calls"].as_array().into_iter().flatten() {
+        if call["function"]["name"]!="run_in_terminal" {continue;}
+        let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let Some(command)=a["command"].as_str() else {continue;};
+        let blocked=command.split([';','\n']).flat_map(|s|s.split("&&")).any(|s| {
+            let words=s.split_whitespace().map(|s|s.trim_matches(['\'', '"']).to_ascii_lowercase()).collect::<Vec<_>>();
+            let Some(exe)=words.first() else {return false;};
+            let exe=exe.rsplit(['/', '\\']).next().unwrap_or(exe).trim_end_matches(".cmd").trim_end_matches(".exe");
+            let action=words.get(1).map(String::as_str);
+            (matches!(exe,"npm"|"pnpm"|"yarn")&&matches!(action,Some("install"|"i"|"ci"|"add")))
+                || (matches!(exe,"pip"|"pip3"|"gem"|"brew"|"choco"|"scoop"|"bundle")&&action==Some("install"))
+                || (matches!(exe,"python"|"python3"|"py")&&words.get(1).is_some_and(|s|s=="-m")&&words.get(2).is_some_and(|s|s=="pip")&&words.get(3).is_some_and(|s|s=="install"))
+        });
+        if blocked {return Err("native task precondition failed: the current user request forbids dependency installation. This command was NOT executed. Reuse available dependencies and choose the next source edit or finite validation command; do not retry the install".into());}
+    }
+    Ok(())
+}
+
 /// VS Code requires display labels in addition to executable terminal args.
 /// Fill only absent display strings declared by the registered contract. Never
 /// synthesize or rewrite the command, execution mode, timeout or permissions.
@@ -274,6 +295,16 @@ fn advisory_only(text:&str)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicitly_forbidden_installs_never_replace_normal_coding_permissions() {
+        let mut p=json!({"messages":[{"role":"user","content":"<userRequest>Implement the feature. Reuse installed packages without reinstalling.</userRequest>"}]});
+        for command in ["npm install sqlite3@5.0.2 express@4.18.2 --save","cd D:/app; npm ci","cd /app && pip install flask","python -m pip install flask","pnpm add express"] {
+            let message=call("run_in_terminal",json!({"command":command}),"install_");assert!(task_constraints(&p,&message).is_err(),"{command}");
+        }
+        for command in ["node --check main.js","node --test tests/api.test.js","npm test","cargo test","git init","Write-Host 'npm install'"] {assert!(task_constraints(&p,&call("run_in_terminal",json!({"command":command}),"ok_")).is_ok(),"{command}");}
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Install the missing dependencies now</userRequest>"}));
+        assert!(task_constraints(&p,&call("run_in_terminal",json!({"command":"npm install"}),"allowed_")).is_ok());
+    }
     fn payload()->Value {json!({"tools":[
         {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}},
         {"function":{"name":"get_errors","parameters":{"properties":{"filePaths":{"type":"array","items":{"type":"string"}}}}}}],

@@ -2928,6 +2928,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
 }
 
 fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    native_tool_workflow::task_constraints(payload,message)?;
     let metadata=complete_native_read_ranges(payload,&native_tool_workflow::terminal_metadata(payload,message));
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
         validate_native_tool_schema(payload,&metadata)?;
@@ -3141,6 +3142,7 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool call exceeded generation limit")
                 || error.starts_with("native edit tool arguments exceed safe patch size:")
                 || error.starts_with("native edit precondition failed:")
+                || error.starts_with("native task precondition failed:")
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
