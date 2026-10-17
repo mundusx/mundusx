@@ -2861,6 +2861,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
     }
     let canonical=native_tool_workflow::canonical_paths(payload,&metadata);
     validate_native_tool_schema(payload,&canonical)?;
+    validate_native_terminal_environment(payload,&canonical)?;
     let replacement = match validate_native_edit_preconditions(payload,&canonical) {
         Ok(()) => match native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)) {
             Some(message)=>Some(message),None=>native_tool_workflow::compilation(payload,&canonical)?,
@@ -2872,6 +2873,40 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
         validate_native_edit_preconditions(payload,&replacement)?;
         Ok((replacement,true))
     } else { let changed=canonical!=*message;Ok((canonical,changed)) }
+}
+
+fn validate_native_terminal_environment(payload:&serde_json::Value,message:&serde_json::Value)->Result<(),String> {
+    let windows=payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|
+        m["content"].as_str().and_then(|text|text.split_once("<environment_info>")?.1.split_once("</environment_info>").map(|p|p.0))
+            .is_some_and(|text|text.to_ascii_lowercase().contains("the user's current os is: windows"))));
+    if !windows {return Ok(());}
+    for call in message["tool_calls"].as_array().into_iter().flatten() {
+        if call["function"]["name"]!="run_in_terminal" {continue;}
+        let Ok(args)=serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let Some(command)=args["command"].as_str() else {continue;};
+        for statement in command.split([';','\n']) {
+            let lower=statement.trim_start().to_ascii_lowercase();let lower=lower.strip_prefix("& ").unwrap_or(&lower).trim_start();
+            if lower=="curl" || lower.starts_with("curl ") {
+                return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest. Use curl.exe with native curl flags, or Invoke-RestMethod for JSON APIs. For POST JSON use ConvertTo-Json and a temporary payload file with curl.exe --data-binary @file, or an Invoke-RestMethod body. Do not retry any mutation already confirmed successful by a host result".into());
+            }
+            if lower.starts_with("curl.exe ") && !lower.contains(" --% ") && (lower.contains(" -d ") || lower.contains(" --data ") || lower.contains(" --data-binary ")) && lower.contains("\\\"") {
+                return Err("native tool schema precondition failed: inline backslash-escaped JSON for curl.exe is ambiguous in Windows PowerShell. Write JSON using ConvertTo-Json to a temporary file and use --data-binary @file, or use Invoke-RestMethod with the JSON body. Preserve the requested operation and do not replay an already successful mutation".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn windows_http_checks_disambiguate_curl_without_rewriting_commands() {
+    let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
+    for command in ["curl -X POST http://localhost:3000/api/students","curl -Method GET -Uri http://localhost:3000/api/students",r#"curl.exe -d "{\"name\":\"Student\"}" http://localhost:3000/api/students"#] {
+        let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));assert!(native_workflow_message(&p,&input).unwrap_err().contains("native tool schema precondition failed"));
+    }
+    for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","Invoke-RestMethod -Method Get -Uri http://localhost:3000/api/students"] {
+        let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));let (out,_)=native_workflow_message(&p,&input).unwrap();let args:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(args["command"],command);
+    }
+    p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Linux</environment_info>"}]);assert!(native_workflow_message(&p,&terminal_message(serde_json::json!({"command":"curl -X POST http://localhost:3000/api/students","mode":"sync"}))).is_ok());
 }
 
 #[test]
