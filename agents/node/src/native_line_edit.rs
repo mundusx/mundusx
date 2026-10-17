@@ -3,6 +3,7 @@
 use serde_json::{json,Value};
 use std::collections::BTreeMap;
 pub const NAME:&str="__mundusx_edit_observed_lines";
+const HOST_NAME:&str="replace_string_in_file";
 
 struct Snapshot {path:String,text:String,call_id:String}
 fn key(path:&str)->Option<String> {
@@ -52,7 +53,7 @@ pub fn prepare(p:&Value)->Value {
         let paths:Vec<_>=sources.values().map(|s|s.path.clone()).collect();
         let ranges:Vec<_>=sources.values().map(|s|format!("{}: lines 1..{}",s.path,s.text.split_inclusive('\n').count())).collect();
         let max=sources.values().map(|s|s.text.split_inclusive('\n').count()).max().unwrap();
-        out["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":NAME,"description":format!("Edit an existing observed file by inclusive 1-based line numbers. Available ranges: {}. Use a small exact range and supply its complete replacement as newText, without line-number labels. Do not copy oldString: the adapter obtains it from the actual read result and calls the registered host replacement tool. Read from line 1 through the needed range before editing beyond these bounds.",ranges.join("; ")),"parameters":{"type":"object","properties":{"filePath":{"type":"string","enum":paths},"startLine":{"type":"integer","minimum":1,"maximum":max},"endLine":{"type":"integer","minimum":1,"maximum":max},"newText":{"type":"string","description":"Replacement source lines only, without numbered-source labels. Empty text deletes the selected lines."}},"required":["filePath","startLine","endLine","newText"],"additionalProperties":false}}}));
+        out["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":HOST_NAME,"description":format!("Edit an existing observed file by inclusive 1-based line numbers. Available ranges: {}. Use a small exact range and supply its complete replacement as newText, without line-number labels. Do not copy oldString: the adapter obtains it from the actual read result and calls the registered host replacement tool. Read from line 1 through the needed range before editing beyond these bounds.",ranges.join("; ")),"parameters":{"type":"object","properties":{"filePath":{"type":"string","enum":paths},"startLine":{"type":"integer","minimum":1,"maximum":max},"endLine":{"type":"integer","minimum":1,"maximum":max},"newText":{"type":"string","description":"Replacement source lines only, without numbered-source labels. Empty text deletes the selected lines."}},"required":["filePath","startLine","endLine","newText"],"additionalProperties":false}}}));
         for m in out["messages"].as_array_mut().into_iter().flatten() {
             if m["role"]!="tool" {continue;}
             if let Some(s)=sources.values().find(|s|m["tool_call_id"].as_str()==Some(s.call_id.as_str())) {
@@ -68,9 +69,20 @@ pub fn prepare(p:&Value)->Value {
 }
 pub fn compile(p:&Value,message:&Value)->Result<Value,String> {
     let Some(calls)=message["tool_calls"].as_array() else {return Ok(message.clone());};
+    // Host instructions can keep the registered edit name salient even while
+    // the planner schema is visible. Accept only its exact planner-shaped
+    // arguments; never infer a source range from missing oldString alone.
+    if calls.len()==1 && calls[0]["function"]["name"]=="replace_string_in_file" && compatible(p) {
+        if let Ok(a)=serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap_or("")) {
+            if a.as_object().is_some_and(|o|o.len()==4&&["filePath","startLine","endLine","newText"].iter().all(|k|o.contains_key(*k))) {
+                let mut planned=message.clone();planned["tool_calls"][0]["function"]["name"]=json!(NAME);
+                return compile(p,&planned);
+            }
+        }
+    }
     if !calls.iter().any(|c|c["function"]["name"]==NAME) {return Ok(message.clone());}
     let fail=|reason:&str|format!("native tool schema precondition failed: {NAME}: {reason}");
-    if !compatible(p)||calls.len()!=1||!prepare(p)["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|t["function"]["name"]==NAME)) {return Err(fail("one registered observed-line edit is required"));}
+    if !compatible(p)||calls.len()!=1||!prepare(p)["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|t["function"]["name"]==HOST_NAME&&t["function"]["parameters"]["properties"]["startLine"].is_object())) {return Err(fail("one registered observed-line edit is required"));}
     let call=&calls[0];let a:Value=serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("")).map_err(|_|fail("arguments must be JSON"))?;
     if a.as_object().is_none_or(|o|o.keys().any(|k|!matches!(k.as_str(),"filePath"|"startLine"|"endLine"|"newText"))) {return Err(fail("unexpected argument"));}
     let path=a["filePath"].as_str().ok_or_else(||fail("filePath is required"))?;
@@ -109,12 +121,14 @@ mod tests {
     fn actual_old_text_is_compiled_without_model_copying_it() {
         let p=payload("const db = existing;\r\nconst query = 'UPDATE courses SET name = ?\";\r\nnext();\r\n");
         let prepared=prepare(&p);assert!(prepared["messages"][2]["content"].as_str().unwrap().contains("2 | const query"));
-        assert!(!prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="replace_string_in_file"));
+        assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==HOST_NAME&&t["function"]["parameters"]["properties"]["startLine"].is_object()));
         let out=compile(&p,&edit(2,2,"const query = 'UPDATE courses SET name = ?';")).unwrap();let a=args(&out);
         assert_eq!(out["tool_calls"][0]["function"]["name"],"replace_string_in_file");
         assert_eq!(a["oldString"],"const query = 'UPDATE courses SET name = ?\";\r\n");
         assert_eq!(a["newString"],"const query = 'UPDATE courses SET name = ?';\r\n");
         assert_eq!(p["messages"][2]["content"],"const db = existing;\r\nconst query = 'UPDATE courses SET name = ?\";\r\nnext();\r\n");
+        let mut host=edit(2,2,"fixed");host["tool_calls"][0]["function"]["name"]=json!(HOST_NAME);
+        assert_eq!(args(&compile(&p,&host).unwrap())["oldString"],a["oldString"]);
     }
     #[test]
     fn unique_context_is_preserved_and_unicode_is_opaque_source() {
