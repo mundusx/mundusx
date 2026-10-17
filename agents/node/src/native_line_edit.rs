@@ -5,6 +5,17 @@ use std::collections::BTreeMap;
 pub const NAME:&str="__mundusx_edit_observed_lines";
 const HOST_NAME:&str="replace_string_in_file";
 
+/// Full-file VS Code reads can serialize CRLF as CRCRLF. Canonicalize only
+/// matched read results, never user messages, source edits or terminal output.
+pub fn normalize_read_results(p:&mut Value) {
+    let Some(messages)=p["messages"].as_array_mut() else {return;};let mut reads=BTreeMap::new();
+    for m in messages {
+        if m["role"]=="assistant" {for c in m["tool_calls"].as_array().into_iter().flatten() {if let Some(id)=c["id"].as_str().filter(|s|!s.is_empty()) {reads.insert(id.to_string(),c["function"]["name"]=="read_file");}}}
+        if m["role"]!="tool"||!m["tool_call_id"].as_str().is_some_and(|id|reads.get(id)==Some(&true)) {continue;}
+        if let Some(text)=m["content"].as_str().filter(|s|s.contains("\r\r\n")) {let mut text=text.to_string();while text.contains("\r\r\n") {text=text.replace("\r\r\n","\r\n");}m["content"]=json!(text);}
+    }
+}
+
 struct Snapshot {path:String,text:String,call_id:String}
 fn key(path:&str)->Option<String> {
     let p=path.replace('\\',"/");
@@ -117,7 +128,11 @@ pub fn prepare(p:&Value)->Value {
     if !compatible(p) {return p.clone();}
     // Unknown host wrappers and legacy CR-only files retain their native edit
     // contract rather than inventing absolute source-line positions.
-    if p["messages"].as_array().is_some_and(|m|m.iter().filter(|m|m["role"]=="tool").filter_map(|m|m["content"].as_str()).any(|s|s.len()>131072||s.replace("\r\n","").contains('\r')||["```","<file>","<path>","File:"].iter().any(|prefix|s.starts_with(prefix)))) {return p.clone();}
+    if p["messages"].as_array().is_some_and(|messages|messages.iter().enumerate().filter(|(_,m)|m["role"]=="tool").any(|(i,m)| {
+        let Some(id)=m["tool_call_id"].as_str().filter(|s|!s.is_empty()) else {return false;};
+        if !messages[..i].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().any(|c|c["id"].as_str()==Some(id)&&c["function"]["name"]=="read_file") {return false;}
+        m["content"].as_str().is_some_and(|s|s.len()>131072||s.replace("\r\n","").contains('\r')||["```","<file>","<path>","File:"].iter().any(|prefix|s.starts_with(prefix)))
+    })) {return p.clone();}
     let mut sources=snapshots(p);let mut out=p.clone();
     let focus=compiler_target(p,&sources);
     if let Some((path,_))=&focus {sources.retain(|k,_|k==path);}
@@ -195,7 +210,7 @@ pub fn compile(p:&Value,message:&Value)->Result<Value,String> {
         let old=lines[lo..hi].concat();
         let expanded=format!("{}{}{}",lines[lo..start-1].concat(),new,lines[end..hi].concat());
         if !old.is_empty()&&source.text.replace("\r\n","\n").matches(&old.replace("\r\n","\n")).count()==1 {break(old,expanded);}
-        if start-1-lo+hi-end>=20||(lo==0&&hi==lines.len()) {return Err(fail("select more unique observed context"));}
+        if start-1-lo+hi-end>=128||(lo==0&&hi==lines.len()) {return Err(fail("select more unique observed context"));}
         lo=lo.saturating_sub(1);hi=(hi+1).min(lines.len());
     };
     if old.len()+new.len()>16384 {return Err(fail("compiled edit exceeds the bounded patch size"));}
@@ -270,5 +285,15 @@ mod tests {
         let mut unknown=p.clone();unknown["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("D:/private/secret.js:42\nCommand exited with code 1");assert!(preflight(&unknown).is_none());
         let mut explicit=p.clone();explicit["tool_choice"]=json!("none");assert!(preflight(&explicit).is_none());
         p["messages"].as_array_mut().unwrap().push(read.clone());p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":read["tool_calls"][0]["id"],"content":"```unsupported host wrapper```"}));assert!(preflight(&p).is_none());
+    }
+    #[test]
+    fn full_read_transport_and_large_duplicate_blocks_keep_edits_grounded() {
+        let mut p=payload("first\r\r\nsecond\r\r\n");p["messages"][0]["content"]=json!("<userRequest>Fix source</userRequest>user data\r\r\n");
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"unmatched","content":"terminal data\r\r\n"}));
+        normalize_read_results(&mut p);assert_eq!(p["messages"][2]["content"],"first\r\nsecond\r\n");assert!(p["messages"][0]["content"].as_str().unwrap().ends_with("\r\r\n"));assert_eq!(p["messages"][3]["content"],"terminal data\r\r\n");
+        assert_eq!(args(&compile(&p,&edit(2,2,"fixed")).unwrap())["oldString"],"second\r\n");
+        let block=(0..60).map(|i|format!("same{i}\n")).collect::<String>();let text=format!("anchorA\n{block}anchorB\n{block}anchorC\n");let p=payload(&text);
+        let out=compile(&p,&edit(32,32,"changed")).unwrap();let a=args(&out);assert!(a["oldString"].as_str().unwrap().lines().count()>20);
+        let actual=text.replacen(a["oldString"].as_str().unwrap(),a["newString"].as_str().unwrap(),1);let mut expected=text.lines().map(str::to_string).collect::<Vec<_>>();expected[31]="changed".into();assert_eq!(actual,expected.join("\n")+"\n");
     }
 }

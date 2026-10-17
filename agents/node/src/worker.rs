@@ -2850,6 +2850,7 @@ fn run_native_openai_tool_turn(
         .ok_or_else(|| "native OpenAI tool turn prefix is missing".to_string())?;
     let mut payload: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("native OpenAI tool turn is invalid JSON: {error}"))?;
+    native_line_edit::normalize_read_results(&mut payload);
     payload["model"] = serde_json::Value::String(model.to_string());
     if configured_mlx_server_url().as_deref() == Some(url) {
         crate::model_profile::apply_mlx(model, &mut payload);

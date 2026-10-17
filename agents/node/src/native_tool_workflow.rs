@@ -128,7 +128,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
     // A broad coding catalog/policy is not evidence of a source change. An
     // API request or server-start command must not trigger unrelated builds.
     let mut needs=false;
-    let mut verified=false;let mut attempts=0;
+    let mut verified=false;let mut attempts=0;let mut previous_failure=None;
     for m in h {
         for c in m["tool_calls"].as_array().into_iter().flatten() {
             let Some(result)=h.iter().find(|r|r["role"]=="tool"&&r["tool_call_id"]==c["id"]).and_then(|r|r["content"].as_str()) else {continue;};
@@ -136,10 +136,13 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
             if c["function"]["name"]=="run_in_terminal" {
                 let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
                 if a["command"].as_str().is_some_and(validation_command) {
-                    attempts+=1;
                     // The host's exit header wins over any code-looking text
                     // printed later by the program under test.
                     verified=terminal_exit(result).unwrap_or(false);
+                    if verified {attempts=0;previous_failure=None;} else {
+                        let diagnostic=result.replace("\r\n","\n");
+                        attempts=if previous_failure.as_ref()==Some(&diagnostic) {attempts+1} else {1};previous_failure=Some(diagnostic);
+                    }
                 }
             }
         }
@@ -148,7 +151,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
     if !tools.iter().any(|t|t["function"]["name"]=="run_in_terminal") {
         return Ok(Some(incomplete("file edits and editor diagnostics were checked, but compiler/build and runtime validation were not run because command execution is unavailable for this turn.")));
     }
-    if attempts>=3 {return Ok(Some(incomplete("compiler/build validation did not pass within three attempts. Inspect the host's actual errors before continuing.")));}
+    if attempts>=3 {return Ok(Some(incomplete("the same compiler/build failure persisted across three checks without diagnostic progress. Inspect the host's actual error before continuing.")));}
     Err("native compilation verification required: editor diagnostics alone do not verify source. Choose the project's actual compiler/typecheck/build or test command using run_in_terminal; inspect its real errors and fix the source before claiming completion. Do not run unrelated commands or claim a command was executed without a host result".into())
 }
 
@@ -452,6 +455,14 @@ mod tests {
         assert!(compiler_failure(&p).is_none());assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
         assert_eq!(terminal_exit("Exit Code: 1\nOutput:\nCommand exited with code 0"),Some(false));
         assert_eq!(terminal_exit("output mentions Command exited with code 0, but is not a status"),None);
+    }
+    #[test]
+    fn new_compiler_errors_continue_but_identical_failures_are_bounded() {
+        let mut p=payload();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));observe(&mut p,call("create_file",json!({"filePath":"/src/main.js"}),"write_"),"Created");
+        for line in 1..=5 {observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"check_"),&format!("/src/main.js:{line}\nSyntaxError\nCommand exited with code 1"));assert!(compilation(&p,&json!({"content":"Done"})).is_err(),"a newly observed error remains actionable");}
+        for _ in 0..2 {observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"same_"),"/src/main.js:5\nSyntaxError\nCommand exited with code 1");}
+        assert!(compilation(&p,&json!({"content":"Done"})).unwrap().unwrap()["content"].as_str().unwrap().contains("without diagnostic progress"));
+        observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"pass_"),"Command exited with code 0");assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
     }
     #[test]
     fn host_reminders_keep_source_verification_scoped_to_the_actual_request() {
