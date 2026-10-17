@@ -108,6 +108,39 @@ fn validate_native_tool_schema(payload:&serde_json::Value,message:&serde_json::V
     Ok(())
 }
 
+/// A plain file inspection may omit the host's mandatory range metadata.
+/// Supply a bounded prefix, never a guessed path or a replacement for explicit
+/// arguments. The host schema still validates the complete candidate.
+fn complete_native_read_ranges(payload:&serde_json::Value,message:&serde_json::Value)->serde_json::Value {
+    use serde_json::{json,Value};
+    let Some(tool)=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="read_file")) else {return message.clone();};
+    let schema=&tool["function"]["parameters"];
+    if !["startLine","endLine"].iter().all(|field|
+        matches!(schema["properties"][*field]["type"].as_str(),Some("number"|"integer"))
+        && schema["required"].as_array().is_some_and(|fields|fields.iter().any(|f|f.as_str()==Some(field)))) {return message.clone();}
+    // A user-specified range needs faithful planning, not a default prefix.
+    let request=payload["messages"].as_array().and_then(|messages|messages.iter().rev().find(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>"))))
+        .and_then(|m|m["content"].as_str()).and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|p|p.0));
+    if request.is_some_and(|s|s.to_ascii_lowercase().contains("line")) {return message.clone();}
+    let mut result=message.clone();
+    for call in result["tool_calls"].as_array_mut().into_iter().flatten() {
+        if call["function"]["name"]!="read_file" {continue;}
+        let Ok(mut args)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        if args["filePath"].as_str().is_none_or(|s|s.trim().is_empty()) {continue;}
+        let missing_start=args.get("startLine").is_none();let missing_end=args.get("endLine").is_none();
+        if !missing_start&&!missing_end {continue;}
+        let start=if missing_start {1} else {let Some(n)=args["startLine"].as_u64().filter(|n|*n>=1) else {continue;};n};
+        let Some(default_end)=start.checked_add(199) else {continue;};
+        let end=if missing_end {schema["properties"]["endLine"]["maximum"].as_u64().map_or(default_end,|max|max.min(default_end))} else {let Some(n)=args["endLine"].as_u64() else {continue;};n};
+        if end<start {continue;}
+        if missing_start {args["startLine"]=json!(start);}
+        if missing_end {args["endLine"]=json!(end);}
+        let mut candidate=call.clone();candidate["function"]["arguments"]=json!(args.to_string());
+        if validate_native_tool_schema(payload,&json!({"tool_calls":[candidate.clone()]})).is_ok() {*call=candidate;}
+    }
+    result
+}
+
 fn syntax_references(code:&str)->(std::collections::BTreeSet<String>,std::collections::BTreeMap<String,usize>) {
     let words=code.split(|c:char|!c.is_alphanumeric()&&c!='_').filter(|s|!s.is_empty()).map(str::to_owned).collect();
     let mut members=std::collections::BTreeMap::new();
@@ -2870,7 +2903,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
 }
 
 fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
-    let metadata=native_tool_workflow::terminal_metadata(payload,message);
+    let metadata=complete_native_read_ranges(payload,&native_tool_workflow::terminal_metadata(payload,message));
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
         validate_native_tool_schema(payload,&metadata)?;
         if metadata["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
@@ -2898,6 +2931,44 @@ fn terminal_schema_validation_preserves_host_commands_without_recipe_restriction
     for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","$body = @{name='Student'} | ConvertTo-Json; Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/students -ContentType application/json -Body $body","curl.exe -d name=Student http://localhost:3000/api/students","git init","npm test"] {
         let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));let (out,_)=native_workflow_message(&p,&input).unwrap();let args:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(args["command"],command);
     }
+}
+
+#[test]
+fn read_range_metadata_reaches_the_host_without_a_model_retry() {
+    use serde_json::{json,Value};
+    let p=json!({"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","additionalProperties":false,"properties":{"filePath":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","maximum":1000}},"required":["filePath","startLine","endLine"]}}}],"messages":[{"role":"user","content":"<userRequest>Add course CRUD API</userRequest>"}]});
+    let make=|a:Value|json!({"role":"assistant","content":null,"tool_calls":[{"id":"read1","type":"function","function":{"name":"read_file","arguments":a.to_string()}}]});
+    for (input,start,end) in [(json!({"filePath":"/app/server.js"}),1,200),(json!({"filePath":"/app/server.js","startLine":401}),401,600),(json!({"filePath":"/app/server.js","endLine":50}),1,50),(json!({"filePath":"/app/server.js","startLine":950}),950,1000)] {
+        let mut attempts=0;
+        run_native_tool_attempts(p.clone(),|body,_,retry| {
+            attempts+=1;assert!(!retry);
+            let (out,changed)=native_workflow_message(body,&make(input.clone()))?;
+            assert!(changed);validate_native_tool_schema(body,&out)?;
+            let a:Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(a["filePath"],"/app/server.js");assert_eq!(a["startLine"],start);assert_eq!(a["endLine"],end);
+            Ok("validated host call".into())
+        }).unwrap();assert_eq!(attempts,1);
+    }
+    for a in [json!({"filePath":"/app/server.js","startLine":5,"endLine":7}),json!({"filePath":"/app/server.js","startLine":"1"}),json!({"filePath":"/app/server.js","startLine":0}),json!({"startLine":1}),json!({"filePath":"/app/server.js","startLine":1001}),json!({"filePath":"/app/server.js","endLine":null})] {
+        let input=make(a);assert_eq!(complete_native_read_ranges(&p,&input),input);
+    }
+    let mut explicit=p.clone();explicit["messages"][0]["content"]=json!("<userRequest>Read lines 50 to 90 from /app/server.js</userRequest>");
+    let missing=make(json!({"filePath":"/app/server.js"}));assert_eq!(complete_native_read_ranges(&explicit,&missing),missing);
+    let mut no_schema=p.clone();no_schema["tools"][0]["function"]["parameters"]["required"]=json!(["filePath"]);
+    assert_eq!(complete_native_read_ranges(&no_schema,&missing),missing);
+}
+
+#[test]
+fn schema_recovery_selects_only_the_rejected_registered_function() {
+    use serde_json::json;
+    let p=json!({"messages":[],"tools":[{"function":{"name":"create_file"}},{"function":{"name":"read_file","parameters":{"required":["filePath","startLine","endLine"]}}}],"chat_template_kwargs":{"opengpu_native_tool_guard":true}});
+    let mut attempts=0;
+    run_native_tool_attempts(p.clone(),|body,_,retry| {
+        attempts+=1;if !retry {return Err("native tool schema precondition failed: read_file.startLine is required".into());}
+        assert_eq!(body["tools"],json!([p["tools"][1]]));assert_eq!(body["tool_choice"]["function"]["name"],"read_file");
+        assert_eq!(body["chat_template_kwargs"]["opengpu_require_tool_call"],true);
+        Ok("corrected call".into())
+    }).unwrap();assert_eq!(attempts,2);
 }
 
 #[test]
@@ -3006,10 +3077,14 @@ fn run_native_tool_attempts(
                 || error.starts_with("native compilation verification required:") =>
         {
             let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:");
-            if terminal_recovery {
-                let tool=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")).cloned().ok_or_else(||error.clone())?;
+            let schema_tool=error.strip_prefix("native tool schema precondition failed: ").and_then(|s|s.split_once('.').map(|p|p.0));
+            let recovery_tool=if terminal_recovery {Some("run_in_terminal")} else {schema_tool};
+            let recovery_tool=recovery_tool.filter(|name|payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()).is_none_or(|selected|selected==*name));
+            let selected=recovery_tool.and_then(|name|payload["tools"].as_array()?.iter().find(|t|t["function"]["name"].as_str()==Some(name))).cloned();
+            if let Some(tool)=selected {
+                let name=tool["function"]["name"].clone();
                 payload["tools"]=serde_json::json!([tool]);
-                payload["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
+                payload["tool_choice"]=serde_json::json!({"type":"function","function":{"name":name}});
                 if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
                     payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(true);
                 }
