@@ -2,6 +2,8 @@
 mod download_progress;
 #[path = "native_stream.rs"]
 mod native_stream;
+#[path = "native_tool_workflow.rs"]
+mod native_tool_workflow;
 use crate::contracts::{
     Backend, ModelCapability, WorkerHealthReport, WorkerLaunchRequest, WorkerLaunchResponse,
     WorkerPolicyReport,
@@ -2819,7 +2821,7 @@ fn run_native_openai_tool_turn(
                 Some(payload),
             );
         }
-        let value = response.into_json::<serde_json::Value>().map_err(|error| {
+        let mut value = response.into_json::<serde_json::Value>().map_err(|error| {
             format!("native OpenAI tool completion returned invalid JSON: {error}")
         })?;
         record_runtime_usage(&value["usage"]);
@@ -2830,8 +2832,12 @@ fn run_native_openai_tool_turn(
             &value["choices"][0]["message"],
             value["choices"][0]["finish_reason"].as_str(),
         )?;
-        validate_native_edit_preconditions(payload,&value["choices"][0]["message"])?;
-        if retry
+        let (message, changed) = native_workflow_message(payload, &value["choices"][0]["message"])?;
+        if changed {
+            value["choices"][0]["finish_reason"] = if message["tool_calls"].is_array() { "tool_calls" } else { "stop" }.into();
+            value["choices"][0]["message"] = message;
+        }
+        if retry && !changed
             && value["choices"][0]["message"]["tool_calls"]
                 .as_array()
                 .is_none_or(|calls| calls.is_empty())
@@ -2840,6 +2846,33 @@ fn run_native_openai_tool_turn(
         }
         normalize_native_openai_tool_response(&value)
     })
+}
+
+fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    let replacement = match validate_native_edit_preconditions(payload,message) {
+        Ok(()) => native_tool_workflow::verification(payload,message),
+        Err(error) => Some(native_tool_workflow::recover_read(payload,message,&error).ok_or(error)?),
+    };
+    if let Some(replacement)=replacement {
+        validate_native_edit_preconditions(payload,&replacement)?;
+        Ok((replacement,true))
+    } else { Ok((message.clone(),false)) }
+}
+
+#[test]
+fn rejected_edit_stream_returns_read_without_releasing_patch_or_success_prose() {
+    let payload=serde_json::json!({"tools":[
+        {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},
+        {"function":{"name":"replace_string_in_file"}}],
+        "messages":[{"role":"user","content":"<userRequest>Create a project</userRequest>"}]});
+    let edit=serde_json::json!({"id":"call_bad","index":0,"type":"function","function":{"name":"replace_string_in_file","arguments":serde_json::json!({"filePath":"D:/sample/main.py","oldString":"unseen","newString":"invented"}).to_string()}});
+    let chunk=serde_json::json!({"choices":[{"delta":{"content":"Fixed successfully!","tool_calls":[edit]},"finish_reason":"tool_calls"}]});
+    let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");
+    let (tx,rx)=mpsc::channel();
+    let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&payload))).unwrap();
+    assert!(result.contains("read_file"));assert!(!result.contains("replace_string_in_file"));
+    let emitted=rx.try_iter().collect::<Vec<_>>().join("");
+    assert!(emitted.contains("read_file"));assert!(!emitted.contains("invented"));assert!(!emitted.contains("Fixed successfully"));
 }
 
 // Only retry rejected, unexecuted tool calls. Never replay transport failures or
@@ -3035,7 +3068,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
             }
             // Tool arguments remain private until the entire batch is valid.
             // Prose still streams immediately; recovery must not duplicate it.
-            if !retry {
+            if !retry && !payload.is_some_and(native_tool_workflow::is_file_turn) {
                 if let Some(content) = delta["content"].as_str().filter(|s| !s.is_empty()) {
                     output.push_str(content);
                     pending_content.push_str(content);
@@ -3057,20 +3090,34 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     if !done || reason.is_none() {
         return Err("native stream ended before terminal event".into());
     }
-    if !pending_content.is_empty() {
+    if !pending_content.is_empty() && !payload.is_some_and(native_tool_workflow::is_file_turn) {
         emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
     }
     let mut message = assembled.message();
     validate_native_tool_message(&message, reason.as_deref())?;
-    if let Some(payload)=payload {validate_native_edit_preconditions(payload,&message)?;}
-    if retry
+    let mut workflow_changed=false;
+    if let Some(payload)=payload {
+        let (checked,changed)=native_workflow_message(payload,&message)?;
+        message=checked;
+        workflow_changed=changed;
+        if changed {
+            pending_tools.clear();
+            if message["tool_calls"].is_array() { pending_tools.push(serde_json::json!({"tool_calls":message["tool_calls"]})); }
+            reason=Some(if message["tool_calls"].is_array() {"tool_calls"} else {"stop"}.to_string());
+        }
+    }
+    if retry && !workflow_changed
         && message["tool_calls"]
             .as_array()
             .is_none_or(|calls| calls.is_empty())
     {
         return Err("native tool recovery returned no tool call".into());
     }
-    message["content"] = output.clone().into();
+    if payload.is_some_and(native_tool_workflow::is_file_turn) {
+        if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
+            emit_stream_delta(&serde_json::json!({"content":content}).to_string());
+        }
+    } else { message["content"] = output.clone().into(); }
     // Preserve the provider's fragment sizes instead of creating one oversized
     // relay event for a large file. Every fragment is validated before release.
     for delta in pending_tools {
