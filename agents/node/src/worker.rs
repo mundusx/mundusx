@@ -3037,6 +3037,10 @@ fn observed_line_stream_compiles_to_a_registered_grounded_host_edit() {
     let args:serde_json::Value=serde_json::from_str(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
     assert_eq!(args["oldString"],"return 1;\r\n");assert_eq!(args["newString"],"return 2;\r\n");
     let emitted=rx.try_iter().collect::<Vec<_>>().join("");assert!(!emitted.contains(native_line_edit::NAME));assert!(!emitted.contains("Already fixed"));assert!(emitted.contains("replace_string_in_file"));
+    let alias=json!({"tool_calls":[{"id":"alias1","type":"function","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/sample/main.rs","oldText":"return 1;\n","newText":"return 4;\n"}).to_string()}}]});
+    let (aliased,_)=native_workflow_message(&p,&alias).unwrap();validate_native_edit_preconditions(&p,&aliased).unwrap();
+    let mut unobserved=alias.clone();unobserved["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/sample/main.rs","oldText":"invented source","newText":"bad"}).to_string());
+    assert_eq!(native_workflow_message(&p,&unobserved).unwrap().0["tool_calls"][0]["function"]["name"],"read_file");
     let mut tries=0;
     run_native_tool_attempts(p.clone(),|body,_,retry| {
         tries+=1;if !retry {return Err("native tool schema precondition failed: replace_string_in_file.oldString is required".into());}

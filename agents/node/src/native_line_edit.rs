@@ -74,6 +74,13 @@ pub fn compile(p:&Value,message:&Value)->Result<Value,String> {
     // arguments; never infer a source range from missing oldString alone.
     if calls.len()==1 && calls[0]["function"]["name"]=="replace_string_in_file" && compatible(p) {
         if let Ok(a)=serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap_or("")) {
+            // Observed live Qwen streams use this exact-string alias pair.
+            // Normalize names only; the existing read/uniqueness guard must
+            // still validate every byte of oldText before releasing the edit.
+            if a.as_object().is_some_and(|o|o.len()==3&&["filePath","oldText","newText"].iter().all(|k|o.contains_key(*k))) && ["filePath","oldText","newText"].iter().all(|k|a[*k].is_string()) {
+                let mut exact=message.clone();exact["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":a["filePath"],"oldString":a["oldText"],"newString":a["newText"]}).to_string());
+                return Ok(exact);
+            }
             if a.as_object().is_some_and(|o|o.len()==4&&["filePath","startLine","endLine","newText"].iter().all(|k|o.contains_key(*k))) {
                 let mut planned=message.clone();planned["tool_calls"][0]["function"]["name"]=json!(NAME);
                 return compile(p,&planned);
@@ -129,6 +136,8 @@ mod tests {
         assert_eq!(p["messages"][2]["content"],"const db = existing;\r\nconst query = 'UPDATE courses SET name = ?\";\r\nnext();\r\n");
         let mut host=edit(2,2,"fixed");host["tool_calls"][0]["function"]["name"]=json!(HOST_NAME);
         assert_eq!(args(&compile(&p,&host).unwrap())["oldString"],a["oldString"]);
+        host["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","oldText":"exact source","newText":"replacement"}).to_string());
+        let alias=compile(&p,&host).unwrap();assert_eq!(args(&alias)["oldString"],"exact source");assert_eq!(args(&alias)["newString"],"replacement");
     }
     #[test]
     fn unique_context_is_preserved_and_unicode_is_opaque_source() {
