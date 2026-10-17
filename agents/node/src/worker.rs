@@ -2859,7 +2859,7 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool schema precondition failed:") =>
         {
             if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
-                payload["max_tokens"]=serde_json::json!(payload["max_tokens"].as_u64().unwrap_or(1024).min(1024));
+                payload["max_tokens"]=serde_json::json!(payload["max_tokens"].as_u64().unwrap_or(4096).min(4096));
             }
             let messages = payload["messages"]
                 .as_array_mut()
@@ -6902,6 +6902,15 @@ mod native_delta_tests {
         format!("data: {frame}\n\ndata: [DONE]\n\n")
     }
 
+    #[test]
+    fn guarded_recovery_retains_the_bounded_legitimate_patch_budget() {
+        let mut attempts=0;
+        let result=run_native_tool_attempts(serde_json::json!({"messages":[],"max_tokens":4096,"chat_template_kwargs":{"opengpu_native_tool_guard":true}}),|sent,_,retry| {
+            attempts+=1;assert_eq!(sent["max_tokens"],4096);
+            if retry {Ok("complete".into())}else{Err("native tool arguments are incomplete: rejected markup".into())}
+        }).unwrap();
+        assert_eq!(result,"complete");assert_eq!(attempts,2);
+    }
     #[test]
     fn incomplete_long_edit_never_leaks_and_recovers_once() {
         let args = format!("{{\"contents\":\"{}", "x".repeat(17181));

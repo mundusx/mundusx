@@ -61,8 +61,9 @@ pub fn apply_mlx(model: &str, payload: &mut Value) {
     if native_files {
         // A host may increase the conversation's answer budget to 8k or more.
         // Serial file operations must remain small enough to finish or fail
-        // promptly; remaining modules belong in subsequent tool turns.
-        payload["max_tokens"]=json!(payload["max_tokens"].as_u64().unwrap_or(2048).min(2048));
+        // promptly. A 4k ceiling also permits legitimate exact-match route
+        // extraction patches, whose old text counts against the output budget.
+        payload["max_tokens"]=json!(payload["max_tokens"].as_u64().unwrap_or(4096).min(4096));
         if payload["chat_template_kwargs"].is_null() {payload["chat_template_kwargs"]=json!({});}
         payload["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(true);
     }
@@ -109,7 +110,13 @@ mod tests {
         let mut explicit=json!({"tools":tools,"repetition_penalty":1.2});
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut explicit);
         assert_eq!(explicit["repetition_penalty"],1.2);
-        assert_eq!(payload["max_tokens"],2048);
+        assert_eq!(payload["max_tokens"],4096);
+        let mut large=json!({"tools":tools,"max_tokens":8192});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut large);
+        assert_eq!(large["max_tokens"],4096);
+        let mut small=json!({"tools":tools,"max_tokens":128});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut small);
+        assert_eq!(small["max_tokens"],128);
         let mut parallel=json!({"tools":tools,"parallel_tool_calls":true});
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut parallel);
         assert!(parallel["chat_template_kwargs"].get("opengpu_native_tool_guard").is_none());
