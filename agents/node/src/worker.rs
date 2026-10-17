@@ -4,6 +4,8 @@ mod download_progress;
 mod native_stream;
 #[path = "native_tool_workflow.rs"]
 mod native_tool_workflow;
+#[path = "native_http_bridge.rs"]
+mod native_http_bridge;
 use crate::contracts::{
     Backend, ModelCapability, WorkerHealthReport, WorkerLaunchRequest, WorkerLaunchResponse,
     WorkerPolicyReport,
@@ -2814,7 +2816,7 @@ fn run_native_openai_tool_turn(
             .as_secs()
             .max(30),
         ))
-        .send_json(payload)
+        .send_json(native_http_bridge::prepare(payload))
         .map_err(|error| format!("native OpenAI tool completion failed: {error}"))?;
         if streaming {
             return parse_native_openai_stream_with_context(
@@ -2854,7 +2856,8 @@ fn run_native_openai_tool_turn(
 const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__";
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
-    native_workflow_message_checked(payload,message).map_err(|error| {
+    let compiled=native_http_bridge::compile(payload,message)?;
+    native_workflow_message_checked(payload,&compiled).map(|(out,changed)|(out,changed || compiled!=*message)).map_err(|error| {
         // Private diagnostic context for the bounded recovery attempt. It must
         // never be emitted as a host tool call or included in a public error.
         let calls=message["tool_calls"].as_array();
@@ -7381,4 +7384,13 @@ fn actual_curl_runtime_errors_receive_guidance_without_replaying_success() {
  assert!(native_terminal_runtime_feedback(&p).unwrap().contains("Do not repeat"));
  p["messages"][0]["content"]=serde_json::json!("Exit code: 0. HTTP 201 Created");assert!(native_terminal_runtime_feedback(&p).is_none());
  p["messages"].as_array_mut().unwrap().push(serde_json::json!({"role":"tool","content":"Exit code: 0. Student created"}));assert!(native_terminal_runtime_feedback(&p).is_none());
+}
+
+#[test]
+fn typed_http_plan_stream_releases_only_the_registered_terminal_call() {
+ let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"system","name":"mundusx_native_http_policy","content":"HTTP task"},{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info><userRequest>create a record using curl</userRequest>"}]);
+ let call=serde_json::json!({"id":"typed-http","index":0,"type":"function","function":{"name":native_http_bridge::NAME,"arguments":serde_json::json!({"method":"POST","url":"http://localhost:3000/api/students","json_body":{"name":"Student","email":"fixture@example.com","age":20}}).to_string()}});
+ let chunk=serde_json::json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");
+ let (tx,rx)=mpsc::channel();let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p))).unwrap();let emitted=rx.try_iter().collect::<Vec<_>>().join("");
+ assert!(result.contains("run_in_terminal"));assert!(!result.contains(native_http_bridge::NAME));assert!(emitted.contains("run_in_terminal"));assert!(!emitted.contains(native_http_bridge::NAME));assert!(emitted.contains("WriteAllBytes"));
 }
