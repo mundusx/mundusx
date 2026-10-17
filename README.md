@@ -8,6 +8,20 @@ MundusX is a decentralized AI compute network that connects idle CPUs, GPUs, and
 
 This repository contains the public, contributor-facing CLI, node agent, local worker, installer, and shared packages. The operator/control-plane side lives in a separate repo.
 
+Native OpenAI-compatible tool turns can opt into worker-local tool discovery when
+the control plane enables `MUNDUSX_NATIVE_TOOL_DISCOVERY=1`. Updated workers
+advertise `native_tool_discovery_v1`; the scheduler must require that capability
+before sending discovery-enabled jobs. Core coding tools remain immediately
+available. Specialized functions are searched only within the client-supplied
+catalog, with at most two private searches and five loaded matches per search.
+The internal discovery call is consumed by the worker and never sent to VS Code;
+only an original registered host tool call is returned. Discovery loads schemas
+and never executes host tools or grants permissions. It adds model turns only
+when discovery is requested. Private rounds are buffered rather than streamed to
+the host. This is an EHDA implementation, not OpenAI's hosted Responses API
+`tool_search` feature. Leave the control-plane flag off until updated workers
+are deployed and advertise the capability.
+
 `opengpu` is the current CLI command name and compatibility binary for contributor machines. It handles install, onboarding, model management, node startup, health checks, and local worker execution.
 
 `mundusx` is the local-first personal agent command. It runs and resumes durable
