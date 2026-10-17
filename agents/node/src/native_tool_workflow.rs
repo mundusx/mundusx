@@ -187,10 +187,12 @@ pub fn recover_read(payload: &Value, message: &Value, error: &str) -> Option<Val
             }
         }
     }
-    if reads >= 2 { return Some(incomplete("the edit still did not match observed source after two recovery reads.")); }
+    if reads >= 2 { return Some(incomplete(&format!("the proposed edit still failed validation after two recovery reads: {error}."))); }
     // First recovery expands a partial read; the second moves forward rather
     // than repeatedly reading the same initial ten lines.
-    Some(call("read_file", json!({"filePath":path,"startLine":end+1,"endLine":end+400}), "call_grounding_"))
+    let mut read=call("read_file", json!({"filePath":path,"startLine":end+1,"endLine":end+400}), "call_grounding_");
+    read["content"]=json!(format!("The proposed edit was NOT executed: {error}. Read the exact target returned by this call, then use replace_string_in_file with oldString copied exactly from observed source. Do not use create_file to replace an existing path. No mutation has been applied by this recovery step."));
+    Some(read)
 }
 
 /// Before a final answer, ask host diagnostics for files changed since their
@@ -267,11 +269,16 @@ mod tests {
         let first=recover_read(&p,&edit,error).unwrap();
         assert_eq!(first["tool_calls"][0]["function"]["name"],"read_file");
         assert_eq!(args(&first),json!({"filePath":"D:/sample/src/main.rs","startLine":1,"endLine":400}));
+        assert!(first["content"].as_str().unwrap().contains(error));
+        assert!(first["content"].as_str().unwrap().contains("NOT executed"));
+        assert!(first["content"].as_str().unwrap().contains("replace_string_in_file"));
+        assert!(!first["content"].as_str().unwrap().contains("bad"));
         observe(&mut p,first,"partial observed source");
         let second=recover_read(&p,&edit,error).unwrap();assert_eq!(args(&second)["startLine"],401);
         observe(&mut p,second,"later source");
         let stopped=recover_read(&p,&edit,error).unwrap();assert!(stopped.get("tool_calls").is_none());
         assert!(stopped["content"].as_str().unwrap().contains("Verification incomplete"));
+        assert!(stopped["content"].as_str().unwrap().contains(error));
         for denied in ["native edit precondition failed: mutation target is outside the explicit files", "native tool schema precondition failed: invalid arguments"] {assert!(recover_read(&p,&edit,denied).is_none());}
     }
     #[test]
