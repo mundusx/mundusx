@@ -21,11 +21,17 @@ pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
 pub fn task_constraints(payload:&Value,message:&Value)->Result<(),String> {
     let text=payload["messages"].as_array().and_then(|m|m.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(s,_)|s)))).unwrap_or("").to_ascii_lowercase();
-    if !["do not install","don't install","without installing","without reinstalling","do not reinstall","don't reinstall","reuse installed"].iter().any(|s|text.contains(s)) {return Ok(());}
+    let no_install=["do not install","don't install","without installing","without reinstalling","do not reinstall","don't reinstall","reuse installed"].iter().any(|s|text.contains(s));
     for call in message["tool_calls"].as_array().into_iter().flatten() {
         if call["function"]["name"]!="run_in_terminal" {continue;}
         let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         let Some(command)=a["command"].as_str() else {continue;};
+        let words=command.split_whitespace().map(|s|s.trim_matches(['\'', '"']).to_ascii_lowercase()).collect::<Vec<_>>();
+        let exe=words.first().map(|s|s.rsplit(['/', '\\']).next().unwrap_or(s).trim_end_matches(".exe")).unwrap_or("");
+        let broad=matches!(exe,"killall"|"pkill") || (exe=="taskkill"&&words.iter().any(|s|s=="/im")) || (exe=="stop-process"&&words.iter().any(|s|s=="-name"));
+        let explicitly_all=["all node processes","all node.exe processes","all python processes","all processes named"].iter().any(|s|text.contains(s));
+        if broad&&!explicitly_all {return Err("native task precondition failed: this process-name kill could stop unrelated host and coding tools. This command was NOT executed. Identify the specific task-owned process and use its PID; do not kill every process with the same executable name".into());}
+        if !no_install {continue;}
         let blocked=command.split([';','\n']).flat_map(|s|s.split("&&")).any(|s| {
             let words=s.split_whitespace().map(|s|s.trim_matches(['\'', '"']).to_ascii_lowercase()).collect::<Vec<_>>();
             let Some(exe)=words.first() else {return false;};
@@ -486,6 +492,18 @@ mod tests {
         for _ in 0..2 {observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"same_"),"/src/main.js:5\nSyntaxError\nCommand exited with code 1");}
         assert!(compilation(&p,&json!({"content":"Done"})).unwrap().unwrap()["content"].as_str().unwrap().contains("without diagnostic progress"));
         observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"pass_"),"Command exited with code 0");assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
+    }
+    #[test]
+    fn process_cleanup_keeps_unrelated_host_tools_running() {
+        let mut p=payload();p["messages"][0]["content"]=json!("<userRequest>Test this project on a temporary port</userRequest>");
+        for command in ["taskkill /F /IM node.exe","Stop-Process -Name node -Force","pkill -f node","killall python"] {
+            assert!(task_constraints(&p,&call("run_in_terminal",json!({"command":command}),"kill_")).unwrap_err().contains("NOT executed"));
+        }
+        for command in ["Stop-Process -Id 12345","taskkill /PID 12345","node --test","npm install"] {
+            assert!(task_constraints(&p,&call("run_in_terminal",json!({"command":command}),"run_")).is_ok());
+        }
+        p["messages"][0]["content"]=json!("<userRequest>Stop all node.exe processes</userRequest>");
+        assert!(task_constraints(&p,&call("run_in_terminal",json!({"command":"taskkill /F /IM node.exe"}),"kill_")).is_ok());
     }
     #[test]
     fn observed_validator_rechecks_after_same_file_edits_without_replaying_mutations() {
