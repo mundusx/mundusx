@@ -4,6 +4,8 @@ mod download_progress;
 mod native_stream;
 #[path = "native_tool_workflow.rs"]
 mod native_tool_workflow;
+#[path = "native_tool_discovery.rs"]
+mod native_tool_discovery;
 use crate::contracts::{
     Backend, ModelCapability, WorkerHealthReport, WorkerLaunchRequest, WorkerLaunchResponse,
     WorkerPolicyReport,
@@ -2798,8 +2800,19 @@ fn run_native_openai_tool_turn(
         crate::model_profile::apply(model, &mut payload);
     }
     let streaming = live_delta_enabled();
+    if let Some(discovery)=native_tool_discovery::Discovery::take(&mut payload)? {
+        // Private discovery rounds must never emit an unregistered call to
+        // the client. File turns already buffer until validation; the normal
+        // final completion is still delivered over the public SSE stream.
+        return with_stream_delta_sender(None,||discovery.run(payload,|body|run_native_tool_payload(url,body,false)));
+    }
+    run_native_tool_payload(url,payload,streaming)
+}
+
+fn run_native_tool_payload(url:&str,mut payload:serde_json::Value,streaming:bool)->Result<String,String> {
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
+    else {payload.as_object_mut().unwrap().remove("stream_options");}
     run_native_tool_attempts(payload, |payload, output, retry| {
         let response = ureq::post(&format!(
             "{}/v1/chat/completions",
@@ -2849,6 +2862,34 @@ fn run_native_openai_tool_turn(
         }
         normalize_native_openai_tool_response(&value)
     })
+}
+
+#[test]
+#[ignore = "requires an explicitly configured local MLX runtime and discovery fixture"]
+fn native_discovery_live_runtime_fixture() {
+    let path=std::env::var("MUNDUSX_NATIVE_DISCOVERY_FIXTURE").expect("fixture path");
+    let fixture:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let url=std::env::var("MUNDUSX_NATIVE_DISCOVERY_URL").expect("explicit runtime URL");
+    assert!(url.starts_with("http://127.0.0.1:"),"live test must target a local runtime");
+    let mut reports=Vec::new();
+    for case in fixture.as_array().unwrap() {
+        let mut payload=case["payload"].clone();let model=payload["model"].as_str().unwrap().to_string();
+        crate::model_profile::apply_mlx(&model,&mut payload);
+        let plan=native_tool_discovery::Discovery::take(&mut payload).unwrap().unwrap();
+        let start=Instant::now();let mut rounds=Vec::new();let (tx,rx)=mpsc::channel();
+        let result=with_stream_delta_sender(Some(tx),||with_stream_delta_sender(None,||plan.run(payload,|body|{
+            let names=body["tools"].as_array().unwrap().iter().map(|t|t["function"]["name"].clone()).collect::<Vec<_>>();
+            rounds.push(serde_json::json!({"tools":names,"schema_chars":body["tools"].to_string().len()}));
+            run_native_tool_payload(&url,body,false)
+        }))).unwrap();
+        assert_eq!(rx.try_iter().count(),0,"private discovery rounds leaked to the host stream");
+        let result:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+        let names=result["message"]["tool_calls"].as_array().unwrap().iter().map(|c|c["function"]["name"].clone()).collect::<Vec<_>>();
+        let passed=names.contains(&case["expected_tool"]);
+        reports.push(serde_json::json!({"case":case["name"],"seconds":start.elapsed().as_secs_f64(),"rounds":rounds,"host_tools_requested":names,"host_tools_executed":false,"passed":passed}));
+        std::fs::write(format!("{path}.result.json"),serde_json::to_string_pretty(&reports).unwrap()).unwrap();
+        assert!(passed,"runtime did not select expected registered tool: {}",case["name"]);
+    }
 }
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {

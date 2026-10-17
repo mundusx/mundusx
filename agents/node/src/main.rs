@@ -838,6 +838,7 @@ fn build_scheduler_capabilities(
     if supports_tools {
         supported_tools.push("tool_use".to_string());
         supported_tools.push("native_tool_calls_v1".to_string());
+        supported_tools.push("native_tool_discovery_v1".to_string());
     }
     supported_tools.sort();
     supported_tools.dedup();
@@ -3294,6 +3295,7 @@ mod tests {
             .supported_tools
             .contains(&"native_tool_calls_v1".to_string()));
         assert!(supported_tools_for(&profile).contains(&"native_tool_calls_v1".to_string()));
+        assert!(supported_tools_for(&profile).contains(&"native_tool_discovery_v1".to_string()));
     }
 
     #[test]
