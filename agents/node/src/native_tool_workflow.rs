@@ -19,6 +19,29 @@ fn catalog(payload: &Value) -> Option<&Vec<Value>> {
 
 pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
+/// VS Code requires display labels in addition to executable terminal args.
+/// Fill only absent display strings declared by the registered contract. Never
+/// synthesize or rewrite the command, execution mode, timeout or permissions.
+pub fn terminal_metadata(payload:&Value,message:&Value)->Value {
+    let Some(tool)=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")) else {return message.clone();};
+    let schema=&tool["function"]["parameters"];
+    let mut result=message.clone();
+    for call in result["tool_calls"].as_array_mut().into_iter().flatten() {
+        if call["function"]["name"]!="run_in_terminal" {continue;}
+        let Ok(mut args)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        if !args.is_object() || args["command"].as_str().is_none_or(|s|s.trim().is_empty()) {continue;}
+        let mut changed=false;
+        for (field,text) in [("goal","Execute the requested project command"),("explanation","Run the command requested for this task.")] {
+            let required=schema["required"].as_array().is_some_and(|keys|keys.iter().any(|k|k.as_str()==Some(field)));
+            if required && schema["properties"][field]["type"]=="string" && args.get(field).is_none() {
+                args[field]=json!(text);changed=true;
+            }
+        }
+        if changed {call["function"]["arguments"]=json!(args.to_string());}
+    }
+    result
+}
+
 /// Equivalent Windows paths must name the same host document URI as well as
 /// compare equally in the guard. Never rewrite source text or relative paths.
 pub fn canonical_paths(payload:&Value,message:&Value)->Value {
@@ -55,7 +78,9 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
     if message["tool_calls"].as_array().is_some_and(|c|!c.is_empty()) {return Ok(None);}
     if message["content"].as_str().is_some_and(|s|s.starts_with("Verification incomplete:")) {return Ok(None);}
     let Some(h)=history(payload) else {return Ok(None);};
-    let mut needs=payload["messages"].as_array().is_some_and(|m|m.iter().any(|m|m["name"]=="mundusx_native_coding_policy"));
+    // A broad coding catalog/policy is not evidence of a source change. An
+    // API request or server-start command must not trigger unrelated builds.
+    let mut needs=false;
     let mut verified=false;let mut attempts=0;
     for m in h {
         for c in m["tool_calls"].as_array().into_iter().flatten() {
@@ -342,5 +367,14 @@ mod tests {
         assert!(compilation(&p,&answer).unwrap().is_none());
         observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.rs"}),"write_"),"Applied");
         assert!(compilation(&p,&answer).is_err());
+    }
+    #[test]
+    fn api_terminal_work_does_not_require_an_unrelated_project_build() {
+        let mut p=payload();p["messages"].as_array_mut().unwrap().insert(0,json!({"role":"system","name":"mundusx_native_coding_policy","content":"Generic coding guidance"}));
+        p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+        observe(&mut p,call("run_in_terminal",json!({"command":"curl.exe -X POST http://localhost:3000/api/students"}),"http_"),"Exit Code: 0\nHTTP 201 Created");
+        assert!(compilation(&p,&json!({"content":"Created the requested record"})).unwrap().is_none());
+        observe(&mut p,call("create_file",json!({"filePath":"/src/server.js"}),"write_"),"Created");
+        assert!(compilation(&p,&json!({"content":"Created"})).is_err(),"real source changes still require validation");
     }
 }

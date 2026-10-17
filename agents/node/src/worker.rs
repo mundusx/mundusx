@@ -2852,13 +2852,15 @@ fn run_native_openai_tool_turn(
 }
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    let metadata=native_tool_workflow::terminal_metadata(payload,message);
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
-        validate_native_tool_schema(payload,message)?;
-        if message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
+        validate_native_tool_schema(payload,&metadata)?;
+        if metadata["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
             return Err(format!("native tool schema precondition failed: expected the explicitly selected function {name}"));
         }
     }
-    let canonical=native_tool_workflow::canonical_paths(payload,message);
+    let canonical=native_tool_workflow::canonical_paths(payload,&metadata);
+    validate_native_tool_schema(payload,&canonical)?;
     let replacement = match validate_native_edit_preconditions(payload,&canonical) {
         Ok(()) => match native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)) {
             Some(message)=>Some(message),None=>native_tool_workflow::compilation(payload,&canonical)?,
@@ -2886,6 +2888,50 @@ fn rejected_edit_stream_returns_read_without_releasing_patch_or_success_prose() 
     assert!(result.contains("read_file"));assert!(!result.contains("replace_string_in_file"));
     let emitted=rx.try_iter().collect::<Vec<_>>().join("");
     assert!(emitted.contains("read_file"));assert!(!emitted.contains("invented"));assert!(!emitted.contains("Fixed successfully"));
+}
+
+#[cfg(test)]
+fn terminal_metadata_fixture()->serde_json::Value {
+    serde_json::json!({"messages":[],"tools":[{"type":"function","function":{"name":"run_in_terminal","parameters":{"type":"object","properties":{"command":{"type":"string"},"goal":{"type":"string"},"explanation":{"type":"string"},"mode":{"type":"string","enum":["sync","async"]}},"required":["command","goal","explanation","mode"]}}}]})
+}
+
+#[cfg(test)]
+fn terminal_message(args:serde_json::Value)->serde_json::Value {
+    serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"terminal1","index":0,"type":"function","function":{"name":"run_in_terminal","arguments":args.to_string()}}]})
+}
+
+#[test]
+fn absent_terminal_display_metadata_is_filled_without_another_model_call() {
+    let p=terminal_metadata_fixture();let command="curl.exe -X POST http://localhost:3000/api/students --data-binary @student.json";
+    for args in [serde_json::json!({"command":command,"mode":"sync","explanation":"Create a student"}),serde_json::json!({"command":command,"mode":"sync"})] {
+        let input=terminal_message(args.clone());let (out,changed)=native_workflow_message(&p,&input).unwrap();assert!(changed);
+        let result:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(result["command"],args["command"]);assert_eq!(result["mode"],args["mode"]);
+        assert!(result["goal"].is_string());assert!(result["explanation"].is_string());validate_native_tool_schema(&p,&out).unwrap();
+        let mut attempts=0;run_native_tool_attempts(p.clone(),|body,_,_| {attempts+=1;let (out,_)=native_workflow_message(body,&input)?;normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":out,"finish_reason":"tool_calls"}]}))}).unwrap();assert_eq!(attempts,1);
+    }
+}
+
+#[test]
+fn terminal_execution_inputs_are_never_invented_or_overwritten() {
+    let mut p=terminal_metadata_fixture();
+    let args=serde_json::json!({"command":"npm start","goal":"Keep my goal","explanation":"Keep my explanation","mode":"async"});
+    let message=terminal_message(args);assert_eq!(native_workflow_message(&p,&message).unwrap(),(message.clone(),false));
+    for args in [serde_json::json!({"mode":"sync"}),serde_json::json!({"command":"npm start"}),serde_json::json!({"command":"npm start","mode":"invented"}),serde_json::json!({"command":"npm start","mode":"sync","goal":null})] {
+        assert!(native_workflow_message(&p,&terminal_message(args)).is_err());
+    }
+    p["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
+    assert!(native_workflow_message(&p,&terminal_message(serde_json::json!({"command":"npm test","mode":"sync"}))).is_ok());
+}
+
+#[test]
+fn streamed_terminal_call_releases_one_valid_call_with_metadata() {
+    let p=terminal_metadata_fixture();let input=terminal_message(serde_json::json!({"command":"curl.exe http://localhost:3000/api/students","mode":"sync","explanation":"Read students"}));
+    let chunk=serde_json::json!({"choices":[{"delta":{"tool_calls":input["tool_calls"]},"finish_reason":"tool_calls"}]});
+    let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
+    let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p))).unwrap();
+    let out:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();validate_native_tool_schema(&p,&out["message"]).unwrap();
+    let deltas=rx.try_iter().collect::<Vec<_>>().join("");assert_eq!(deltas.matches("run_in_terminal").count(),1);assert!(deltas.contains("goal"));
 }
 
 // Only retry rejected, unexecuted tool calls. Never replay transport failures or
