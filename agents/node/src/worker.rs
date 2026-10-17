@@ -3011,7 +3011,7 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
-            let terminal_recovery=error.starts_with("native compilation verification required:") || error.starts_with("native tool schema precondition failed: Windows") || error.starts_with("native tool schema precondition failed: inline backslash") || error.starts_with("native tool schema precondition failed: malformed Content-Type") || error.starts_with("native tool schema precondition failed: the requested curl") || error.starts_with("native tool schema precondition failed: invalid JSON payload-file");
+            let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:") || error.starts_with("native tool schema precondition failed: Windows") || error.starts_with("native tool schema precondition failed: inline backslash") || error.starts_with("native tool schema precondition failed: malformed Content-Type") || error.starts_with("native tool schema precondition failed: the requested curl") || error.starts_with("native tool schema precondition failed: invalid JSON payload-file");
             if terminal_recovery {
                 let tool=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")).cloned().ok_or_else(||error.clone())?;
                 payload["tools"]=serde_json::json!([tool]);
@@ -7356,4 +7356,11 @@ fn terminal_schema_recovery_uses_only_registered_terminal_and_preserves_host_res
  let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[{"role":"tool","content":"previous successful POST must not be replayed","tool_call_id":"prior"}]});
  let mut attempts=0;
  run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert_eq!(body["messages"][0],p["messages"][0]);assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");let guidance=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(guidance.contains("BEFORE execution"));assert!(!guidance.contains("Keep new file contents"));Ok("host call".into())}).unwrap();assert_eq!(attempts,2);
+}
+
+#[test]
+fn missing_executable_terminal_argument_is_regenerated_not_invented() {
+ let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[]});
+ let mut attempts=0;
+ run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: run_in_terminal.mode is required".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert!(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("run_in_terminal.mode is required"));Ok("regenerated valid call".into())}).unwrap();assert_eq!(attempts,2);
 }
