@@ -2887,10 +2887,10 @@ fn validate_native_terminal_environment(payload:&serde_json::Value,message:&serd
         for statement in command.split([';','\n']) {
             let lower=statement.trim_start().to_ascii_lowercase();let lower=lower.strip_prefix("& ").unwrap_or(&lower).trim_start();
             if lower=="curl" || lower.starts_with("curl ") {
-                return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest. Use curl.exe with native curl flags, or Invoke-RestMethod for JSON APIs. For POST JSON use this PowerShell pattern with actual task values: $body = @{name='actual name';email='actual email';age=20} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not use inline JSON or backslash escaping. Do not retry any mutation already confirmed successful by a host result".into());
+                return Err("native tool schema precondition failed: Windows bare curl may resolve to Invoke-WebRequest. Use curl.exe with native curl flags, or Invoke-RestMethod for JSON APIs. For POST JSON use this PowerShell pattern with actual task values: $body = @{field='actual task value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not use inline JSON or backslash escaping. Do not retry any mutation already confirmed successful by a host result".into());
             }
             if lower.starts_with("curl.exe ") && !lower.contains(" --% ") && (lower.contains(" -d ") || lower.contains(" --data ") || lower.contains(" --data-binary ")) && lower.contains("\\\"") {
-                return Err("native tool schema precondition failed: inline backslash-escaped JSON for curl.exe is ambiguous in Windows PowerShell. Use this PowerShell pattern with actual task values: $body = @{name='actual name';email='actual email';age=20} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not use inline JSON or backslash escaping. Preserve the requested operation and do not replay an already successful mutation".into());
+                return Err("native tool schema precondition failed: inline backslash-escaped JSON for curl.exe is ambiguous in Windows PowerShell. Use this PowerShell pattern with actual task values: $body = @{field='actual task value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Do not use inline JSON or backslash escaping. Preserve the requested operation and do not replay an already successful mutation".into());
             }
         }
     }
@@ -2975,6 +2975,11 @@ fn run_native_tool_attempts(
     mut payload: serde_json::Value,
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
+    if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
+        if let Some(messages)=payload["messages"].as_array_mut() {
+            messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe, never bare curl. For JSON request bodies, never use Bash backslash-escaped inline JSON. Build a PowerShell hashtable with the actual requested fields and values and pipe it to ConvertTo-Json; write that JSON to [IO.Path]::GetTempFileName() using [IO.File]::WriteAllText; pass the file with curl.exe --data-binary ('@' + $file), then remove the temporary file. Preserve the actual method, URL and task data. Invoke-RestMethod with a ConvertTo-Json body is also valid. Include all registered terminal arguments. Never replay an already successful mutation."}));
+        }
+    }
     let mut output = String::new();
     match attempt(&payload, &mut output, false) {
         Ok(result) => Ok(result),
@@ -7313,4 +7318,10 @@ mod native_delta_tests {
         fs::remove_file(file).unwrap();
         fs::remove_dir(dir).unwrap();
     }
+}
+
+#[test]
+fn windows_terminal_guidance_precedes_first_generation_without_changing_request() {
+ let p=serde_json::json!({"messages":[{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info><userRequest>create a record using curl</userRequest>"}]});
+ run_native_tool_attempts(p.clone(),|body,_,retry| {assert!(!retry);assert_eq!(body["messages"][0],p["messages"][0]);assert!(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("ConvertTo-Json"));Ok("valid call".into())}).unwrap();
 }
