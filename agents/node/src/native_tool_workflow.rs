@@ -11,6 +11,7 @@ fn key(path: &str) -> Option<String> {
 }
 
 fn catalog(payload: &Value) -> Option<&Vec<Value>> {
+    if payload.get("tool_choice").is_some_and(|choice| !choice.is_null() && !matches!(choice.as_str(),Some("auto" | "required"))) { return None; }
     let tools = payload["tools"].as_array()?;
     ["read_file", "list_dir", "replace_string_in_file"].iter().all(|name|
         tools.iter().any(|t| t["function"]["name"].as_str() == Some(name))).then_some(tools)
@@ -166,5 +167,14 @@ mod tests {
         assert!(advisory_only("<compileError>Code Duplication (3%)</compileError>"));
         assert!(!advisory_only("<compileError>Code Duplication (3%)</compileError><compileError>Unexpected token</compileError>"));
         assert!(!advisory_only("<compileError>Unknown diagnostic</compileError>"));
+    }
+    #[test]
+    fn explicit_client_tool_choice_is_not_overridden() {
+        let mut p=payload();observe(&mut p,call("create_file",json!({"filePath":"/src/main.rs"}),"write_"),"Created");
+        for choice in [json!("none"),json!({"type":"function","function":{"name":"custom"}})] {
+            p["tool_choice"]=choice;
+            assert!(verification(&p,&json!({"content":"answer"})).is_none());
+            assert!(!is_file_turn(&p));
+        }
     }
 }
