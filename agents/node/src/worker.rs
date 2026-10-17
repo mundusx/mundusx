@@ -2982,6 +2982,13 @@ fn run_native_tool_attempts(
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
     if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
+        if let Some(tools)=payload["tools"].as_array_mut() {
+            for tool in tools.iter_mut().filter(|t|t["function"]["name"]=="run_in_terminal") {
+                let schema=&mut tool["function"]["parameters"]["properties"]["command"];
+                let description=schema["description"].as_str().unwrap_or("").to_string();
+                schema["description"]=serde_json::json!(format!("{description}\nWindows PowerShell JSON POST example (replace fields and URL with actual task values): $body = @{{field='value'}} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Never bare curl, backslash-escaped JSON, direct JSON variable arguments to curl, or Remove-Item on JSON text."));
+            }
+        }
         if let Some(messages)=payload["messages"].as_array_mut() {
             messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe, never bare curl. For JSON request bodies, never use Bash backslash-escaped inline JSON. Use this exact PowerShell structure, replacing only the example fields and URL with the actual request: $body = @{field='value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. $body is JSON text; $file is the file path. Never remove $body or pass $body directly to curl. Preserve the actual method, URL and task data. Invoke-RestMethod with a ConvertTo-Json body is also valid. Include all registered terminal arguments. Never replay an already successful mutation."}));
         }
