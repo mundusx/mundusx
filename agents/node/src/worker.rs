@@ -2969,6 +2969,14 @@ fn schema_recovery_selects_only_the_rejected_registered_function() {
         assert_eq!(body["chat_template_kwargs"]["opengpu_require_tool_call"],true);
         Ok("corrected call".into())
     }).unwrap();assert_eq!(attempts,2);
+    for choice in [json!("none"),json!({"type":"function","function":{"name":"create_file"}})] {
+        let mut forced=p.clone();forced["tool_choice"]=choice.clone();
+        run_native_tool_attempts(forced,|body,_,retry| {
+            if !retry {return Err("native tool schema precondition failed: read_file.startLine is required".into());}
+            assert_eq!(body["tools"],p["tools"]);assert_eq!(body["tool_choice"],choice);
+            Ok("client choice preserved".into())
+        }).unwrap();
+    }
 }
 
 #[test]
@@ -3079,7 +3087,7 @@ fn run_native_tool_attempts(
             let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:");
             let schema_tool=error.strip_prefix("native tool schema precondition failed: ").and_then(|s|s.split_once('.').map(|p|p.0));
             let recovery_tool=if terminal_recovery {Some("run_in_terminal")} else {schema_tool};
-            let recovery_tool=recovery_tool.filter(|name|payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()).is_none_or(|selected|selected==*name));
+            let recovery_tool=recovery_tool.filter(|name|payload["tool_choice"].as_str()!=Some("none") && payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()).is_none_or(|selected|selected==*name));
             let selected=recovery_tool.and_then(|name|payload["tools"].as_array()?.iter().find(|t|t["function"]["name"].as_str()==Some(name))).cloned();
             if let Some(tool)=selected {
                 let name=tool["function"]["name"].clone();
