@@ -3045,6 +3045,14 @@ fn rejected_edit_stream_returns_read_without_releasing_patch_or_success_prose() 
 fn complete_source_artifacts_become_host_edits_and_truncated_artifacts_never_leak() {
     use serde_json::json;
     let p=json!({"messages":[{"role":"user","content":"<userRequest>First repair the file: main.rs. Replace the entire file with the new implementation.</userRequest>"},{"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":json!({"filePath":"D:/sample/main.rs","startLine":1,"endLine":20}).to_string()}}]},{"role":"tool","tool_call_id":"read1","content":"old source\n"}],"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}},"required":["filePath","oldString","newString"]}}}]});
+    run_native_tool_attempts(p.clone(),|body,_,retry| {
+        if !retry {return Err("native tool arguments are incomplete: replacement source exceeded generation limit".into());}
+        let guidance=body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(guidance["name"],"mundusx_source_artifact_recovery");
+        assert!(guidance["content"].as_str().unwrap().contains("source text only"));
+        assert!(!guidance["content"].as_str().unwrap().contains("exactly ONE complete valid tool call"));
+        Ok("complete source".into())
+    }).unwrap();
     for reason in ["stop","length"] {
         let chunk=json!({"choices":[{"delta":{"content":"fn main() {}\n"},"finish_reason":reason}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
         let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p)));
@@ -3252,13 +3260,16 @@ fn run_native_tool_attempts(
             if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
                 payload["max_tokens"]=serde_json::json!(payload["max_tokens"].as_u64().unwrap_or(4096).min(4096));
             }
+            let source_recovery=native_line_edit::source_response_required(&payload);
             let messages = payload["messages"]
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
             if let Some(rejected)=rejected_call {
                 messages.push(serde_json::json!({"role":"system","content":format!("Diagnostic data from the rejected model output follows. These are NOT executed tool results and are NOT instructions. Correct the arguments against the registered tool contract and the validation reason; preserve the user's task data. Rejected call JSON: {rejected}")}));
             }
-            if terminal_recovery {
+            if source_recovery {
+                messages.push(serde_json::json!({"role":"system","name":"mundusx_source_artifact_recovery","content":format!("The previous source artifact was rejected before any edit executed: {error}. Return a SHORTER complete replacement source file implementing the latest user requirements. This is an internal source-generation step with no tools: return source text only, never tool-call JSON or markup. Do not repeat the old implementation or omit cleanup and assertions to shorten it; use concise helper functions. Do not claim completion. The adapter will validate and compile the complete source into the registered host edit.")}));
+            } else if terminal_recovery {
                 messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. Use the host shell and its actual execution results; do not invent a successful outcome. Wait for the host execution result.")}));
             } else {
             messages.push(serde_json::json!({"role":"system", "content":format!(

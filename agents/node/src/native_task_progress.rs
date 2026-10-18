@@ -41,7 +41,10 @@ fn progress(p:&Value)->Progress {
                 state.reads.entry(k).or_default().push(Read{start,end,id:id.into(),digest:digest[..12].into()});
             },
             "create_file"|"replace_string_in_file"|"insert_edit_into_file"|"multi_replace_string_in_file"=>{
-                if ok(text) {state.writes+=1;state.check=None;state.reads.clear();}
+                // A host rejection can mean the user changed the file after
+                // our read. Allow fresh grounding even when no write applied.
+                state.reads.clear();
+                if ok(text) {state.writes+=1;state.check=None;}
             },
             "run_in_terminal"=>{
                 state.reads.clear();
@@ -106,6 +109,12 @@ mod tests {
    observe(&mut p,call("replace_string_in_file",json!({"filePath":"/test.js"})),"Applied edit");assert!(guard(&p,&check).is_ok());
   }
   let mut p=p();let c=call("run_in_terminal",json!({"command":"cargo test"}));observe(&mut p,c.clone(),"Terminal still running");assert!(guard(&p,&c).is_ok());
+ }
+ #[test] fn rejected_edit_allows_refresh_without_claiming_a_write() {
+  let mut p=p();let read=call("read_file",json!({"filePath":"/app/main.js","startLine":1,"endLine":2}));
+  observe(&mut p,read.clone(),"old\nsource\n");assert!(guard(&p,&read).is_err());
+  observe(&mut p,call("replace_string_in_file",json!({"filePath":"/app/main.js"})),"String replacement failed: source changed");
+  assert!(guard(&p,&read).is_ok());assert_eq!(progress(&p).writes,0);
  }
  #[test] fn unmatched_results_and_other_requests_do_not_supply_progress() {
   let mut p=p();p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"invented","content":"Command exited with code 0"}));assert!(guidance(&p).is_none());
