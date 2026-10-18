@@ -2872,7 +2872,11 @@ fn run_native_openai_tool_turn(
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
-    if let Some(automatic)=native_tool_workflow::silent_validation_followup(&payload).or_else(||native_tool_workflow::validator_after_edit(&payload)).or_else(||native_tool_workflow::requested_validator_after_edit(&payload)).or_else(||native_line_edit::preflight(&payload)) {
+    if let Some(message)=native_tool_workflow::literal_inspection_output(&payload) {
+        if streaming {emit_stream_delta(&serde_json::json!({"content":message["content"]}).to_string());}
+        return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"stop"}]}));
+    }
+    if let Some(automatic)=native_tool_workflow::literal_inspection(&payload).or_else(||native_tool_workflow::silent_validation_followup(&payload)).or_else(||native_tool_workflow::validator_after_edit(&payload)).or_else(||native_tool_workflow::requested_validator_after_edit(&payload)).or_else(||native_line_edit::preflight(&payload)) {
         if let Ok((message,_))=native_workflow_message(&payload,&automatic) {
             if streaming {
                 let mut calls=message["tool_calls"].clone();

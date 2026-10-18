@@ -444,7 +444,7 @@ fn compatible(p: &Value) -> bool {
         })
 }
 fn snapshots(p: &Value) -> BTreeMap<String, Snapshot> {
-    let mut found = BTreeMap::new();
+    let mut found: BTreeMap<String,Snapshot> = BTreeMap::new();
     let Some(messages) = p["messages"].as_array() else {
         return found;
     };
@@ -511,6 +511,10 @@ fn snapshots(p: &Value) -> BTreeMap<String, Snapshot> {
         {
             continue;
         }
+        // A matching small prefix refresh does not erase the fuller matched
+        // observation or its observed EOF. Changes and intervening edits still
+        // invalidate it; host exact-string matching checks the actual edit.
+        if found.get(&k).is_some_and(|previous|previous.text.len()>text.len()&&previous.text.starts_with(text)) {continue;}
         found.insert(
             k,
             Snapshot {
@@ -1079,6 +1083,18 @@ mod tests {
         assert!(compile(&p,&edit(1,3,"const db = require('./database.js');\nconst app = require('./server.js');")).unwrap_err().contains("another repeated statement"));
         assert!(compile(&p,&edit(1,4,"const db = require('./database.js');\nconst app = require('./server.js');")).is_ok());
         assert!(compile(&p,&edit(3,3,"")).is_ok());
+    }
+    #[test]
+    fn matching_short_prefix_keeps_full_observation_but_changed_prefix_invalidates_it() {
+        let mut p=payload("const first = 1;\nconst second = 2;\nconst third = 3;\n");
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"short","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":1}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"short","content":"const first = 1;\n"})]);
+        assert_eq!(snapshots(&p)["d:/app/main.js"].text.lines().count(),3);
+        assert!(compile(&p,&edit(1,1,"const first = 4;\n")).is_ok());
+        p["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("const first = 9;\n");
+        assert_eq!(snapshots(&p)["d:/app/main.js"].text,"const first = 9;\n");
+        assert!(compile(&p,&edit(1,1,"const first = 4;\n")).unwrap_err().contains("confirmed EOF"));
     }
     #[test]
     fn adjacent_context_cannot_be_duplicated_by_a_narrow_range() {
