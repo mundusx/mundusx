@@ -681,9 +681,10 @@ pub fn prepare(p: &Value) -> Value {
     }
     if p["mundusx_repair_from_observations"]==true && super::native_tool_workflow::repair_pending(p)
         && out["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|t["function"]["name"]==NAME)) {
-        out["tools"].as_array_mut().unwrap().retain(|t|t["function"]["name"]==NAME);
+        let uncertain_cause=super::native_tool_workflow::compiler_failure(p).is_some_and(|failure|!super::native_tool_workflow::source_diagnostic(&failure));
+        out["tools"].as_array_mut().unwrap().retain(|t|t["function"]["name"]==NAME || (uncertain_cause&&matches!(t["function"]["name"].as_str(),Some("read_file"|"list_dir"|"file_search"|"grep_search"))));
         out["tool_choice"]=json!("required");
-        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_observed_repair_recovery","content":"The proposed duplicate inspection was rejected before execution. Current matched source observations are supplied below. This bounded correction step uses the observed-file edit planner to repair the actual failed check. Choose the file containing the cause, not necessarily the stack-frame symptom. Preserve the user requirements and test expectations. Do not repeat an unchanged statement or invent an edit merely to unlock execution. The normal catalog returns after this step."}));
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_observed_repair_recovery","content":"The proposed duplicate inspection was rejected before execution. Reuse current matched source observations. For a functional/runtime failure, inspect an unread implementation file or genuinely missing range when needed; a repeated fixture read does not establish the cause. Otherwise use the observed-file edit planner for an actual correction. Choose the causal file, not automatically the stack-frame symptom or test fixture. Preserve requirements and expected behavior; never weaken assertions to match a faulty implementation or invent an edit merely to unlock execution. The normal catalog returns after this bounded correction."}));
     }
     if let Some((_, line)) = &focus {
         if ordered.is_none() {
@@ -973,13 +974,16 @@ mod tests {
         .unwrap()
     }
     #[test]
-    fn duplicate_inspection_recovery_focuses_edits_only_during_actual_failed_validation() {
+    fn duplicate_inspection_recovery_keeps_unread_implementation_inspection_for_functional_failures() {
         let mut p=payload("const faulty = 1;\n");p["mundusx_repair_from_observations"]=json!(true);
         assert!(prepare(&p)["tools"].as_array().unwrap().len()>1);
         p["messages"].as_array_mut().unwrap().extend([
             json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test main.js"}).to_string()}}]}),
             json!({"role":"tool","tool_call_id":"test1","content":"AssertionError: expected correct behavior\nCommand exited with code 1"})]);
-        let prepared=prepare(&p);assert_eq!(prepared["tools"].as_array().unwrap().len(),1);assert_eq!(prepared["tools"][0]["function"]["name"],NAME);
+        let prepared=prepare(&p);for name in [NAME,"read_file","list_dir"] {assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name),"{name}");}
+        assert!(!prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="create_file"));
+        p["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("D:/app/main.js:1\nSyntaxError: missing semicolon\nCommand exited with code 1");
+        let compiler=prepare(&p);assert_eq!(compiler["tools"].as_array().unwrap().len(),1);assert_eq!(compiler["tools"][0]["function"]["name"],NAME);
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
     }
     #[test]
