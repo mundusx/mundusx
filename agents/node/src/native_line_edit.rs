@@ -533,6 +533,14 @@ pub fn prepare(p: &Value) -> Value {
             out["messages"]=json!(messages.iter().enumerate().filter(|(i,m)|*i>=start||Some(*i)==previous_answer||matches!(m["role"].as_str(),Some("user"|"system"|"developer"))).map(|(_,m)|m.clone()).collect::<Vec<_>>());
         }
     }
+    // Earlier preambles are model hypotheses, not host observations. Keep
+    // the tool calls and matched results, but avoid repeatedly reinforcing an
+    // unverified diagnosis on every repair turn. Original payload stays intact.
+    for message in out["messages"].as_array_mut().into_iter().flatten() {
+        if message["role"]=="assistant"&&message["tool_calls"].as_array().is_some_and(|calls|!calls.is_empty()) {
+            message["content"]=Value::Null;
+        }
+    }
     if let Some((target,source))=whole_source(p) {
         compact_replaced_source(&mut out,&target);
         // This bounded substep generates source, not another agent action.
@@ -1051,6 +1059,17 @@ mod tests {
         p["tools"]=json!([]);p["tool_choice"]=json!("none");p["messages"].as_array_mut().unwrap().extend([json!({"role":"user","content":"<userRequest>hello</userRequest>"}),json!({"role":"system","name":"mundusx_conversational_turn","content":"Answer the greeting; retain preferences"})]);
         let original=p.clone();let view=prepare(&p);assert_eq!(p,original);assert!(!view.to_string().contains("UNNEEDED_LARGE_SOURCE"));
         assert!(view["messages"].as_array().unwrap().iter().any(|m|m["content"]=="<userRequest>hello</userRequest>"));assert_eq!(view["tool_choice"],"none");
+    }
+    #[test]
+    fn tool_preambles_are_not_replayed_as_evidence_during_repairs() {
+        let mut p=payload("const value = 1;\n");
+        p["messages"][1]["content"]=json!("UNVERIFIED_DIAGNOSIS: storage must be broken");
+        let original=p.clone();let view=prepare(&p);
+        assert_eq!(p,original);
+        let replay=view["messages"].as_array().unwrap().iter().find(|m|m["tool_calls"].as_array().is_some_and(|calls|calls.iter().any(|c|c["id"]=="read1"))).unwrap();
+        assert_eq!(replay["tool_calls"],p["messages"][1]["tool_calls"]);
+        assert!(replay["content"].is_null());assert!(!view.to_string().contains("UNVERIFIED_DIAGNOSIS"));
+        assert!(view["messages"].as_array().unwrap().iter().any(|m|m["tool_call_id"]=="read1"));
     }
     #[test]
     fn model_context_keeps_current_evidence_and_all_instructions_without_old_task_tools() {
