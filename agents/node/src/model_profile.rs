@@ -9,18 +9,34 @@ from mlx_lm.sample_utils import make_sampler, make_logits_processors
 model, tokenizer = load(sys.argv[1])
 prompt = tokenizer.apply_chat_template([{"role":"user","content":sys.argv[2]}], tokenize=False, add_generation_prompt=True)
 print(generate(model, tokenizer, prompt=prompt, max_tokens=int(sys.argv[3]),
-    sampler=make_sampler(temp=float(sys.argv[4]), top_p=float(sys.argv[5]), top_k=20),
-    logits_processors=make_logits_processors(repetition_penalty=1.1, repetition_context_size=512), verbose=False))
+    sampler=make_sampler(temp=float(sys.argv[4]), top_p=float(sys.argv[5]), top_k=int(sys.argv[6])),
+    logits_processors=make_logits_processors(repetition_penalty=float(sys.argv[7]), repetition_context_size=512), verbose=False))
 "#;
+
+pub fn is_qwen3_coder_next(model: &str) -> bool {
+    let name = model.rsplit(['/', '\\']).next().unwrap_or(model).to_ascii_lowercase();
+    name == "qwen3-coder-next" || ["4bit", "6bit", "8bit", "bf16", "fp16"].iter()
+        .any(|suffix| name == format!("qwen3-coder-next-{suffix}"))
+}
 
 pub fn is_qwen3_coder(model: &str) -> bool {
     let name = model.rsplit(['/', '\\']).next().unwrap_or(model).to_ascii_lowercase();
-    name.starts_with("qwen3-coder-") && name.contains("instruct")
+    (name.starts_with("qwen3-coder-") && name.contains("instruct")) || is_qwen3_coder_next(model)
+}
+
+// Official Next model card/generation_config: temperature=1, top_p=.95, top_k=40.
+// Keep its defaults separate from the older Coder Instruct profile.
+pub fn top_k(model: &str) -> u32 { if is_qwen3_coder_next(model) {40} else {20} }
+pub fn repetition_penalty(model: &str) -> f64 { if is_qwen3_coder_next(model) {1.0} else {1.05} }
+
+fn default_sampling(model: &str) -> (f64,f64) {
+    if is_qwen3_coder_next(model) {(1.0,0.95)}
+    else if is_qwen3_coder(model) {(0.7,0.8)} else {(0.2,0.9)}
 }
 
 pub fn sampling(model: &str, temperature: Option<f32>, top_p: Option<f32>) -> (f32, f32) {
-    let (default_temperature, default_top_p) = if is_qwen3_coder(model) { (0.7, 0.8) } else { (0.2, 0.9) };
-    (temperature.unwrap_or(default_temperature).max(0.0), top_p.unwrap_or(default_top_p).clamp(0.0, 1.0))
+    let (default_temperature, default_top_p) = default_sampling(model);
+    (temperature.unwrap_or(default_temperature as f32).max(0.0), top_p.unwrap_or(default_top_p as f32).clamp(0.0, 1.0))
 }
 
 pub fn verify_mlx_runtime(python: &std::path::Path) -> Result<(), String> {
@@ -39,7 +55,8 @@ assert 'repetition_penalty' in source and 'top_k' in source
 
 pub fn apply(model: &str, payload: &mut Value) {
     if !is_qwen3_coder(model) { return; }
-    for (key, value) in [("temperature", json!(0.7)), ("top_p", json!(0.8)), ("top_k", json!(20)), ("repetition_penalty", json!(1.05))] {
+    let (temperature,top_p)=default_sampling(model);
+    for (key, value) in [("temperature", json!(temperature)), ("top_p", json!(top_p)), ("top_k", json!(top_k(model))), ("repetition_penalty", json!(repetition_penalty(model)))] {
         if payload.get(key).is_none_or(Value::is_null) { payload[key] = value; }
     }
 }
@@ -55,7 +72,7 @@ pub fn apply_mlx(model: &str, payload: &mut Value) {
     if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
         // Exact source edits must be able to copy observed identifiers and literals.
         // The native runtime guard independently stops actual argument loops.
-        payload["repetition_penalty"] = json!(if native_files {1.0} else {1.1});
+        payload["repetition_penalty"] = json!(if native_files || is_qwen3_coder_next(model) {1.0} else {1.1});
     }
     apply(model, payload);
     if native_files {
@@ -99,6 +116,21 @@ fn merge_leading_system_messages(payload: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn next_uses_its_own_defaults_and_preserves_actual_client_sampling() {
+        let model="mlx-community/Qwen3-Coder-Next-4bit";
+        assert!(is_qwen3_coder(model));
+        assert_eq!(sampling(model,None,None),(1.0,0.95));
+        let mut payload=json!({"temperature":0.1,"top_p":1.0,"model":model});
+        apply_mlx(model,&mut payload);
+        assert_eq!(payload["temperature"],0.1);assert_eq!(payload["top_p"],1.0);
+        assert_eq!(payload["top_k"],40);assert_eq!(payload["repetition_penalty"],1.0);
+        assert_eq!(payload["model"],model);
+        assert!(!is_qwen3_coder("unknown/Qwen3-Coder-Next-unverified-architecture"));
+        let mut required=json!({"tool_choice":"required","tools":[{"type":"function"}]});
+        apply_mlx(model,&mut required);
+        assert_eq!(required["chat_template_kwargs"]["opengpu_require_tool_call"],true);
+    }
     #[test]
     fn native_guard_is_limited_to_serial_vscode_coder_tools() {
         let tools=json!([{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}]);

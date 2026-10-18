@@ -2457,7 +2457,7 @@ fn run_llama_command(
         .arg("--seed")
         .arg(seed.to_string());
     if crate::model_profile::is_qwen3_coder(&model_path.to_string_lossy()) {
-        command.args(["--top-k", "20", "--repeat-penalty", "1.05"]);
+        command.args(["--top-k", &crate::model_profile::top_k(&model_path.to_string_lossy()).to_string(), "--repeat-penalty", &crate::model_profile::repetition_penalty(&model_path.to_string_lossy()).to_string()]);
     }
     if let Some(grammar) = grammar {
         command.arg("--grammar").arg(grammar);
@@ -3818,7 +3818,9 @@ fn run_mlx_command(
         // Use its public sampler/logits API rather than silently dropping it.
         command = Command::new(&python);
         command.args(["-c", crate::model_profile::MLX_GENERATE_SCRIPT, model_name, prompt,
-            &max_tokens.to_string(), &temperature.to_string(), &top_p.to_string()]);
+            &max_tokens.to_string(), &temperature.to_string(), &top_p.to_string(),
+            &crate::model_profile::top_k(model_name).to_string(),
+            &(if crate::model_profile::is_qwen3_coder_next(model_name) {1.0_f32} else {1.1_f32}).to_string()]);
     }
     let output = command.output()
         .map_err(|error| format!("failed to launch MLX runtime: {error}"))?;
@@ -4465,7 +4467,8 @@ fn run_llama_request(
         .unwrap_or_else(|| "active".to_string());
 
     if crate::model_profile::is_qwen3_coder(&model_name) {
-        eprintln!("model-profile=qwen3-coder-instruct-v1; defaults temperature=0.7 top_p=0.8 top_k=20 repetition_penalty=1.05; explicit request settings preserved");
+        let (temperature,top_p)=crate::model_profile::sampling(&model_name,None,None);
+        eprintln!("model-profile=qwen3-coder; defaults temperature={temperature} top_p={top_p} top_k={} repetition_penalty={}; explicit request settings preserved",crate::model_profile::top_k(&model_name),crate::model_profile::repetition_penalty(&model_name));
     }
 
     if backend == Backend::M && crate::model_profile::is_qwen3_coder(&model_name) && !managed_mlx_profile_verified() {
