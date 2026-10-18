@@ -2970,7 +2970,8 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
 
 fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     native_tool_workflow::task_constraints(payload,message)?;
-    let metadata=complete_native_read_ranges(payload,&native_tool_workflow::validation_status(payload,&native_tool_workflow::terminal_metadata(payload,message)));
+    let planned=native_tool_workflow::planning_metadata(payload,message);
+    let metadata=complete_native_read_ranges(payload,&native_tool_workflow::validation_status(payload,&native_tool_workflow::terminal_metadata(payload,&planned)));
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
         validate_native_tool_schema(payload,&metadata)?;
         if metadata["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
@@ -3213,6 +3214,20 @@ fn terminal_execution_inputs_are_never_invented_or_overwritten() {
     }
     p["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
     assert!(native_workflow_message(&p,&terminal_message(serde_json::json!({"command":"npm test","mode":"sync"}))).is_ok());
+}
+
+#[test]
+fn planning_status_aliases_follow_only_the_registered_host_enum() {
+    use serde_json::{json,Value};
+    let mut p=json!({"tools":[{"function":{"name":"manage_todo_list","parameters":{"type":"object","required":["todoList"],"properties":{"todoList":{"type":"array","items":{"type":"object","required":["id","title","status"],"properties":{"id":{"type":"integer"},"title":{"type":"string"},"status":{"type":"string","enum":["not-started","in-progress","completed"]}}}}}}}}]});
+    let make=|status:&str|json!({"role":"assistant","tool_calls":[{"id":"plan1","function":{"name":"manage_todo_list","arguments":json!({"todoList":[{"id":1,"title":"Preserve actual task data","status":status}]}).to_string()}}]});
+    for (alias,status) in [("pending","not-started"),("in_progress","in-progress"),("completed","completed")] {
+        let input=make(alias);let original=input.clone();let (out,_)=native_workflow_message(&p,&input).unwrap();assert_eq!(input,original);
+        let a:Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(a["todoList"][0]["status"],status);assert_eq!(a["todoList"][0]["title"],"Preserve actual task data");
+    }
+    assert!(native_workflow_message(&p,&make("blocked")).is_err());
+    p["tools"][0]["function"]["parameters"]["properties"]["todoList"]["items"]["properties"]["status"]["enum"]=json!(["pending","in-progress","completed"]);
+    assert_eq!(native_tool_workflow::planning_metadata(&p,&make("pending")),make("pending"));
 }
 
 #[test]

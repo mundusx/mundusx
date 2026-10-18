@@ -69,6 +69,27 @@ pub fn terminal_metadata(payload:&Value,message:&Value)->Value {
     result
 }
 
+/// Canonical planning labels, only when the registered enum declares their
+/// equivalent host spelling. These labels never prove source/test completion.
+pub fn planning_metadata(payload:&Value,message:&Value)->Value {
+    let Some(values)=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="manage_todo_list"))
+        .and_then(|t|t.pointer("/function/parameters/properties/todoList/items/properties/status/enum")).and_then(Value::as_array) else {return message.clone();};
+    let mut out=message.clone();
+    for call in out.get_mut("tool_calls").and_then(Value::as_array_mut).into_iter().flatten() {
+        if call["function"]["name"]!="manage_todo_list" {continue;}
+        let Ok(mut a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let mut changed=false;
+        for item in a.get_mut("todoList").and_then(Value::as_array_mut).into_iter().flatten() {
+            let Some(status)=item["status"].as_str() else {continue;};
+            if values.iter().any(|v|v.as_str()==Some(status)) {continue;}
+            let canonical=match status {"pending"=>"not-started","in_progress"=>"in-progress",_=>continue};
+            if values.iter().any(|v|v.as_str()==Some(canonical)) {item["status"]=json!(canonical);changed=true;}
+        }
+        if changed {call["function"]["arguments"]=json!(a.to_string());}
+    }
+    out
+}
+
 fn status_suffix(command:&str)->String {
     use sha2::{Digest,Sha256};
     let digest=format!("{:x}",Sha256::digest(command.as_bytes()));
