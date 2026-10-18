@@ -53,6 +53,15 @@ fn whole_replacement(p:&Value)->bool {
     if ["do not replace","don't replace","never replace"].iter().any(|s|text.contains(s)) {return false;}
     ["replace that test implementation","replace the entire file","replace the whole file","replace this file entirely"].iter().any(|s|text.contains(s))
 }
+fn whole_source(p:&Value)->Option<(String,Snapshot)> {
+    if !compatible(p)||!whole_replacement(p) {return None;}
+    let mut sources=snapshots(p);let target=ordered_target(p,&sources)?;let source=sources.remove(&target)?;
+    let call=p["messages"].as_array()?.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)?;
+    let a:Value=serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
+    if source.text.lines().count() as u64>=a["endLine"].as_u64()? {return None;}
+    Some((target,source))
+}
+pub fn source_response_required(p:&Value)->bool {whole_source(p).is_some()}
 fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     let messages=p["messages"].as_array()?;
     let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))?;
@@ -466,6 +475,14 @@ pub fn prepare(p: &Value) -> Value {
     }
     let mut sources = snapshots(p);
     let mut out = p.clone();
+    if let Some((_,source))=whole_source(p) {
+        out["tools"]=json!([]);out["tool_choice"]=json!("none");
+        out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(false);
+        out["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(false);
+        out["max_tokens"]=json!(p["max_tokens"].as_u64().unwrap_or(2048).min(2048));
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal source-generation step for the user's explicitly requested complete replacement of {} ({} observed lines). All original host permissions and task constraints remain in force. Return ONLY the complete NEW source file, preferably under 100 lines and 5000 characters. Do not output tool-call markup, a plan, copied old headers, oldString, or a diff. The adapter retains the exact observed old file and will compile your source into the registered host replacement tool; this is not a final user answer and does not execute code. Implement real requested behavior and cleanup. Original user requirements:\n{}",source.path,source.text.lines().count(),user_task(p).unwrap_or(""))}));
+        return out;
+    }
     let ordered=ordered_target(p,&sources).filter(|target| {
         let source=&sources[target];
         p["messages"].as_array().into_iter().flatten().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)
@@ -582,6 +599,18 @@ pub fn prepare(p: &Value) -> Value {
     out
 }
 pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
+    if message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()) {
+        if let Some((_,source))=whole_source(p) {
+            let text=message["content"].as_str().filter(|s|!s.trim().is_empty()).ok_or("native tool arguments are incomplete: complete replacement source is missing")?;
+            let mut code=text.trim();
+            if code.starts_with("```") {
+                let (_,body)=code.split_once('\n').ok_or("native tool arguments are incomplete: source fence is incomplete")?;
+                code=body.strip_suffix("```").ok_or("native tool arguments are incomplete: source fence is incomplete")?.trim_end();
+            }
+            let plan=json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_observed_source_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":NAME,"arguments":json!({"filePath":source.path,"startLine":1,"endLine":source.text.lines().count(),"newText":code}).to_string()}}]});
+            return compile(p,&plan);
+        }
+    }
     let Some(calls) = message["tool_calls"].as_array() else {
         return Ok(message.clone());
     };
@@ -627,12 +656,12 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
     let fail = |reason: &str| format!("native tool schema precondition failed: {NAME}: {reason}");
     if !compatible(p)
         || calls.len() != 1
-        || !prepare(p)["tools"].as_array().is_some_and(|tools| {
+        || !(source_response_required(p)||prepare(p)["tools"].as_array().is_some_and(|tools| {
             tools.iter().any(|t| {
                 matches!(t["function"]["name"].as_str(), Some(HOST_NAME | NAME))
                     && t["function"]["parameters"]["properties"]["startLine"].is_object()
             })
-        })
+        }))
     {
         return Err(fail("one registered observed-line edit is required"));
     }
@@ -751,7 +780,8 @@ mod tests {
         let compiled=compile(&p,&edit(1,2,"new source")).unwrap();assert_eq!(args(&compiled)["oldString"],"old source\nsecond line\n");
         let mut whole=p.clone();whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with the new implementation.</userRequest>");
         assert!(compile(&whole,&edit(1,1,"partial replacement")).unwrap_err().contains("complete observed file"));assert!(compile(&whole,&edit(1,2,"complete replacement")).is_ok());
-        let prepared_whole=prepare(&whole);assert!(prepared_whole["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("endLine=2"));
+        let prepared_whole=prepare(&whole);assert!(prepared_whole["tools"].as_array().unwrap().is_empty());assert_eq!(prepared_whole["tool_choice"],"none");
+        let artifact=compile(&whole,&json!({"role":"assistant","content":"```javascript\nnew implementation\n```"})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");assert_eq!(args(&artifact)["oldString"],"old source\nsecond line\n");
         whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Do not replace the entire file.</userRequest>");assert!(!whole_replacement(&whole));
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
         p["messages"].as_array_mut().unwrap().extend([compiled,json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"}),json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),json!({"role":"tool","tool_call_id":"read2","content":"new source\n"})]);
