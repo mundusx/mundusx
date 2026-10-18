@@ -213,7 +213,8 @@ pub fn preflight(p: &Value) -> Option<Value> {
     if let Some(read)=ordered_read(p).or_else(||first_target_read(p)) {return Some(read);}
     // Runtime frames can justify a fresh read, but only positive compiler
     // evidence in compiler_target can force a line edit.
-    let failure=super::native_tool_workflow::diagnostic_paths(&super::native_tool_workflow::compiler_failure(p)?);
+    let raw_failure=super::native_tool_workflow::compiler_failure(p)?;
+    let failure=super::native_tool_workflow::diagnostic_paths(&raw_failure);
     let messages = p["messages"].as_array()?;
     let start = super::native_task_progress::request_index(messages)
         .map_or(0, |i| i + 1);
@@ -256,6 +257,7 @@ pub fn preflight(p: &Value) -> Option<Value> {
             }
         }
     }
+    let failure_index=messages.iter().rposition(|m|m["role"]=="tool"&&m["content"].as_str()==Some(raw_failure.as_str()))?;
     let fresh = snapshots(p);
     let tool = p["tools"]
         .as_array()?
@@ -292,6 +294,12 @@ pub fn preflight(p: &Value) -> Option<Value> {
                 continue;
             }
             let rest = line[index + k.len()..].trim_start_matches(['\'', '"']);
+            // Import/load errors can name the importing file without a line
+            // number. Refresh only a previously observed path, once after
+            // this actual failed check; never infer a missing module's path.
+            if rest.trim().is_empty() && read_index < failure_index && !fresh.contains_key(&k) {
+                return Some(json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_read_diagnostic_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":"read_file","arguments":json!({"filePath":path,"startLine":1,"endLine":400u64.min(maximum)}).to_string()}}]}));
+            }
             let Some(rest) = rest
                 .strip_prefix(':')
                 .or_else(|| rest.strip_prefix('('))
@@ -1113,6 +1121,19 @@ mod tests {
                 .iter()
                 .any(|t| t["function"]["name"] == NAME));
         }
+    }
+    #[test]
+    fn import_failure_refreshes_its_known_importer_without_a_line_number() {
+        let mut p=payload("old source\n");
+        p["tools"][0]["function"]["parameters"]=json!({"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer","maximum":400}},"required":["filePath","startLine","endLine"]});
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"write1","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/app/main.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"write1","content":"Applied edit"}),
+            json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test main.js"}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"test1","content":"Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'D:/app/missing.js' imported from D:/app/main.js\nCommand exited with code 1"})]);
+        let read=preflight(&p).unwrap();assert_eq!(args(&read)["filePath"],"D:/app/main.js");
+        let mut unknown=p.clone();unknown["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("Cannot find module imported from D:/private/unknown.js\nCommand exited with code 1");assert!(preflight(&unknown).is_none());
+        let id=read["tool_calls"][0]["id"].clone();p["messages"].as_array_mut().unwrap().extend([read,json!({"role":"tool","tool_call_id":id,"content":"current source\n"})]);
+        assert!(preflight(&p).is_none());assert!(compiler_target(&p,&snapshots(&p)).is_none());
     }
     #[test]
     fn compiler_preflight_reads_only_known_targets_and_does_not_loop() {
