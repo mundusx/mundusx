@@ -2929,9 +2929,11 @@ fn run_native_openai_tool_turn(
 const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__";
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
-    let compiled=native_http_bridge::compile(payload,message)?;
-    let compiled=native_line_edit::compile(payload,&compiled)?;
-    native_workflow_message_checked(payload,&compiled).map(|(out,changed)|(out,changed || compiled!=*message)).map_err(|error| {
+    (|| {
+        let compiled=native_http_bridge::compile(payload,message)?;
+        let compiled=native_line_edit::compile(payload,&compiled)?;
+        native_workflow_message_checked(payload,&compiled).map(|(out,changed)|(out,changed || compiled!=*message))
+    })().map_err(|error| {
         // Private diagnostic context for the bounded recovery attempt. It must
         // never be emitted as a host tool call or included in a public error.
         let calls=message["tool_calls"].as_array();
@@ -3276,7 +3278,7 @@ fn run_native_tool_attempts(
                 messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. Use the host shell and its actual execution results; do not invent a successful outcome. Wait for the host execution result.")}));
             } else {
             messages.push(serde_json::json!({"role":"system", "content":format!(
-                "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
+                "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For a range-placement failure involving context outside the selected line range, use the existing observed source: expand the selected range to include that context or omit the duplicated context from newText; do not reread unchanged source. For other edit precondition failures, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
             }
             attempt(&payload, &mut output, true).map_err(|retry_error| {
                 format!("native tool recovery failed after one retry: {}",retry_error.split(REJECTED_NATIVE_CALL_MARKER).next().unwrap_or(&retry_error))
@@ -7629,6 +7631,15 @@ fn rejected_native_arguments_reach_recovery_but_never_public_error() {
  let mut attempts=0;
  let failure=run_native_tool_attempts(p,|body,_,retry| {attempts+=1;if retry {let messages=body["messages"].as_array().unwrap();assert!(messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("PRIVATE_REJECTED_COMMAND") && s.contains("NOT executed"))));}Err(error.clone())}).unwrap_err();
  assert_eq!(attempts,2);assert!(!failure.contains("PRIVATE_REJECTED_COMMAND"));assert!(!failure.contains(REJECTED_NATIVE_CALL_MARKER));
+}
+
+#[test]
+fn rejected_line_compile_arguments_are_retained_for_private_recovery() {
+ let p=serde_json::json!({"tools":[],"messages":[]});
+ let bad=serde_json::json!({"role":"assistant","tool_calls":[{"id":"edit1","type":"function","function":{"name":"__mundusx_edit_observed_lines","arguments":"{\"filePath\":\"/unobserved.js\",\"startLine\":1,\"endLine\":1,\"newText\":\"PRIVATE_RANGE_REPLACEMENT\"}"}}]});
+ let error=native_workflow_message(&p,&bad).unwrap_err();
+ assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
+ assert!(error.contains("PRIVATE_RANGE_REPLACEMENT"));
 }
 
 #[test]

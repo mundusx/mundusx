@@ -782,6 +782,20 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
     if end < start || end > lines.len() || replacement.len() > 16384 {
         return Err(fail("range or replacement exceeds observed bounds"));
     }
+    // A narrow replacement containing an unchanged adjacent block would
+    // duplicate that block in the host file. Reject instead of guessing a
+    // broader mutation. Short repeated syntax remains valid.
+    let normalized_replacement = replacement.replace("\r\n", "\n");
+    for (lo, hi) in [(start.saturating_sub(9), start - 1), (end, (end + 8).min(lines.len()))] {
+        for width in 3..=hi.saturating_sub(lo) {
+            let begin = if hi == start - 1 { hi - width } else { lo };
+            let context = lines[begin..begin + width].concat().replace("\r\n", "\n");
+            if context.trim().len() >= 96 && context.lines().filter(|line| !line.trim().is_empty()).count() >= 3
+                && normalized_replacement.contains(&context) {
+                return Err(fail(&format!("newText repeats unchanged context outside selected line range {start}..{end} at lines {}..{}; expand the selected range or omit duplicated context", begin + 1, begin + width)));
+            }
+        }
+    }
     let eol = if source.text.contains("\r\n") {
         "\r\n"
     } else {
@@ -844,6 +858,17 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn adjacent_context_cannot_be_duplicated_by_a_narrow_range() {
+        let source = "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { createServer } from 'node:http';\nimport { readFile } from 'node:fs/promises';\nconst value = 1;\n";
+        let p = payload(source);
+        assert!(compile(&p, &edit(1, 1, source)).unwrap_err().contains("outside selected line range"));
+        let updated = source.replace("const value = 1", "const value = 2");
+        assert!(compile(&p, &edit(1, 5, &updated)).is_ok());
+        assert!(compile(&p, &edit(1, 1, "")).is_ok());
+        assert!(compile(&p, &edit(5, 5, "const value = 2;")).is_ok());
+        assert!(compile(&p, &edit(5, 5, source)).unwrap_err().contains("outside selected line range"));
     }
     #[test]
     fn explicit_first_edit_expands_partial_reads_then_uses_only_the_grounded_planner() {
