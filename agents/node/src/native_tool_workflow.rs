@@ -243,11 +243,12 @@ pub fn requested_validator_after_edit(payload:&Value)->Option<Value> {
     if !["command","goal","explanation","mode"].iter().all(|name|required.iter().any(|k|k.as_str()==Some(name))) {return None;}
     let task=super::native_task_progress::task(payload)?;
     let lower=task.to_ascii_lowercase();
-    if ["only after","wait for","after approval","if i approve","unless"].iter().any(|s|lower.contains(s)) {return None;}
+    if ["wait for","after approval","if i approve","unless"].iter().any(|s|lower.contains(s)) {return None;}
     let mut command=None;
     for sentence in task.split(['\n']).flat_map(|line|line.split(". ")) {
         let sentence=sentence.trim();let lower=sentence.to_ascii_lowercase();
         let Some(prefix)=["run `","then run `","finally run `","please run `"].iter().find(|p|lower.starts_with(**p)) else {continue;};
+        if lower.contains("only after") {return None;}
         let candidate=sentence[prefix.len()..].split_once('`')?.0;
         if candidate.len()>512||candidate.contains([';','|','&','\n','\r','$','`','<','>'])||!validation_command(candidate) {return None;}
         let words=candidate.split_whitespace().collect::<Vec<_>>();
@@ -496,7 +497,7 @@ mod tests {
     fn literal_requested_validators_handoff_after_real_edits_once() {
         for command in ["node --test test.js","cargo test","pytest tests/","mvn test","dotnet test","go test ./...","cmake --build build"] {
             let mut p=payload();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","explanation","mode"],"properties":{"goal":{"type":"string"},"explanation":{"type":"string"}}}}}));
-            p["messages"][0]["content"]=json!(format!("<userRequest>Implement the feature. Run `{command}` and fix actual failures.</userRequest>"));
+            p["messages"][0]["content"]=json!(format!("<userRequest>Implement the feature. Run `{command}` and fix actual failures. Finish only after real automated tests pass.</userRequest>"));
             assert!(requested_validator_after_edit(&p).is_none());
             observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"write_"),"Applied edit");
             let check=requested_validator_after_edit(&p).unwrap();let a=args(&check);assert_eq!(a["command"],command);assert_eq!(a["mode"],"sync");assert!(a["goal"].is_string()&&a["explanation"].is_string());
