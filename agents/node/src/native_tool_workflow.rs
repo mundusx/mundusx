@@ -109,6 +109,29 @@ fn terminal_exit(text:&str)->Option<bool> {
     }))
 }
 
+pub(super) fn observed_exit(text:&str)->Option<bool> {terminal_exit(text)}
+pub(super) fn is_validation(command:&str)->bool {validation_command(command)}
+
+fn requested_tests(payload:&Value)->bool {
+    payload["messages"].as_array().and_then(|m|m.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(s,_)|s.to_ascii_lowercase()))))
+        .is_some_and(|s|["assertions","automated http tests","automated tests","functional tests"].iter().any(|v|s.contains(v)))
+}
+fn nonempty_test_report(command:&str,result:&str)->bool {
+    let command=command.to_ascii_lowercase();let result=result.to_ascii_lowercase();
+    if !command.contains("test") {return false;}
+    if result.contains("no test files")||result.contains("no tests ran")||result.contains("0 tests collected") {return false;}
+    result.lines().any(|line| {
+        let line=line.trim();
+        // TAP (Node), Rust, pytest, Maven, .NET and Go runner reports.
+        line.strip_prefix("# tests ").and_then(|s|s.trim().parse::<u64>().ok()).is_some_and(|n|n>0)
+        || line.strip_prefix("test result: ok. ").and_then(|s|s.split_whitespace().next()?.parse::<u64>().ok()).is_some_and(|n|n>0)
+        || line.split_whitespace().collect::<Vec<_>>().windows(2).any(|w|w[0].parse::<u64>().is_ok_and(|n|n>0)&&w[1].trim_matches([',','.'])=="passed")
+        || line.split_once("tests run: ").and_then(|(_,s)|s.split(',').next()?.trim().parse::<u64>().ok()).is_some_and(|n|n>0)
+        || (line.contains("passed!")&&line.split_once("total:").and_then(|(_,s)|s.split_whitespace().next()?.parse::<u64>().ok()).is_some_and(|n|n>0))
+        || line.starts_with("ok\t")||line.starts_with("ok  ")
+    })
+}
+
 pub fn compiler_failure(payload:&Value)->Option<String> {
     let h=history(payload)?;
     for result in h.iter().rev().filter(|m|m["role"]=="tool") {
@@ -156,6 +179,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
     let Some(h)=history(payload) else {return Ok(None);};
     // A broad coding catalog/policy is not evidence of a source change. An
     // API request or server-start command must not trigger unrelated builds.
+    let require_tests=requested_tests(payload);
     let mut needs=false;
     let mut verified=false;let mut attempts=0;let mut previous_failure=None;
     for m in h {
@@ -167,7 +191,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
                 if a["command"].as_str().is_some_and(validation_command) {
                     // The host's exit header wins over any code-looking text
                     // printed later by the program under test.
-                    verified=terminal_exit(result).unwrap_or(false);
+                    verified=terminal_exit(result).unwrap_or(false)&&(!require_tests||nonempty_test_report(a["command"].as_str().unwrap_or(""),result));
                     if verified {attempts=0;previous_failure=None;} else {
                         let diagnostic=result.replace("\r\n","\n");
                         attempts=if previous_failure.as_ref()==Some(&diagnostic) {attempts+1} else {1};previous_failure=Some(diagnostic);
@@ -181,7 +205,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
         return Ok(Some(incomplete("file edits and editor diagnostics were checked, but compiler/build and runtime validation were not run because command execution is unavailable for this turn.")));
     }
     if attempts>=3 {return Ok(Some(incomplete("the same compiler/build failure persisted across three checks without diagnostic progress. Inspect the host's actual error before continuing.")));}
-    Err("native compilation verification required: editor diagnostics alone do not verify source. Choose the project's actual compiler/typecheck/build or test command using run_in_terminal; inspect its real errors and fix the source before claiming completion. Do not run unrelated commands or claim a command was executed without a host result".into())
+    Err(if require_tests {"native compilation verification required: the current request requires actual automated tests. A syntax check, printed sample results, zero tests, or an unknown runner summary does not verify it. Implement real assertions, run the project's test runner, and inspect its exit status and nonempty test summary before claiming completion. Reuse completed output; repair failures instead of rerunning unchanged commands"} else {"native compilation verification required: editor diagnostics alone do not verify source. Choose the project's actual compiler/typecheck/build or test command using run_in_terminal; inspect its real errors and fix the source before claiming completion. Do not run unrelated commands or claim a command was executed without a host result"}.into())
 }
 
 fn validation_command(command:&str)->bool {
@@ -492,6 +516,19 @@ mod tests {
         for _ in 0..2 {observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"same_"),"/src/main.js:5\nSyntaxError\nCommand exited with code 1");}
         assert!(compilation(&p,&json!({"content":"Done"})).unwrap().unwrap()["content"].as_str().unwrap().contains("without diagnostic progress"));
         observe(&mut p,call("run_in_terminal",json!({"command":"node --check /src/main.js"}),"pass_"),"Command exited with code 0");assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
+    }
+    #[test]
+    fn requested_tests_require_a_nonempty_runner_report_after_source_changes() {
+        let mut p=payload();p["messages"][0]["content"]=json!("<userRequest>Add automated tests with assertions</userRequest>");p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+        observe(&mut p,call("create_file",json!({"filePath":"/src/test.js"}),"write_"),"Created file");
+        let answer=json!({"content":"Done"});
+        for output in ["# tests 0\nCommand exited with code 0","Printed sample results\nCommand exited with code 0"] {
+            let mut q=p.clone();observe(&mut q,call("run_in_terminal",json!({"command":"node --test test.js"}),"test_"),output);assert!(compilation(&q,&answer).is_err());
+        }
+        for (command,output) in [("node --test test.js","# tests 3\n# pass 3"),("cargo test","test result: ok. 2 passed; 0 failed"),("pytest","=== 2 passed in 0.1s ==="),("mvn test","[INFO] Tests run: 2, Failures: 0, Errors: 0"),("dotnet test","Passed! Total: 2"),("go test ./...","ok\texample/pkg\t0.2s")] {
+            let mut q=p.clone();observe(&mut q,call("run_in_terminal",json!({"command":command}),"test_"),&format!("{output}\nCommand exited with code 0"));assert!(compilation(&q,&answer).unwrap().is_none(),"{command}");
+        }
+        let mut q=p.clone();observe(&mut q,call("run_in_terminal",json!({"command":"node --check test.js"}),"check_"),"Command exited with code 0");assert!(compilation(&q,&answer).is_err());
     }
     #[test]
     fn process_cleanup_keeps_unrelated_host_tools_running() {

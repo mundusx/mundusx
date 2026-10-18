@@ -8,6 +8,8 @@ mod native_tool_workflow;
 mod native_http_bridge;
 #[path = "native_line_edit.rs"]
 mod native_line_edit;
+#[path = "native_task_progress.rs"]
+mod native_task_progress;
 use crate::contracts::{
     Backend, ModelCapability, WorkerHealthReport, WorkerLaunchRequest, WorkerLaunchResponse,
     WorkerPolicyReport,
@@ -2951,6 +2953,7 @@ fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_jso
     }
     let canonical=native_tool_workflow::canonical_paths(payload,&metadata);
     validate_native_tool_schema(payload,&canonical)?;
+    native_task_progress::guard(payload,&canonical)?;
     let replacement = match validate_native_edit_preconditions(payload,&canonical) {
         Ok(()) => match native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)) {
             Some(message)=>Some(message),None=>native_tool_workflow::compilation(payload,&canonical)?,
@@ -3077,6 +3080,26 @@ fn terminal_message(args:serde_json::Value)->serde_json::Value {
 }
 
 #[test]
+fn unchanged_validation_is_corrected_before_another_host_execution() {
+    let mut p=terminal_metadata_fixture();
+    for name in ["read_file","list_dir","replace_string_in_file"] {p["tools"].as_array_mut().unwrap().push(serde_json::json!({"type":"function","function":{"name":name,"parameters":{"type":"object"}}}));}
+    let args=serde_json::json!({"command":"node --test test.js","goal":"Run tests","explanation":"Verify source","mode":"sync"});
+    p["messages"]=serde_json::json!([{"role":"user","content":"<userRequest>Fix source and test</userRequest>"},terminal_message(args.clone()),{"role":"tool","tool_call_id":"terminal1","content":"Assertion failed\nCommand exited with code 1"}]);
+    let mut attempts=0;
+    run_native_tool_attempts(p,|body,_,retry| {
+        attempts+=1;
+        let proposed=if retry {
+            assert!(body["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_observed_task_progress"));
+            serde_json::json!({"role":"assistant","tool_calls":[{"id":"read_next","type":"function","function":{"name":"read_file","arguments":"{\"filePath\":\"/src/test.js\",\"startLine\":1,\"endLine\":100}"}}]})
+        } else {terminal_message(args.clone())};
+        let (accepted,_)=native_workflow_message(body,&proposed)?;
+        assert_eq!(accepted["tool_calls"][0]["function"]["name"],"read_file");
+        normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":accepted,"finish_reason":"tool_calls"}]}))
+    }).unwrap();
+    assert_eq!(attempts,2);
+}
+
+#[test]
 fn observed_validator_streams_a_registered_recheck_without_model_inference() {
     let mut p=terminal_metadata_fixture();
     for name in ["read_file","list_dir","replace_string_in_file"] {
@@ -3155,6 +3178,9 @@ fn run_native_tool_attempts(
     mut payload: serde_json::Value,
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
+    if let Some(progress)=native_task_progress::guidance(&payload) {
+        if let Some(messages)=payload["messages"].as_array_mut() {messages.push(progress);}
+    }
     if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
         if let Some(messages)=payload["messages"].as_array_mut() {
             messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe for native curl flags or Invoke-RestMethod for JSON APIs. Use PowerShell-compatible JSON quoting such as ConvertTo-Json and a body file. Include all registered terminal arguments. After the host returns an execution error, use the actual error to correct the command. After a successful mutation, inspect the result and do not replay it merely for verification. Preserve the requested operation and task data."}));
@@ -3182,6 +3208,7 @@ fn run_native_tool_attempts(
                 || error.starts_with("native edit tool arguments exceed safe patch size:")
                 || error.starts_with("native edit precondition failed:")
                 || error.starts_with("native task precondition failed:")
+                || error.starts_with("native progress precondition failed:")
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
