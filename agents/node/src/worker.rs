@@ -175,7 +175,7 @@ fn validate_native_edit_preconditions(payload:&serde_json::Value,message:&serde_
     validate_native_tool_schema(payload,message)?;
     let Some(calls)=message["tool_calls"].as_array() else {return Ok(())};
     let messages=payload["messages"].as_array().ok_or("native edit precondition failed: missing history")?;
-    let start=messages.iter().rposition(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|s|s.contains("<userRequest>"))).map_or(0,|i|i+1);
+    let start=native_task_progress::request_index(messages).map_or(0,|i|i+1);
     // Mentioning a path in a negative instruction must not grant edit scope.
     let scoped_files:Vec<String>=start.checked_sub(1).and_then(|i|messages[i]["content"].as_str())
         .and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|(s,_)|s.trim()))
@@ -3120,6 +3120,7 @@ fn unchanged_validation_is_corrected_before_another_host_execution() {
         attempts+=1;
         let proposed=if retry {
             assert!(body["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_observed_task_progress"));
+            assert_eq!(body["messages"].as_array().unwrap().last().unwrap()["name"],"mundusx_progress_recovery");
             serde_json::json!({"role":"assistant","tool_calls":[{"id":"read_next","type":"function","function":{"name":"read_file","arguments":"{\"filePath\":\"/src/test.js\",\"startLine\":1,\"endLine\":100}"}}]})
         } else {terminal_message(args.clone())};
         let (accepted,_)=native_workflow_message(body,&proposed)?;
@@ -3269,6 +3270,8 @@ fn run_native_tool_attempts(
             }
             if source_recovery {
                 messages.push(serde_json::json!({"role":"system","name":"mundusx_source_artifact_recovery","content":format!("The previous source artifact was rejected before any edit executed: {error}. Return a SHORTER complete replacement source file implementing the latest user requirements. This is an internal source-generation step with no tools: return source text only, never tool-call JSON or markup. Do not repeat the old implementation or omit cleanup and assertions to shorten it; use concise helper functions. Do not claim completion. The adapter will validate and compile the complete source into the registered host edit.")}));
+            } else if error.starts_with("native progress precondition failed:") {
+                messages.push(serde_json::json!({"role":"system","name":"mundusx_progress_recovery","content":format!("The proposed action was rejected BEFORE execution because its actual result is already available: {error}. Continue from that matched result. Do not repeat the same covered read or unchanged completed check. Choose the next needed edit, a genuinely missing source range or different target, or the next verification after a real change. This is not an edit-grounding failure and does not require rereading the same file. Use the current observed-source guidance and preserve the original task requirements. Return one necessary registered tool call or a truthful final answer if the task is already verified.")}));
             } else if terminal_recovery {
                 messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. Use the host shell and its actual execution results; do not invent a successful outcome. Wait for the host execution result.")}));
             } else {

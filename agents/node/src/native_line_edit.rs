@@ -46,7 +46,7 @@ struct Snapshot {
 // Honor an explicit ordered edit of a named, already observed file. This is
 // user intent, not a model-invented plan or permission inferred from focus.
 fn user_task(p:&Value)->Option<&str> {
-    p["messages"].as_array()?.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|(task,_)|task))
+    super::native_task_progress::task(p)
 }
 fn whole_replacement(p:&Value)->bool {
     let text=user_task(p).unwrap_or("").to_ascii_lowercase();
@@ -90,7 +90,7 @@ fn compact_replaced_source(p:&mut Value,target:&str) {
 }
 fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     let messages=p["messages"].as_array()?;
-    let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))?;
+    let start=super::native_task_progress::request_index(messages)?;
     let text=messages[start]["content"].as_str()?.split_once("<userRequest>")?.1.split_once("</userRequest>")?.0;
     let lower=text.to_ascii_lowercase();let first=lower.find("first ")?+6;
     let clause=lower[..first-6].rsplit(['.','!','?','\n']).next()?.trim();
@@ -123,7 +123,7 @@ fn ordered_read(p:&Value)->Option<Value> {
 // obtaining fresh bytes for this request. Never reuse the old source itself.
 fn first_target_read(p:&Value)->Option<Value> {
     let messages=p["messages"].as_array()?;
-    let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))?;
+    let start=super::native_task_progress::request_index(messages)?;
     let mut paths=BTreeMap::new();
     for (i,result) in messages.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
         let Some(id)=result["tool_call_id"].as_str().filter(|s|!s.is_empty()) else {continue;};
@@ -219,14 +219,7 @@ pub fn preflight(p: &Value) -> Option<Value> {
         failure = failure.replace("//", "/");
     }
     let messages = p["messages"].as_array()?;
-    let start = messages
-        .iter()
-        .rposition(|m| {
-            m["role"] == "user"
-                && m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("<userRequest>"))
-        })
+    let start = super::native_task_progress::request_index(messages)
         .map_or(0, |i| i + 1);
     let mut known = BTreeMap::new();
     let mut mutations = BTreeMap::new();
@@ -408,14 +401,7 @@ fn snapshots(p: &Value) -> BTreeMap<String, Snapshot> {
     let Some(messages) = p["messages"].as_array() else {
         return found;
     };
-    let start = messages
-        .iter()
-        .rposition(|m| {
-            m["role"] == "user"
-                && m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("<userRequest>"))
-        })
+    let start = super::native_task_progress::request_index(messages)
         .map_or(0, |i| i + 1);
     for (i, result) in messages.iter().enumerate().skip(start) {
         if result["role"] != "tool" {
@@ -541,7 +527,7 @@ pub fn prepare(p: &Value) -> Value {
         out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(false);
         out["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(false);
         out["max_tokens"]=json!(p["max_tokens"].as_u64().unwrap_or(4096).min(4096));
-        out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal source-generation step for the user's explicitly requested complete replacement of {} ({} observed lines). All original host permissions and task constraints remain in force. Return ONLY the complete NEW source file, preferably under 100 lines and 5000 characters. Do not output tool-call markup, a plan, copied old headers, oldString, or a diff. The adapter retains the exact observed old file and will compile your source into the registered host replacement tool; this is not a final user answer and does not execute code. Implement real requested behavior and cleanup. Original user requirements:\n{}",source.path,source.text.lines().count(),user_task(p).unwrap_or(""))}));
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_source_artifact_step","content":format!("Internal source-generation step for the user's explicitly requested complete replacement of {} ({} observed lines). All original host permissions and task constraints remain in force. Return ONLY the complete NEW source file, preferably under 100 lines and 5000 characters. Do not output tool-call markup, a plan, copied old headers, oldString, or a diff. The adapter retains the exact observed old file and will compile your source into the registered host replacement tool; this is not a final user answer and does not execute code. Implement real requested behavior and cleanup. Original user requirements:\n{}",source.path,source.text.lines().count(),user_task(p).unwrap_or(""))}));
         return out;
     }
     let ordered=ordered_target(p,&sources).filter(|target| {
@@ -840,6 +826,7 @@ mod tests {
         let mut whole=p.clone();whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with the new implementation.</userRequest>");
         assert!(compile(&whole,&edit(1,1,"partial replacement")).unwrap_err().contains("complete observed file"));assert!(compile(&whole,&edit(1,2,"complete replacement")).is_ok());
         let prepared_whole=prepare(&whole);assert!(prepared_whole["tools"].as_array().unwrap().is_empty());assert_eq!(prepared_whole["tool_choice"],"none");
+        let step=prepared_whole["messages"].as_array().unwrap().last().unwrap();assert_eq!(step["role"],"system");assert_eq!(step["name"],"mundusx_source_artifact_step");
         assert!(!prepared_whole["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("old source"))));assert_eq!(whole["messages"][2]["content"],"old source\nsecond line\n");assert_eq!(prepared_whole["messages"][0],whole["messages"][0]);
         let artifact=compile(&whole,&json!({"role":"assistant","content":"```javascript\nnew implementation\n```"})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");assert_eq!(args(&artifact)["oldString"],"old source\nsecond line\n");
         let artifact=compile(&whole,&json!({"role":"assistant","content":"Here is the replacement:\n```javascript\nnew implementation\n\u{a0}```\nExplanation outside the artifact."})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");

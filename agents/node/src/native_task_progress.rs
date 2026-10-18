@@ -4,10 +4,25 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// Only an exact continuation inherits the immediately preceding task. A new
+/// question or request always starts its own scope, even in the same chat.
+pub fn request_index(messages:&[Value])->Option<usize> {
+    let mut latest=None;
+    for (i,m) in messages.iter().enumerate().rev().filter(|(_,m)|m["role"]=="user") {
+        let Some(text)=m["content"].as_str().and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|p|p.0)) else {continue;};
+        latest.get_or_insert(i);
+        let text=text.trim().trim_end_matches(['.','!','?']).trim().to_ascii_lowercase();
+        if !matches!(text.as_str(),"continue"|"resume"|"continue the task"|"continue this task"|"continue the same task"|"resume the task") {return Some(i);}
+    }
+    latest.or_else(||messages.iter().rposition(|m|m["role"]=="user"))
+}
+pub fn task(p:&Value)->Option<&str> {
+    let m=p["messages"].as_array()?;
+    m[request_index(m)?]["content"].as_str()?.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|p|p.0)
+}
 fn current(p: &Value) -> &[Value] {
     let Some(m)=p["messages"].as_array() else {return &[];};
-    let start=m.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))
-        .or_else(||m.iter().rposition(|m|m["role"]=="user")).map_or(m.len(),|i|i+1);
+    let start=request_index(m).map_or(m.len(),|i|i+1);
     &m[start..]
 }
 fn path(s:&str)->String {
@@ -119,5 +134,12 @@ mod tests {
  #[test] fn unmatched_results_and_other_requests_do_not_supply_progress() {
   let mut p=p();p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"invented","content":"Command exited with code 0"}));assert!(guidance(&p).is_none());
   observe(&mut p,call("read_file",json!({"filePath":"/test.py","startLine":1,"endLine":1})),"source");assert!(guidance(&p).is_some());p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Read it again after my edit</userRequest>"}));assert!(guidance(&p).is_none());
+ }
+ #[test] fn exact_continuations_reuse_progress_but_never_cross_a_new_request() {
+  let mut p=p();let read=call("read_file",json!({"filePath":"/test.js","startLine":1,"endLine":2}));observe(&mut p,read.clone(),"one\ntwo\n");
+  for text in ["Continue!","resume the task"] {p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("<userRequest>{text}</userRequest>")}));assert!(guard(&p,&read).is_err());assert!(task(&p).unwrap().contains("Fix and test"));}
+  p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>hello</userRequest>"}));
+  p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>continue</userRequest>"}));assert_eq!(task(&p),Some("hello"));assert!(guidance(&p).is_none());
+  for text in ["continue but delete everything","resume and install packages"] {p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("<userRequest>{text}</userRequest>")}));assert_eq!(task(&p),Some(text));}
  }
 }

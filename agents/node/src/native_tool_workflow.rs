@@ -20,7 +20,7 @@ fn catalog(payload: &Value) -> Option<&Vec<Value>> {
 pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
 pub fn task_constraints(payload:&Value,message:&Value)->Result<(),String> {
-    let text=payload["messages"].as_array().and_then(|m|m.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(s,_)|s)))).unwrap_or("").to_ascii_lowercase();
+    let text=super::native_task_progress::task(payload).unwrap_or("").to_ascii_lowercase();
     let no_install=["do not install","don't install","without installing","without reinstalling","do not reinstall","don't reinstall","reuse installed"].iter().any(|s|text.contains(s));
     for call in message["tool_calls"].as_array().into_iter().flatten() {
         if call["function"]["name"]!="run_in_terminal" {continue;}
@@ -124,7 +124,7 @@ pub(super) fn source_diagnostic(text:&str)->bool {
 }
 
 fn requested_tests(payload:&Value)->bool {
-    payload["messages"].as_array().and_then(|m|m.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(s,_)|s.to_ascii_lowercase()))))
+    super::native_task_progress::task(payload).map(str::to_ascii_lowercase)
         .is_some_and(|s|["assertions","automated http tests","automated tests","functional tests"].iter().any(|v|s.contains(v)))
 }
 fn nonempty_test_report(command:&str,result:&str)->bool {
@@ -258,8 +258,7 @@ fn history(payload: &Value) -> Option<&[Value]> {
     let messages = payload["messages"].as_array()?;
     // VS Code can insert user-role reminders between host tool results. They
     // must not erase evidence of edits made for the current tagged request.
-    let start = messages.iter().rposition(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))
-        .or_else(||messages.iter().rposition(|m|m["role"]=="user"))? + 1;
+    let start=super::native_task_progress::request_index(messages)?+1;
     Some(&messages[start..])
 }
 
