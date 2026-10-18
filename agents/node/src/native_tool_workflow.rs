@@ -313,9 +313,11 @@ fn incomplete(reason: &str) -> Value {
 /// schema and traversal failures are never converted into another operation.
 pub fn recover_read(payload: &Value, message: &Value, error: &str) -> Option<Value> {
     catalog(payload)?;
-    if !["native edit precondition failed: read the exact target", "native edit precondition failed: oldString is ambiguous", "native edit precondition failed: target was already read"].iter().any(|p| error.starts_with(p)) { return None; }
+    let missing_prefix=error=="native tool schema precondition failed: __mundusx_edit_observed_lines: read this file from line 1 before editing";
+    if !missing_prefix && !["native edit precondition failed: read the exact target", "native edit precondition failed: oldString is ambiguous", "native edit precondition failed: target was already read"].iter().any(|p| error.starts_with(p)) { return None; }
     let calls = message["tool_calls"].as_array()?;
     if calls.len() != 1 { return None; }
+    if missing_prefix && calls[0]["function"]["name"]!="__mundusx_edit_observed_lines" {return None;}
     let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str()?).ok()?;
     let path = args["filePath"].as_str()?;
     let target = key(path)?;
@@ -336,6 +338,7 @@ pub fn recover_read(payload: &Value, message: &Value, error: &str) -> Option<Val
     if reads >= 2 { return Some(incomplete(&format!("the proposed edit still failed validation after two recovery reads: {error}."))); }
     // First recovery expands a partial read; the second moves forward rather
     // than repeatedly reading the same initial ten lines.
+    if missing_prefix {end=0;}
     let mut read=call("read_file", json!({"filePath":path,"startLine":end+1,"endLine":end+400}), "call_grounding_");
     read["content"]=json!(format!("The proposed edit was NOT executed: {error}. Read the exact target returned by this call, then use replace_string_in_file with oldString copied exactly from observed source. Do not use create_file to replace an existing path. No mutation has been applied by this recovery step."));
     Some(read)

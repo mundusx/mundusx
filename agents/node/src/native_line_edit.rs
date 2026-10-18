@@ -860,6 +860,19 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn stale_private_edit_returns_a_fresh_registered_read_before_any_mutation() {
+        let p=payload("const existing = 1;\n");
+        let mut proposed=edit(1,1,"PRIVATE_UNEXECUTED_SOURCE");
+        proposed["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/other.js","startLine":1,"endLine":1,"newText":"PRIVATE_UNEXECUTED_SOURCE"}).to_string());
+        let (out,changed)=super::super::native_workflow_message(&p,&proposed).unwrap();
+        assert!(changed);assert_eq!(out["tool_calls"][0]["function"]["name"],"read_file");
+        assert_eq!(key(args(&out)["filePath"].as_str().unwrap()),key("D:/app/other.js"));
+        assert_eq!(args(&out)["startLine"],1);assert_eq!(args(&out)["endLine"],400);
+        assert!(!out.to_string().contains("PRIVATE_UNEXECUTED_SOURCE"));
+        let error="native tool schema precondition failed: __mundusx_edit_observed_lines: unexpected argument";
+        assert!(super::super::native_tool_workflow::recover_read(&p,&proposed,error).is_none());
+    }
+    #[test]
     fn adjacent_context_cannot_be_duplicated_by_a_narrow_range() {
         let source = "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { createServer } from 'node:http';\nimport { readFile } from 'node:fs/promises';\nconst value = 1;\n";
         let p = payload(source);

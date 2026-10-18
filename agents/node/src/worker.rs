@@ -2931,7 +2931,10 @@ const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     (|| {
         let compiled=native_http_bridge::compile(payload,message)?;
-        let compiled=native_line_edit::compile(payload,&compiled)?;
+        let compiled=match native_line_edit::compile(payload,&compiled) {
+            Ok(message)=>message,
+            Err(error)=>native_tool_workflow::recover_read(payload,&compiled,&error).ok_or(error)?,
+        };
         native_workflow_message_checked(payload,&compiled).map(|(out,changed)|(out,changed || compiled!=*message))
     })().map_err(|error| {
         // Private diagnostic context for the bounded recovery attempt. It must
