@@ -113,9 +113,14 @@ pub(super) fn observed_exit(text:&str)->Option<bool> {terminal_exit(text)}
 pub(super) fn is_validation(command:&str)->bool {validation_command(command)}
 pub(super) fn source_diagnostic(text:&str)->bool {
     let text=text.to_ascii_lowercase();
-    !(["assertionerror","assertion failed","assertionfailed","assert.equal","assert.isequal","assert.true","assert.false","panicked at","expected values to be strictly equal","comparisonfailure","error: not equal:"].iter().any(|s|text.contains(s))
+    if ["typeerror","referenceerror","rangeerror","valueerror","keyerror","attributeerror","runtimeerror","nullpointerexception","indexoutofboundsexception","test did not finish before its parent"].iter().any(|s|text.contains(s)) {return false;}
+    if ["assertionerror","assertion failed","assertionfailed","assert.equal","assert.isequal","assert.true","assert.false","panicked at","expected values to be strictly equal","comparisonfailure","error: not equal:"].iter().any(|s|text.contains(s))
         || (text.contains("expected:")&&text.contains("received:"))
-        || text.lines().any(|line|line.trim_start().strip_prefix('e').is_some_and(|s|s.trim_start().starts_with("assert "))))
+        || text.lines().any(|line|line.trim_start().strip_prefix('e').is_some_and(|s|s.trim_start().starts_with("assert "))) {return false;}
+    // A runtime stack frame points to a symptom, not necessarily its cause.
+    // Only positive compiler evidence justifies forcing a single-line repair.
+    ["syntaxerror","indentationerror","taberror","compileerror","error[e","error ts","error cs","fatal error:","compilation error","error: expected","error: unexpected","error: mismatched","error: missing","error: cannot","error: conflicting","error: redefinition","error: redeclaration","error: unknown type","error: invalid","error: no matching","error: undeclared","error: unresolved"].iter().any(|s|text.contains(s))
+        || text.lines().any(|line|line.trim_start().starts_with("-->")||line.contains("): error"))
 }
 
 fn requested_tests(payload:&Value)->bool {

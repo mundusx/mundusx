@@ -964,7 +964,7 @@ mod tests {
     }
     #[test]
     fn functional_assertion_locations_do_not_force_test_edits() {
-        for diagnostic in ["AssertionError: 500 !== 400","E       assert 500 == 400","org.opentest4j.AssertionFailedError","Assert.Equal() Failure","thread panicked at assertion","Expected: 400\nReceived: 500"] {
+        for diagnostic in ["AssertionError: 500 !== 400","E       assert 500 == 400","org.opentest4j.AssertionFailedError","Assert.Equal() Failure","thread panicked at assertion","Expected: 400\nReceived: 500","TypeError: Failed to parse URL from undefined/api/courses","ReferenceError: setup is not defined","java.lang.NullPointerException","ValueError: invalid literal","test did not finish before its parent and was cancelled"] {
             let mut p=payload("test source\nassertion\n");
             p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test D:/app/main.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"test1","content":format!("{diagnostic}\nD:/app/main.js:2\nCommand exited with code 1")})]);
             assert!(compiler_target(&p,&snapshots(&p)).is_none(),"{diagnostic}");assert!(preflight(&p).is_none());
