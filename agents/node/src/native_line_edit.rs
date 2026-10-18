@@ -714,17 +714,10 @@ pub fn prepare(p: &Value) -> Value {
         if ordered.is_some() {
             let source=&sources[ordered.as_ref().unwrap()];let count=source.text.lines().count();
             out["tools"].as_array_mut().unwrap().retain(|t|matches!(t["function"]["name"].as_str(),Some(NAME|"read_file"|"list_dir"|"file_search"|"grep_search"|"get_errors")));
-            if whole_replacement(p) {
-                // A complete replacement is generated from the requested
-                // behavior, not by copying the obsolete implementation.
-                // Preserve dependency reads and the untouched grounding
-                // transcript; only omit this target body from the model view.
-                for message in out["messages"].as_array_mut().unwrap() {
-                    if message["role"]=="tool"&&message["tool_call_id"]==source.call_id {
-                        message["content"]=json!(format!("Matched current source observation for {}: {count} lines with confirmed EOF. Its obsolete implementation body is omitted only because the user explicitly requested complete replacement. The adapter retains the exact observed bytes for the registered host replacement. Implement the new requirements, using related exports and dependencies when needed; do not reconstruct the old implementation.",source.path));
-                    }
-                }
-            }
+            // The latest successful read remains visible even for a full
+            // replacement. Hiding it conflicts with the host's read-before-edit
+            // contract and can trigger rejected refresh loops. Superseded reads
+            // and applied edit bodies were already retired above.
             let range=if whole_replacement(p) {format!("The user explicitly requested replacement of the old implementation. Replace the complete observed file using startLine=1 and endLine={count}; newText must be the complete NEW implementation, not copied legacy headers or only a partial cleanup.")} else {"Select the smallest observed range that implements the requested first change.".into()};
             out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal next step derived from the user's explicit FIRST edit of {}. All original instructions, permissions and constraints remain in force. {range} Supply only replacement source as newText, without oldString or line labels. Implement the requested behavior rather than preserving the faulty implementation. Keep code concise. Read related manifests, exports and dependencies when needed before this edit; do not guess project APIs. The requested first source change remains this target. Other implementation changes follow after the host applies this edit. The original user request, repeated here to retain the task requirements, is:\n{}",source.path,user_task(p).unwrap_or(""))}));
             return out;
@@ -1069,7 +1062,8 @@ mod tests {
         assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
         assert!(!prepared["tools"].as_array().unwrap().iter().any(|t|matches!(t["function"]["name"].as_str(),Some("create_file"|"manage_todo_list"|"run_in_terminal"))));
         assert!(prepared["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("module.exports = db;"))));
-        assert!(!prepared.to_string().contains("old test"));
+        assert!(prepared.to_string().contains("old test"));
+        assert_eq!(prepared["messages"].as_array().unwrap().iter().filter(|m|m["role"]=="tool"&&m["content"].as_str().is_some_and(|s|s.contains("old test"))).count(),1);
         assert_eq!(p["messages"][2]["content"],"old test\nsecond line\n");
         let mut partial=p.clone();partial["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Preserve the implementation and correct the error.</userRequest>");
         assert!(prepare(&partial).to_string().contains("old test"));
