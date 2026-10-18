@@ -116,6 +116,7 @@ fn key(path: &str) -> Option<String> {
 }
 fn compiler_target(p: &Value, sources: &BTreeMap<String, Snapshot>) -> Option<(String, usize)> {
     let mut failure = super::native_tool_workflow::compiler_failure(p)?.replace('\\', "/");
+    if !super::native_tool_workflow::source_diagnostic(&failure) {return None;}
     while failure.contains("//") {
         failure = failure.replace("//", "/");
     }
@@ -165,6 +166,7 @@ pub fn preflight(p: &Value) -> Option<Value> {
     }
     if let Some(read)=ordered_read(p) {return Some(read);}
     let mut failure = super::native_tool_workflow::compiler_failure(p)?.replace('\\', "/");
+    if !super::native_tool_workflow::source_diagnostic(&failure) {return None;}
     while failure.contains("//") {
         failure = failure.replace("//", "/");
     }
@@ -879,6 +881,15 @@ mod tests {
             let mut p = payload("x");
             p["tool_choice"] = choice;
             assert_eq!(prepare(&p), p);
+        }
+    }
+    #[test]
+    fn functional_assertion_locations_do_not_force_test_edits() {
+        for diagnostic in ["AssertionError: 500 !== 400","E       assert 500 == 400","org.opentest4j.AssertionFailedError","Assert.Equal() Failure","thread panicked at assertion","Expected: 400\nReceived: 500"] {
+            let mut p=payload("test source\nassertion\n");
+            p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test D:/app/main.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"test1","content":format!("{diagnostic}\nD:/app/main.js:2\nCommand exited with code 1")})]);
+            assert!(compiler_target(&p,&snapshots(&p)).is_none(),"{diagnostic}");assert!(preflight(&p).is_none());
+            assert!(prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
         }
     }
     #[test]

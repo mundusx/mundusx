@@ -111,6 +111,12 @@ fn terminal_exit(text:&str)->Option<bool> {
 
 pub(super) fn observed_exit(text:&str)->Option<bool> {terminal_exit(text)}
 pub(super) fn is_validation(command:&str)->bool {validation_command(command)}
+pub(super) fn source_diagnostic(text:&str)->bool {
+    let text=text.to_ascii_lowercase();
+    !(["assertionerror","assertion failed","assertionfailed","assert.equal","assert.isequal","assert.true","assert.false","panicked at","expected values to be strictly equal","comparisonfailure","error: not equal:"].iter().any(|s|text.contains(s))
+        || (text.contains("expected:")&&text.contains("received:"))
+        || text.lines().any(|line|line.trim_start().strip_prefix('e').is_some_and(|s|s.trim_start().starts_with("assert "))))
+}
 
 fn requested_tests(payload:&Value)->bool {
     payload["messages"].as_array().and_then(|m|m.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(s,_)|s.to_ascii_lowercase()))))
