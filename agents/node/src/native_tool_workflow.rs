@@ -123,11 +123,11 @@ fn nonempty_test_report(command:&str,result:&str)->bool {
     result.lines().any(|line| {
         let line=line.trim();
         // TAP (Node), Rust, pytest, Maven, .NET and Go runner reports.
-        line.strip_prefix("# tests ").and_then(|s|s.trim().parse::<u64>().ok()).is_some_and(|n|n>0)
+        line.trim_start_matches(['#','ℹ',' ']).strip_prefix("tests ").and_then(|s|s.trim().parse::<u64>().ok()).is_some_and(|n|n>0)
         || line.strip_prefix("test result: ok. ").and_then(|s|s.split_whitespace().next()?.parse::<u64>().ok()).is_some_and(|n|n>0)
         || line.split_whitespace().collect::<Vec<_>>().windows(2).any(|w|w[0].parse::<u64>().is_ok_and(|n|n>0)&&w[1].trim_matches([',','.'])=="passed")
         || line.split_once("tests run: ").and_then(|(_,s)|s.split(',').next()?.trim().parse::<u64>().ok()).is_some_and(|n|n>0)
-        || (line.contains("passed!")&&line.split_once("total:").and_then(|(_,s)|s.split_whitespace().next()?.parse::<u64>().ok()).is_some_and(|n|n>0))
+        || (line.contains("passed!")&&line.split_once("total:").and_then(|(_,s)|s.split_whitespace().next()?.trim_end_matches(',').parse::<u64>().ok()).is_some_and(|n|n>0))
         || line.starts_with("ok\t")||line.starts_with("ok  ")
     })
 }
