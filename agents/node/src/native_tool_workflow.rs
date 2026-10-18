@@ -234,6 +234,36 @@ pub fn validator_after_edit(payload:&Value)->Option<Value> {
     Some(call("run_in_terminal",args,"call_recheck_observed_"))
 }
 
+/// Execute only a literal validator the user explicitly asked to run. Source
+/// changes and host results are still checked from the untouched transcript.
+pub fn requested_validator_after_edit(payload:&Value)->Option<Value> {
+    let tools=catalog(payload)?;
+    let terminal=tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")?;
+    let required=terminal["function"]["parameters"]["required"].as_array()?;
+    if !["command","goal","explanation","mode"].iter().all(|name|required.iter().any(|k|k.as_str()==Some(name))) {return None;}
+    let task=super::native_task_progress::task(payload)?;
+    let lower=task.to_ascii_lowercase();
+    if ["only after","wait for","after approval","if i approve","unless"].iter().any(|s|lower.contains(s)) {return None;}
+    let mut command=None;
+    for sentence in task.split(['\n']).flat_map(|line|line.split(". ")) {
+        let sentence=sentence.trim();let lower=sentence.to_ascii_lowercase();
+        let Some(prefix)=["run `","then run `","finally run `","please run `"].iter().find(|p|lower.starts_with(**p)) else {continue;};
+        let candidate=sentence[prefix.len()..].split_once('`')?.0;
+        if candidate.len()>512||candidate.contains([';','|','&','\n','\r','$','`','<','>'])||!validation_command(candidate) {return None;}
+        let words=candidate.split_whitespace().collect::<Vec<_>>();
+        if words.iter().any(|w|matches!(*w,"--watch"|"-w"|"--loop")) {return None;}
+        if command.replace(candidate).is_some() {return None;}
+    }
+    let command=command?;let h=history(payload)?;let mut write=None;let mut execution=None;
+    for (i,result) in h.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
+        let Some(c)=h[..i].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==result["tool_call_id"]) else {continue;};
+        if matches!(c["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file"))&&result["content"].as_str().is_some_and(successful_result) {write=Some(i);}
+        if matches!(c["function"]["name"].as_str(),Some("run_in_terminal"|"send_to_terminal"|"create_and_run_task")) {execution=Some(i);}
+    }
+    if execution.is_some_and(|i|i>=write.unwrap_or(0))||write.is_none() {return None;}
+    Some(terminal_metadata(payload,&call("run_in_terminal",json!({"command":command,"mode":"sync"}),"call_requested_validator_")))
+}
+
 /// Host execution remains permission controlled. A language-service cache is
 /// not a compiler result. Ask the model to select its project's real validator
 /// when that host tool is available; otherwise report the verification gap.
@@ -461,6 +491,22 @@ mod tests {
     fn canonicalizing_a_single_path_does_not_invent_array_arguments() {
         let p=payload();let m=call("read_file",json!({"filePath":"d:/sample/main.js","startLine":1,"endLine":20}),"read_");
         let a=args(&canonical_paths(&p,&m));assert_eq!(a["filePath"],r"D:\sample\main.js");assert!(a.get("filePaths").is_none());
+    }
+    #[test]
+    fn literal_requested_validators_handoff_after_real_edits_once() {
+        for command in ["node --test test.js","cargo test","pytest tests/","mvn test","dotnet test","go test ./...","cmake --build build"] {
+            let mut p=payload();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","explanation","mode"],"properties":{"goal":{"type":"string"},"explanation":{"type":"string"}}}}}));
+            p["messages"][0]["content"]=json!(format!("<userRequest>Implement the feature. Run `{command}` and fix actual failures.</userRequest>"));
+            assert!(requested_validator_after_edit(&p).is_none());
+            observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"write_"),"Applied edit");
+            let check=requested_validator_after_edit(&p).unwrap();let a=args(&check);assert_eq!(a["command"],command);assert_eq!(a["mode"],"sync");assert!(a["goal"].is_string()&&a["explanation"].is_string());
+            observe(&mut p,check,"Command exited with code 1");assert!(requested_validator_after_edit(&p).is_none());
+            observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"repair_"),"Applied edit");assert!(requested_validator_after_edit(&p).is_some());
+            for task in [format!("Explain `{command}`"),format!("Do not run `{command}`"),format!("Run `{command}` only after I approve"),format!("Run `{command}; echo x`"),format!("Run `{command} --watch`"),format!("Run `{command}`. Then run `cargo test`")] {
+                let mut q=p.clone();q["messages"][0]["content"]=json!(format!("<userRequest>{task}</userRequest>"));assert!(requested_validator_after_edit(&q).is_none(),"{task}");
+            }
+            let mut explicit=p.clone();explicit["tool_choice"]=json!("none");assert!(requested_validator_after_edit(&explicit).is_none());
+        }
     }
     fn observe(p:&mut Value,m:Value,text:&str) {
         let id=m["tool_calls"][0]["id"].clone();

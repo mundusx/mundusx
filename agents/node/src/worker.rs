@@ -2869,7 +2869,7 @@ fn run_native_openai_tool_turn(
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
-    if let Some(automatic)=native_tool_workflow::validator_after_edit(&payload).or_else(||native_line_edit::preflight(&payload)) {
+    if let Some(automatic)=native_tool_workflow::validator_after_edit(&payload).or_else(||native_tool_workflow::requested_validator_after_edit(&payload)).or_else(||native_line_edit::preflight(&payload)) {
         if let Ok((message,_))=native_workflow_message(&payload,&automatic) {
             if streaming {
                 let mut calls=message["tool_calls"].clone();
