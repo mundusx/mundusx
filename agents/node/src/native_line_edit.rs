@@ -45,6 +45,14 @@ struct Snapshot {
 
 // Honor an explicit ordered edit of a named, already observed file. This is
 // user intent, not a model-invented plan or permission inferred from focus.
+fn user_task(p:&Value)->Option<&str> {
+    p["messages"].as_array()?.iter().rev().filter(|m|m["role"]=="user").filter_map(|m|m["content"].as_str()).find_map(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|(task,_)|task))
+}
+fn whole_replacement(p:&Value)->bool {
+    let text=user_task(p).unwrap_or("").to_ascii_lowercase();
+    if ["do not replace","don't replace","never replace"].iter().any(|s|text.contains(s)) {return false;}
+    ["replace that test implementation","replace the entire file","replace the whole file","replace this file entirely"].iter().any(|s|text.contains(s))
+}
 fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     let messages=p["messages"].as_array()?;
     let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))?;
@@ -56,7 +64,7 @@ fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     let mut words=rest[..colon].split_whitespace();if !matches!(words.next(),Some("repair"|"replace"|"edit"|"update")) {return None;}
     let mut modifiers=words.collect::<Vec<_>>();if modifiers.first()==Some(&"the") {modifiers.remove(0);}
     if !matches!(modifiers.as_slice(),[]|["test"]|["source"]) {return None;}
-    let named=text[first+colon+5..].split_whitespace().next()?.trim_matches(['`','\'','"',',',';']);
+    let named=text[first+colon+5..].split_whitespace().next()?.trim_end_matches(['.',',',';']).trim_matches(['`','\'','"']);
     let matches=sources.iter().filter(|(_,s)|key(named).is_some_and(|k|key(&s.path)==Some(k))||s.path.replace('\\',"/").rsplit('/').next()==Some(named)).collect::<Vec<_>>();
     if matches.len()!=1 {return None;}
     let (target,_)=matches[0];
@@ -522,7 +530,9 @@ pub fn prepare(p: &Value) -> Value {
             out["chat_template_kwargs"]["opengpu_require_tool_call"] = json!(true);
         }
         if ordered.is_some() {
-            out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"Internal next step derived from the user's explicit FIRST edit of this named file. All original instructions and constraints remain in force. Implement that first requested source change now using the supplied observed-line planner. Select the actual observed range to replace and supply only replacement source as newText, without oldString, copied context, or line labels. For replacement of the requested test implementation, use concise real assertions and the requested temporary-server cleanup. Do not execute the old implementation or inspect unrelated files. After the host applies this edit, other tools become available for the remaining task."}));
+            let source=&sources[ordered.as_ref().unwrap()];let count=source.text.lines().count();
+            let range=if whole_replacement(p) {format!("The user explicitly requested replacement of the old implementation. Replace the complete observed file using startLine=1 and endLine={count}; newText must be the complete NEW implementation, not copied legacy headers or only a partial cleanup.")} else {"Select the smallest observed range that implements the requested first change.".into()};
+            out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal next step derived from the user's explicit FIRST edit of {}. All original instructions, permissions and constraints remain in force. {range} Supply only replacement source as newText, without oldString or line labels. Implement the requested behavior rather than preserving the faulty implementation. Keep code concise and do not inspect unrelated files. After the host applies this edit, other tools become available for the remaining task. The original user request, repeated here to retain the task requirements, is:\n{}",source.path,user_task(p).unwrap_or(""))}));
             return out;
         }
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_grounded_compiler_repair","content":format!("A real compiler diagnostic identifies line {line} in this observed source. Use the supplied line planner to correct the faulty statement with the smallest actual source change. Do not supply oldText or oldString: the adapter obtains old source from the actual read. Choose startLine and endLine from the observed line labels and supply corrected source as newText. Do not copy the unchanged faulty statement, inspect unrelated files, install packages or rewrite the whole file.")}));
@@ -662,6 +672,7 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
         .as_str()
         .ok_or_else(|| fail("newText is required"))?;
     let lines: Vec<_> = source.text.split_inclusive('\n').collect();
+    if ordered_target(p,&sources).is_some()&&whole_replacement(p)&&(start!=1||end!=lines.len()) {return Err(fail("the user requested replacement of the old implementation: select the complete observed file, not a partial header rewrite"));}
     if end < start || end > lines.len() || replacement.len() > 16384 {
         return Err(fail("range or replacement exceeds observed bounds"));
     }
@@ -738,6 +749,10 @@ mod tests {
         p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string());
         assert!(preflight(&p).is_none());let prepared=prepare(&p);assert_eq!(prepared["tools"].as_array().unwrap().len(),1);assert_eq!(prepared["tools"][0]["function"]["name"],NAME);assert_eq!(prepared["tool_choice"],"required");
         let compiled=compile(&p,&edit(1,2,"new source")).unwrap();assert_eq!(args(&compiled)["oldString"],"old source\nsecond line\n");
+        let mut whole=p.clone();whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with the new implementation.</userRequest>");
+        assert!(compile(&whole,&edit(1,1,"partial replacement")).unwrap_err().contains("complete observed file"));assert!(compile(&whole,&edit(1,2,"complete replacement")).is_ok());
+        let prepared_whole=prepare(&whole);assert!(prepared_whole["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("endLine=2"));
+        whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Do not replace the entire file.</userRequest>");assert!(!whole_replacement(&whole));
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
         p["messages"].as_array_mut().unwrap().extend([compiled,json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"}),json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),json!({"role":"tool","tool_call_id":"read2","content":"new source\n"})]);
         assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));
