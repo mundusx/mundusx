@@ -2859,6 +2859,11 @@ fn run_native_openai_tool_turn(
     } else {
         crate::model_profile::apply(model, &mut payload);
     }
+    if native_task_progress::is_compaction(&payload) && payload["tool_choice"].as_object().is_none() {
+        payload["tools"]=serde_json::json!([]);payload["tool_choice"]=serde_json::json!("none");
+        payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(false);
+        payload["chat_template_kwargs"]["opengpu_native_tool_guard"]=serde_json::json!(false);
+    }
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
@@ -3217,7 +3222,7 @@ fn run_native_tool_attempts(
     if let Some(progress)=native_task_progress::guidance(&payload) {
         if let Some(messages)=payload["messages"].as_array_mut() {messages.push(progress);}
     }
-    if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
+    if !native_task_progress::is_compaction(&payload) && payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
         if let Some(messages)=payload["messages"].as_array_mut() {
             messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe for native curl flags or Invoke-RestMethod for JSON APIs. Use PowerShell-compatible JSON quoting such as ConvertTo-Json and a body file. Include all registered terminal arguments. After the host returns an execution error, use the actual error to correct the command. After a successful mutation, inspect the result and do not replay it merely for verification. Preserve the requested operation and task data."}));
         }

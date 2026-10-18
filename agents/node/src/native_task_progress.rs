@@ -4,11 +4,20 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+pub fn is_compaction_text(text:&str)->bool {
+    text.trim_start().starts_with("The conversation has grown too large for the context window and must be compacted now.")
+        && text.contains("Your task is to create a comprehensive, detailed summary of the entire conversation") && !text.contains("<userRequest>")
+}
+pub fn is_compaction(p:&Value)->bool {
+    p["messages"].as_array().and_then(|m|m.last()).is_some_and(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(is_compaction_text))
+}
+
 /// Only an exact continuation inherits the immediately preceding task. A new
 /// question or request always starts its own scope, even in the same chat.
 pub fn request_index(messages:&[Value])->Option<usize> {
     let mut latest=None;
     for (i,m) in messages.iter().enumerate().rev().filter(|(_,m)|m["role"]=="user") {
+        if m["content"].as_str().is_some_and(is_compaction_text) {return Some(i);}
         let Some(text)=m["content"].as_str().and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|p|p.0)) else {continue;};
         latest.get_or_insert(i);
         let text=text.trim().trim_end_matches(['.','!','?']).trim().to_ascii_lowercase();
@@ -122,6 +131,11 @@ mod tests {
  fn p()->Value {json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Fix and test this project</userRequest>"}]})}
  fn call(name:&str,a:Value)->Value {json!({"role":"assistant","tool_calls":[{"id":format!("id{}",uuid::Uuid::new_v4()),"function":{"name":name,"arguments":a.to_string()}}]})}
  fn observe(p:&mut Value,c:Value,text:&str) {let id=c["tool_calls"][0]["id"].clone();p["messages"].as_array_mut().unwrap().extend([c,json!({"role":"tool","tool_call_id":id,"content":text})]);}
+ #[test] fn compaction_never_inherits_the_previous_coding_action() {
+  let mut p=p();observe(&mut p,call("run_in_terminal",json!({"command":"node --test api.js"})),"AssertionError\nCommand exited with code 1");
+  p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"The conversation has grown too large for the context window and must be compacted now.\nYour task is to create a comprehensive, detailed summary of the entire conversation"}));
+  assert!(is_compaction(&p));assert!(task(&p).is_none());assert!(guidance(&p).is_none());assert!(!super::super::native_tool_workflow::repair_pending(&p));
+ }
  #[test] fn covered_reads_reuse_observations_but_edits_and_incomplete_reads_allow_refresh() {
   let mut p=p();let read=call("read_file",json!({"filePath":"D:/app/main.rs","startLine":1,"endLine":2}));observe(&mut p,read.clone(),"one\ntwo\n");assert!(guard(&p,&read).is_err());
   let missing=call("read_file",json!({"filePath":"D:/app/main.rs","startLine":3,"endLine":4}));assert!(guard(&p,&missing).is_ok());observe(&mut p,missing.clone(),"tail");assert!(guard(&p,&missing).is_ok());
