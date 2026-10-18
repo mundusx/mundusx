@@ -88,7 +88,7 @@ fn compact_replaced_source(p:&mut Value,target:&str) {
         }
     }
 }
-fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
+fn ordered_name(p:&Value)->Option<&str> {
     let messages=p["messages"].as_array()?;
     let start=super::native_task_progress::request_index(messages)?;
     let text=messages[start]["content"].as_str()?.split_once("<userRequest>")?.1.split_once("</userRequest>")?.0;
@@ -99,7 +99,16 @@ fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     let mut words=rest[..colon].split_whitespace();if !matches!(words.next(),Some("repair"|"replace"|"edit"|"update")) {return None;}
     let mut modifiers=words.collect::<Vec<_>>();if modifiers.first()==Some(&"the") {modifiers.remove(0);}
     if !matches!(modifiers.as_slice(),[]|["test"]|["source"]) {return None;}
-    let named=text[first+colon+5..].split_whitespace().next()?.trim_end_matches(['.',',',';']).trim_matches(['`','\'','"']);
+    let rest=text[first+colon+5..].trim_start();
+    if let Some(quote)=rest.chars().next().filter(|c|matches!(c,'`'|'\''|'"')) {
+        return rest[1..].split_once(quote).map(|pair|pair.0);
+    }
+    rest.split_whitespace().next().map(|s|s.trim_end_matches(['.',',',';']))
+}
+fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
+    let messages=p["messages"].as_array()?;
+    let start=super::native_task_progress::request_index(messages)?;
+    let named=ordered_name(p)?;
     let matches=sources.iter().filter(|(_,s)|key(named).is_some_and(|k|key(&s.path)==Some(k))||s.path.replace('\\',"/").rsplit('/').next()==Some(named)).collect::<Vec<_>>();
     if matches.len()!=1 {return None;}
     let (target,_)=matches[0];
@@ -147,6 +156,12 @@ fn first_target_read(p:&Value)->Option<Value> {
         let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         let Some(path)=a["filePath"].as_str() else {continue;};let Some(k)=key(path) else {continue;};
         paths.insert(k,Snapshot{path:path.into(),text:String::new(),call_id:id.into()});
+    }
+    // The user's exact absolute path is already sufficient authority for a
+    // fresh read. It supplies no source bytes and never grounds an edit.
+    // Relative names still need an unambiguous previously observed path.
+    if let Some(path)=ordered_name(p) {
+        if let Some(k)=key(path) {paths.entry(k).or_insert_with(||Snapshot{path:path.into(),text:String::new(),call_id:String::new()});}
     }
     let target=ordered_target(p,&paths)?;let source=&paths[&target];
     // A fresh read has already been attempted, even if the host rejected it.
@@ -502,6 +517,7 @@ pub fn prepare(p: &Value) -> Value {
     if p["tool_choice"]=="none" && p["tools"].as_array().is_some_and(|tools|tools.is_empty())
         && p["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["role"]=="system"&&m["name"]=="mundusx_conversational_turn")) {
         let mut out=p.clone();
+        super::native_skill_catalog::compact(p,&mut out);
         if let Some(messages)=out["messages"].as_array_mut() {messages.retain(|m|matches!(m["role"].as_str(),Some("system"|"developer"|"user")));}
         return out;
     }
@@ -1090,6 +1106,20 @@ mod tests {
         p["messages"].as_array_mut().unwrap().extend([compiled,json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"}),json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),json!({"role":"tool","tool_call_id":"read2","content":"new source\n"})]);
         assert_ne!(prepare(&p)["tool_choice"],"required");
         for text in ["First replace the test file: other.js","Explain how to replace main.js","The source says first replace the test file"] {let mut q=payload("source\n");q["messages"][0]["content"]=json!(format!("<userRequest>{text}</userRequest>"));assert_ne!(prepare(&q)["tool_choice"],"required");}
+    }
+    #[test]
+    fn an_explicit_absolute_first_target_needs_no_prior_read_or_file_focus() {
+        for named in ["D:/sample/new-test.cjs", "\"D:/sample folder/new-test.cjs\"", "`/tmp/sample folder/test.py`"] {
+            let mut p=payload("unrelated observed source\n");p["messages"][0]["content"]=json!(format!("<userRequest>First replace the test file: {named}. Replace the entire file.</userRequest>"));
+            p["messages"].as_array_mut().unwrap().truncate(1);
+            let original=p.clone();let read=preflight(&p).unwrap();assert_eq!(p,original);let a=args(&read);
+            assert_eq!(a["filePath"],named.trim_matches(['`','"']));assert_eq!(a["startLine"],1);assert_eq!(a["endLine"],400);
+            assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));
+            p["messages"].as_array_mut().unwrap().push(read.clone());let id=read["tool_calls"][0]["id"].clone();p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":id,"content":"Error: file does not exist"}));assert!(preflight(&p).is_none());
+        }
+        for named in ["unknown.cjs","D:/sample/../other.cjs","\"D:/missing closing quote.cjs"] {
+            let mut p=payload("source\n");p["messages"].as_array_mut().unwrap().truncate(1);p["messages"][0]["content"]=json!(format!("<userRequest>First repair the file: {named}</userRequest>"));assert!(preflight(&p).is_none());
+        }
     }
     #[test]
     fn first_edit_reuses_only_the_prior_path_and_reads_fresh_source_once() {

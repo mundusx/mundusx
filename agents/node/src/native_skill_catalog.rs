@@ -77,4 +77,11 @@ mod tests {
         let mut p=p("Edit source");p["messages"][0]["content"]=json!(p["messages"][0]["content"].as_str().unwrap().replace("</file>","</wrong>"));let mut out=p.clone();compact(&p,&mut out);assert_eq!(p,out);
         let mut p=p.clone();p["messages"][0]["content"]=json!("An unrelated system prompt <skills>must remain</skills>");let mut out=p.clone();compact(&p,&mut out);assert_eq!(p,out);
     }
+    #[test] fn tool_free_greetings_keep_preferences_without_the_full_extension_catalog() {
+        let mut p=p("hello");p["tools"]=json!([]);p["tool_choice"]=json!("none");
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_conversational_turn","content":"Answer the greeting; retain the user's preferences"}));
+        let original=p.clone();let out=super::super::native_line_edit::prepare(&p);assert_eq!(p,original);
+        assert!(out["messages"][0]["content"].as_str().unwrap().len()<p["messages"][0]["content"].as_str().unwrap().len());
+        assert!(out.to_string().contains("retain the user's preferences"));assert_eq!(out["tool_choice"],"none");assert!(out["tools"].as_array().unwrap().is_empty());
+    }
 }
