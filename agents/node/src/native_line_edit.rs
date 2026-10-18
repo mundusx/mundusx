@@ -582,6 +582,10 @@ pub fn prepare(p: &Value) -> Value {
             }
         }
     }
+    if super::native_tool_workflow::repair_pending(p) {
+        out["tools"].as_array_mut().unwrap().retain(|t|!matches!(t["function"]["name"].as_str(),Some("run_in_terminal"|"create_and_run_task"|"send_to_terminal")));
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_failed_validation_repair_phase","content":"The last completed validation failed and no confirmed source edit followed it. Continue source inspection and repair the actual cause with the available file tools. Command execution is temporarily withheld for this repair phase to prevent rerunning the same failure; it becomes available automatically after a confirmed edit. Terminal execution is not globally forbidden. Preserve test expectations; do not invent a source change merely to unlock execution. Environment failures and explicit client-selected tools keep their normal path."}));
+    }
     if let Some((_, line)) = &focus {
         out["tools"]
             .as_array_mut()
@@ -857,6 +861,18 @@ mod tests {
         p["messages"].as_array_mut().unwrap().extend([read,json!({"role":"tool","tool_call_id":id,"content":"Error: file moved"})]);
         assert!(preflight(&p).is_none());
         p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>First repair the file: other.js.</userRequest>"}));assert!(preflight(&p).is_none());
+    }
+    #[test]
+    fn failed_tests_return_to_repairs_before_another_execution_and_edits_unlock_checks() {
+        for (command,failure) in [("node --test test.js","TypeError: undefined URL"),("cargo test","thread panicked at assertion"),("pytest","AssertionError: mismatch"),("mvn test","java.lang.NullPointerException"),("dotnet test","Assert.Equal() Failure"),("go test ./...","panic: bad state")] {
+            let mut p=payload("source\n");p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
+            p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":command}).to_string()}}]}),json!({"role":"tool","tool_call_id":"test1","content":format!("{failure}\nCommand exited with code 1")})]);
+            assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"),"{command}");assert!(p["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"));
+            let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"run_in_terminal"}});assert_eq!(prepare(&explicit),explicit);
+            let mut environment=p.clone();environment["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("command not found\nCommand exited with code 1");assert!(prepare(&environment)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"));
+            p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"edit1","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/app/main.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"})]);
+            assert!(prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"));
+        }
     }
     #[test]
     fn model_context_keeps_current_evidence_and_all_instructions_without_old_task_tools() {

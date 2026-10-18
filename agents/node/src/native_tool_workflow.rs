@@ -157,6 +157,13 @@ pub fn compiler_failure(payload:&Value)->Option<String> {
     None
 }
 
+pub fn repair_pending(payload:&Value)->bool {
+    compiler_failure(payload).is_some_and(|text| {
+        let text=text.to_ascii_lowercase();
+        !["command not found","not recognized as","java_home is not set","java_home is not defined","could not find `cargo.toml`","no such file or directory","permission denied","connection refused","econnrefused"].iter().any(|s|text.contains(s))
+    })
+}
+
 /// Repeat an observed finite validator only after a confirmed edit to the
 /// same compiler-reported source. No model call, shell rewrite, or new command.
 pub fn validator_after_edit(payload:&Value)->Option<Value> {
