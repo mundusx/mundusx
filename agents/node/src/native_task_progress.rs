@@ -84,7 +84,7 @@ fn progress(p:&Value)->Progress {
                 state.reads.clear();
                 state.plan=None;
                 let command=a["command"].as_str().unwrap_or("").trim();
-                state.check_explicit=super::native_tool_workflow::observed_exit(text).is_some();
+                state.check_explicit=super::native_tool_workflow::observed_exit(text).is_some()||super::native_tool_workflow::bound_exit_status(&a,text).is_some();
                 state.check=if super::native_tool_workflow::is_validation(command) {
                     super::native_tool_workflow::observed_validation_exit(p,&a,text).map(|passed|(command.into(),id.into(),passed))
                 } else {None};

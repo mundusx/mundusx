@@ -69,6 +69,65 @@ pub fn terminal_metadata(payload:&Value,message:&Value)->Value {
     result
 }
 
+fn status_suffix(command:&str)->String {
+    use sha2::{Digest,Sha256};
+    let digest=format!("{:x}",Sha256::digest(command.as_bytes()));
+    format!("; $mundusxValidationOk=$?; $mundusxValidationExit=$LASTEXITCODE; if (-not $mundusxValidationOk -and ($null -eq $mundusxValidationExit -or $mundusxValidationExit -eq 0)) {{ $mundusxValidationExit=1 }}; if ($null -eq $mundusxValidationExit) {{ $mundusxValidationExit=0 }}; Write-Output (\"MUNDUSX_VALIDATION_EXIT_{}:\" + $mundusxValidationExit)",&digest[..16])
+}
+fn receipt(command:&str)->Option<(&str,String)> {
+    let (base,_)=command.split_once("; $mundusxValidationOk=$?;")?;
+    let suffix=status_suffix(base);
+    if command!=format!("{base}{suffix}") {return None;}
+    let marker=suffix.split_once("MUNDUSX_VALIDATION_EXIT_")?.1.split_once(':')?.0;
+    Some((base,format!("MUNDUSX_VALIDATION_EXIT_{marker}:")))
+}
+fn powershell_contract(payload:&Value)->bool {
+    payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal"))
+        .and_then(|t|t["function"]["description"].as_str())
+        .is_some_and(|s|s.starts_with("This tool allows you to execute Windows PowerShell"))
+}
+pub(super) fn bound_exit_status(args:&Value,text:&str)->Option<bool> {
+    let (_,marker)=args["command"].as_str().and_then(receipt)?;
+    text.lines().rev().find_map(|line|line.trim().strip_prefix(&marker).and_then(|s|s.parse::<i32>().ok())).map(|code|code==0)
+}
+/// Preserve the finite validator verbatim and visibly report its native exit
+/// status in the same host shell. Never execute here or wrap mutations, async
+/// commands, compound shell programs, or an unidentified shell contract.
+pub fn validation_status(payload:&Value,message:&Value)->Value {
+    if !powershell_contract(payload) {return message.clone();}
+    let mut out=message.clone();
+    for c in out["tool_calls"].as_array_mut().into_iter().flatten() {
+        if c["function"]["name"]!="run_in_terminal" {continue;}
+        let Ok(mut a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let Some(command)=a["command"].as_str() else {continue;};
+        if !native_sync_terminal(payload,&a)||!validation_command(command)||command.contains([';','|','&','\n','\r','$','`','<','>']) {continue;}
+        let exe=command.split_whitespace().next().unwrap_or("");
+        if !matches!(exe,"node"|"python"|"python3"|"py"|"cargo"|"javac"|"gcc"|"g++"|"clang"|"clang++"|"go"|"dotnet"|"swift"|"kotlinc"|"ruby"|"php") {continue;}
+        a["command"]=json!(format!("{command}{}",status_suffix(command)));
+        c["function"]["arguments"]=json!(a.to_string());
+    }
+    out
+}
+/// A legacy silent result did not expose exit status. One explicit receipt
+/// check replaces repeated speculative inspection; future calls are wrapped
+/// before their first execution instead.
+pub fn silent_validation_followup(payload:&Value)->Option<Value> {
+    if !powershell_contract(payload) {return None;}
+    let h=history(payload)?;
+    for (i,r) in h.iter().enumerate().rev().filter(|(_,m)|m["role"]=="tool") {
+        let c=h[..i].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==r["tool_call_id"])?;
+        let name=c["function"]["name"].as_str()?;
+        if matches!(name,"create_file"|"replace_string_in_file"|"insert_edit_into_file"|"send_to_terminal"|"create_and_run_task") {return None;}
+        if name!="run_in_terminal" {continue;}
+        if r["content"].as_str()?.trim()!="Command produced no output" {return None;}
+        let a:Value=serde_json::from_str(c["function"]["arguments"].as_str()?).ok()?;
+        let proposed=terminal_metadata(payload,&call("run_in_terminal",a,"call_status_receipt_"));
+        let wrapped=validation_status(payload,&proposed);
+        return (wrapped!=proposed).then_some(wrapped);
+    }
+    None
+}
+
 /// Equivalent Windows paths must name the same host document URI as well as
 /// compare equally in the guard. Never rewrite source text or relative paths.
 pub fn canonical_paths(payload:&Value,message:&Value)->Value {
@@ -118,6 +177,11 @@ fn native_sync_terminal(payload:&Value,args:&Value)->bool {
 pub(super) fn observed_validation_exit(payload:&Value,args:&Value,text:&str)->Option<bool> {
     let explicit=terminal_exit(text);
     if explicit==Some(false)||!native_sync_terminal(payload,args)||!args["command"].as_str().is_some_and(validation_command) {return explicit;}
+    if powershell_contract(payload) {
+        if args["command"].as_str().and_then(receipt).is_some() {
+            return bound_exit_status(args,text).or(explicit);
+        }
+    }
     if let Some(report)=super::native_terminal_report::complete(text) {
         if !report.passed {return Some(false);}
         if explicit.is_some() {return explicit;}
@@ -144,7 +208,8 @@ fn requested_tests(payload:&Value)->bool {
         .is_some_and(|s|["assertions","automated http tests","automated tests","functional tests"].iter().any(|v|s.contains(v)))
 }
 fn nonempty_test_report(command:&str,result:&str)->bool {
-    let command=command.to_ascii_lowercase();let result=super::native_terminal_report::clean(result);
+    let report=if let Some((_,marker))=receipt(command) {result.lines().filter(|line|!line.trim().strip_prefix(&marker).is_some_and(|s|s.parse::<i32>().is_ok())).collect::<Vec<_>>().join("\n")} else {result.into()};
+    let command=command.to_ascii_lowercase();let result=super::native_terminal_report::clean(&report);
     if !validation_command(&command) {return false;}
     if let Some(report)=super::native_terminal_report::complete(&result) {return report.passed&&report.executed;}
     if let Some(passed)=super::native_terminal_report::partial_node_pass(&result) {return passed;}
@@ -465,6 +530,36 @@ fn advisory_only(text:&str)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bound_powershell_validator_status_preserves_command_and_rejects_unknown_results() {
+        let mut p=payload();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal","description":"This tool allows you to execute Windows PowerShell 5.1 commands in a persistent terminal session","parameters":{"required":["command","goal","explanation","mode"]}}}));
+        let a=json!({"command":"node --check main.js","mode":"sync","goal":"Check","explanation":"Verify"});
+        let c=call("run_in_terminal",a.clone(),"check_");let wrapped=validation_status(&p,&c);let args:Value=serde_json::from_str(wrapped["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt(args["command"].as_str().unwrap()).unwrap().0,"node --check main.js");
+        assert_eq!(validation_status(&p,&wrapped),wrapped);
+        let marker=receipt(args["command"].as_str().unwrap()).unwrap().1;
+        assert_eq!(observed_validation_exit(&p,&args,&format!("{marker}0")),Some(true));
+        assert_eq!(observed_validation_exit(&p,&args,&format!("{marker}2")),Some(false));
+        assert_eq!(observed_validation_exit(&p,&args,"Command produced no output"),None);
+        assert_eq!(observed_validation_exit(&p,&args,"MUNDUSX_VALIDATION_EXIT_wrong:0"),None);
+        assert_eq!(observed_validation_exit(&p,&args,&format!("{marker}0\nCommand exited with code 1")),Some(false));
+        for command in ["git init","npm install","node --check main.js; Remove-Item other.js","node --check $file"] {
+            let c=call("run_in_terminal",json!({"command":command,"mode":"sync"}),"other_");assert_eq!(validation_status(&p,&c),c);
+        }
+        let c=call("run_in_terminal",json!({"command":"node --check main.js","mode":"async"}),"async_");assert_eq!(validation_status(&p,&c),c);
+        observe(&mut p,c.clone(),"Command produced no output");assert!(silent_validation_followup(&p).is_none());
+        observe(&mut p,call("run_in_terminal",a.clone(),"silent_"),"Command produced no output");assert!(silent_validation_followup(&p).is_some());
+        observe(&mut p,wrapped,&format!("{marker}0"));assert!(silent_validation_followup(&p).is_none());
+        p["tools"].as_array_mut().unwrap().last_mut().unwrap()["function"]["description"]=json!("Execute a command in an unknown shell");assert_eq!(validation_status(&p,&call("run_in_terminal",a,"same_"))["tool_calls"][0]["function"]["arguments"].as_str().and_then(|s|serde_json::from_str::<Value>(s).ok()).unwrap()["command"],"node --check main.js");
+    }
+    #[test]
+    fn exit_receipts_do_not_substitute_for_nonempty_real_test_reports() {
+        let command=format!("node --test test.js{}",status_suffix("node --test test.js"));let marker=receipt(&command).unwrap().1;
+        let report="# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 3";
+        assert!(nonempty_test_report(&command,&format!("{report}\n{marker}0")));
+        assert!(!nonempty_test_report(&command,&format!("{marker}0")));
+        assert!(!nonempty_test_report(&command,&format!("{}\n{marker}0",report.replace("pass 1","pass 0").replace("skipped 0","skipped 1"))));
+    }
     #[test]
     fn explicitly_forbidden_installs_never_replace_normal_coding_permissions() {
         let mut p=json!({"messages":[{"role":"user","content":"<userRequest>Implement the feature. Reuse installed packages without reinstalling.</userRequest>"}]});

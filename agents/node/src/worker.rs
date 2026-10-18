@@ -2869,7 +2869,7 @@ fn run_native_openai_tool_turn(
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
-    if let Some(automatic)=native_tool_workflow::validator_after_edit(&payload).or_else(||native_tool_workflow::requested_validator_after_edit(&payload)).or_else(||native_line_edit::preflight(&payload)) {
+    if let Some(automatic)=native_tool_workflow::silent_validation_followup(&payload).or_else(||native_tool_workflow::validator_after_edit(&payload)).or_else(||native_tool_workflow::requested_validator_after_edit(&payload)).or_else(||native_line_edit::preflight(&payload)) {
         if let Ok((message,_))=native_workflow_message(&payload,&automatic) {
             if streaming {
                 let mut calls=message["tool_calls"].clone();
@@ -2968,7 +2968,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
 
 fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     native_tool_workflow::task_constraints(payload,message)?;
-    let metadata=complete_native_read_ranges(payload,&native_tool_workflow::terminal_metadata(payload,message));
+    let metadata=complete_native_read_ranges(payload,&native_tool_workflow::validation_status(payload,&native_tool_workflow::terminal_metadata(payload,message)));
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
         validate_native_tool_schema(payload,&metadata)?;
         if metadata["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
