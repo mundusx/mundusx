@@ -125,6 +125,22 @@ fn first_target_read(p:&Value)->Option<Value> {
     let messages=p["messages"].as_array()?;
     let start=super::native_task_progress::request_index(messages)?;
     let mut paths=BTreeMap::new();
+    // A checkpoint path is a pointer for a fresh read, never source grounding.
+    // Use only the checkpoint that supplies this continued task, not metadata
+    // from an older task when the human has issued a new request.
+    if let Some(text)=messages[start]["content"].as_str() {
+        let body=text.trim_start().strip_prefix("<conversation-summary>").unwrap_or(text).trim_start();
+        if body.starts_with("Extractive conversation checkpoint from existing client messages.") {
+            for line in body.lines().rev() {
+                let Ok(data)=serde_json::from_str::<Value>(line) else {continue;};
+                if data["active_user_request"].as_str()!=user_task(p) {continue;}
+                for path in data["observed_source_paths"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    if let Some(k)=key(path) {paths.insert(k,Snapshot{path:path.into(),text:String::new(),call_id:String::new()});}
+                }
+                break;
+            }
+        }
+    }
     for (i,result) in messages.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
         let Some(id)=result["tool_call_id"].as_str().filter(|s|!s.is_empty()) else {continue;};
         let Some(c)=messages[..i].iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==id&&c["function"]["name"]=="read_file") else {continue;};
@@ -1140,6 +1156,14 @@ mod tests {
             let read=super::super::native_tool_workflow::recover_read(&p,&proposal,&error).unwrap();let a=args(&read);assert_eq!(a["startLine"],1);assert_eq!(a["endLine"],400);
             p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string());assert!(compile(&p,&proposal).is_ok());
         }
+    }
+    #[test]
+    fn checkpoint_paths_can_only_request_fresh_reads_for_the_continued_explicit_target() {
+        let task="First edit the file: main.js. Preserve data and run tests.";let mut p=payload("old source\n");
+        p["messages"]=json!([{"role":"user","content":format!("<conversation-summary>\nExtractive conversation checkpoint from existing client messages.\n<userRequest>{task}</userRequest>\n{}\nHost transcript hint.\n</conversation-summary>",json!({"active_user_request":task,"observed_source_paths":["D:/app/main.js"]}))},{"role":"user","content":"<userRequest>Continue</userRequest>"}]);
+        let original=p.clone();let read=preflight(&p).unwrap();assert_eq!(args(&read)["filePath"],"D:/app/main.js");assert_eq!(args(&read)["startLine"],1);assert_eq!(args(&read)["endLine"],400);assert_eq!(p,original);
+        assert!(compile(&p,&edit(1,1,"changed")).is_err());
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>First edit the file: main.js. This is a new task.</userRequest>"}));assert!(preflight(&p).is_none());
     }
     #[test]
     fn model_context_keeps_current_evidence_and_all_instructions_without_old_task_tools() {
