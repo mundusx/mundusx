@@ -2929,11 +2929,22 @@ fn run_native_openai_tool_turn(
         {
             return Err("native tool recovery returned no tool call".into());
         }
-        normalize_native_openai_tool_response_with_limit(&value,if native_line_edit::source_response_required(payload) {32768} else {16384})
+        normalize_native_openai_tool_response_with_limit(&value,native_host_argument_limit(Some(payload),&value["choices"][0]["message"],changed))
     })
 }
 
 const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__";
+
+fn native_host_argument_limit(payload:Option<&serde_json::Value>,message:&serde_json::Value,changed:bool)->usize {
+    let artifact=payload.is_some_and(native_line_edit::source_response_required);
+    // Generated calls retain their original limit. After the adapter has
+    // grounded an edit, serialized host arguments contain BOTH observed old
+    // text and new text, plus JSON escaping. That is not model generation.
+    if changed&&payload.is_some_and(native_tool_workflow::is_file_turn)
+        &&message["tool_calls"].as_array().is_some_and(|calls|!calls.is_empty()&&calls.iter().all(|c|c["function"]["name"]=="replace_string_in_file")) {
+        if artifact {65536}else{32768}
+    } else if artifact {32768}else{16384}
+}
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
     (|| {
@@ -3531,7 +3542,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     {
         return Err("native tool recovery returned no tool call".into());
     }
-    let argument_limit=if payload.is_some_and(native_line_edit::source_response_required) {32768} else {16384};
+    let argument_limit=native_host_argument_limit(payload,&message,workflow_changed);
     validate_native_tool_message_with_limit(&message,reason.as_deref(),argument_limit)?;
     if payload.is_some_and(native_tool_workflow::is_file_turn) {
         if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
@@ -7657,6 +7668,23 @@ fn rejected_line_compile_arguments_are_retained_for_private_recovery() {
  let error=native_workflow_message(&p,&bad).unwrap_err();
  assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
  assert!(error.contains("PRIVATE_RANGE_REPLACEMENT"));
+}
+
+#[test]
+fn compiled_observed_edits_have_a_separate_serialization_budget() {
+ use serde_json::json;
+ let source=(0..220).map(|i|format!("const x{i} = \"a\\\\b\"; // \"quoted\"\n")).collect::<String>();
+ let replacement=source.replacen("const x0", "const y0",1);
+ let p=json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}},"required":["filePath","oldString","newString"]}}}],"messages":[{"role":"user","content":"<userRequest>Fix /app/main.js</userRequest>"},{"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":json!({"filePath":"/app/main.js","startLine":1,"endLine":400}).to_string()}}]},{"role":"tool","tool_call_id":"read1","content":source}]});
+ let generated=json!({"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"edit1","type":"function","function":{"name":"__mundusx_edit_observed_lines","arguments":json!({"filePath":"/app/main.js","startLine":1,"endLine":220,"newText":replacement}).to_string()}}]});
+ validate_native_tool_message(&generated,Some("tool_calls")).unwrap();
+ let (compiled,changed)=native_workflow_message(&p,&generated).unwrap();assert!(changed);
+ let encoded=compiled["tool_calls"][0]["function"]["arguments"].as_str().unwrap().chars().count();assert!(encoded>16384&&encoded<32768,"{encoded}");
+ assert!(validate_native_tool_message(&compiled,Some("tool_calls")).is_err());
+ assert_eq!(native_host_argument_limit(Some(&p),&compiled,false),16384);
+ validate_native_tool_message_with_limit(&compiled,Some("tool_calls"),native_host_argument_limit(Some(&p),&compiled,changed)).unwrap();
+ let stream=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"tool_calls":generated["tool_calls"]},"finish_reason":"tool_calls"}]}));
+ let result=parse_native_openai_stream_with_context(std::io::Cursor::new(stream),&mut String::new(),false,Some(&p)).unwrap();assert!(result.contains("replace_string_in_file"));
 }
 
 #[test]
