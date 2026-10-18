@@ -3031,16 +3031,22 @@ fn read_range_metadata_reaches_the_host_without_a_model_retry() {
 }
 
 #[test]
-fn schema_recovery_selects_only_the_rejected_registered_function() {
+fn schema_recovery_preserves_auto_selection_and_honors_client_selected_functions() {
     use serde_json::json;
     let p=json!({"messages":[],"tools":[{"function":{"name":"create_file"}},{"function":{"name":"read_file","parameters":{"required":["filePath","startLine","endLine"]}}}],"chat_template_kwargs":{"opengpu_native_tool_guard":true}});
     let mut attempts=0;
     run_native_tool_attempts(p.clone(),|body,_,retry| {
         attempts+=1;if !retry {return Err("native tool schema precondition failed: read_file.startLine is required".into());}
-        assert_eq!(body["tools"],json!([p["tools"][1]]));assert_eq!(body["tool_choice"]["function"]["name"],"read_file");
+        assert_eq!(body["tools"],p["tools"]);assert_eq!(body["tool_choice"],"required");
         assert_eq!(body["chat_template_kwargs"]["opengpu_require_tool_call"],true);
         Ok("corrected call".into())
     }).unwrap();assert_eq!(attempts,2);
+    let mut selected=p.clone();selected["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});
+    run_native_tool_attempts(selected,|body,_,retry| {
+        if !retry {return Err("native tool schema precondition failed: read_file.startLine is required".into());}
+        assert_eq!(body["tools"],json!([p["tools"][1]]));assert_eq!(body["tool_choice"]["function"]["name"],"read_file");
+        Ok("explicit client selection preserved".into())
+    }).unwrap();
     for choice in [json!("none"),json!({"type":"function","function":{"name":"create_file"}})] {
         let mut forced=p.clone();forced["tool_choice"]=choice.clone();
         run_native_tool_attempts(forced,|body,_,retry| {
@@ -3282,10 +3288,18 @@ fn run_native_tool_attempts(
             let recovery_tool=if terminal_recovery {Some("run_in_terminal")} else if line_edit_recovery {None} else {schema_tool};
             let recovery_tool=recovery_tool.filter(|name|payload["tool_choice"].as_str()!=Some("none") && payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()).is_none_or(|selected|selected==*name));
             let selected=recovery_tool.and_then(|name|payload["tools"].as_array()?.iter().find(|t|t["function"]["name"].as_str()==Some(name))).cloned();
-            if let Some(tool)=selected {
+            if let Some(tool)=selected.filter(|_|terminal_recovery||payload.pointer("/tool_choice/function/name").is_some()) {
                 let name=tool["function"]["name"].clone();
                 payload["tools"]=serde_json::json!([tool]);
                 payload["tool_choice"]=serde_json::json!({"type":"function","function":{"name":name}});
+                if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
+                    payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(true);
+                }
+            } else if recovery_tool.is_some() && payload["tool_choice"].as_str()!=Some("none") && payload.pointer("/tool_choice/function/name").is_none() {
+                // A model-selected function can itself be the mistake. Keep
+                // auto recovery in the current projected tool/context view,
+                // rather than pinning that mistake as a client-selected tool.
+                payload["tool_choice"]=serde_json::json!("required");
                 if payload.pointer("/chat_template_kwargs/opengpu_native_tool_guard")==Some(&serde_json::json!(true)) {
                     payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(true);
                 }

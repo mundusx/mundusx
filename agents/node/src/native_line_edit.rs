@@ -531,7 +531,10 @@ pub fn prepare(p: &Value) -> Value {
         return out;
     }
     if !compatible(p) {
-        return p.clone();
+        let mut out=p.clone();
+        super::native_skill_catalog::compact(p,&mut out);
+        super::native_tool_workflow::compact_validation_receipts(p,&mut out);
+        return out;
     }
     // Unknown host wrappers and legacy CR-only files retain their native edit
     // contract rather than inventing absolute source-line positions.

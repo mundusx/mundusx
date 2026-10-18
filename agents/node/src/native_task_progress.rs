@@ -51,7 +51,8 @@ fn ok(s:&str)->bool {
 }
 struct Read {start:u64,end:u64,requested_end:u64,eof:bool,id:String,digest:String,text:String}
 #[derive(Default)]
-struct Progress {reads:BTreeMap<String,Vec<Read>>,check:Option<(String,String,bool)>,check_explicit:bool,writes:usize,plan:Option<String>}
+struct Progress {reads:BTreeMap<String,Vec<Read>>,check:Option<(String,String,bool)>,check_explicit:bool,writes:usize,plan:Option<String>,failed:BTreeMap<String,(usize,String)>}
+fn call_digest(name:&str,args:&Value)->String {format!("{:x}",Sha256::digest(format!("{name}:{args}").as_bytes()))}
 fn progress(p:&Value)->Progress {
     let h=current(p);let mut state=Progress::default();
     for (i,r) in h.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
@@ -60,6 +61,12 @@ fn progress(p:&Value)->Progress {
         let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         let Some(text)=r["content"].as_str() else {continue;};
         let name=c["function"]["name"].as_str().unwrap_or("");
+        if !matches!(name,"run_in_terminal"|"create_file"|"replace_string_in_file"|"insert_edit_into_file"|"multi_replace_string_in_file") {
+            let fingerprint=call_digest(name,&a);
+            if !ok(text)&&!text.trim().is_empty() {
+                let failed=state.failed.entry(fingerprint).or_default();failed.0=failed.0.saturating_add(1);failed.1=id.into();
+            } else if ok(text) {state.failed.remove(&fingerprint);}
+        }
         match name {
             "read_file"=>{
                 state.plan=None;
@@ -78,9 +85,10 @@ fn progress(p:&Value)->Progress {
                 // our read. Allow fresh grounding even when no write applied.
                 state.reads.clear();
                 state.plan=None;
-                if ok(text) {state.writes+=1;state.check=None;}
+                if ok(text) {state.writes+=1;state.check=None;state.failed.clear();}
             },
             "run_in_terminal"=>{
+                state.failed.clear();
                 state.reads.clear();
                 state.plan=None;
                 let command=a["command"].as_str().unwrap_or("").trim();
@@ -111,6 +119,10 @@ pub fn guard(p:&Value,message:&Value)->Result<(),String> {
     let s=progress(p);
     for c in message["tool_calls"].as_array().into_iter().flatten() {
         let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let name=c["function"]["name"].as_str().unwrap_or("");
+        if let Some((count,id))=s.failed.get(&call_digest(name,&a)).filter(|(count,_)|*count>=2) {
+            return Err(format!("native progress precondition failed: this identical {name} call already failed in {count} matched host results, most recently {id}, without a state change resolving it. Correct the actual arguments or repair the cause; do not repeat unchanged failures. No tool was executed"));
+        }
         if c["function"]["name"]=="read_file" {
             let (Some(file),Some(start),Some(end))=(a["filePath"].as_str(),a["startLine"].as_u64(),a["endLine"].as_u64()) else {continue;};
             if let Some(rs)=s.reads.get(&path(file)) {
@@ -201,6 +213,14 @@ mod tests {
   observe(&mut p,read.clone(),"old\nsource\n");assert!(guard(&p,&read).is_ok());observe(&mut p,read.clone(),"old\nsource\n");assert!(guard(&p,&read).is_err());
   observe(&mut p,call("replace_string_in_file",json!({"filePath":"/app/main.js"})),"String replacement failed: source changed");
   assert!(guard(&p,&read).is_ok());assert_eq!(progress(&p).writes,0);
+ }
+ #[test] fn identical_failed_controls_are_bounded_even_between_read_observations() {
+  let mut p=p();let kill=call("kill_terminal",json!({"id":"not-a-terminal"}));
+  observe(&mut p,kill.clone(),"Tool execution failed: terminal not found");assert!(guard(&p,&kill).is_ok());
+  observe(&mut p,call("read_file",json!({"filePath":"/app/test.js","startLine":1,"endLine":20})),"source\n");
+  observe(&mut p,kill.clone(),"Tool execution failed: terminal not found");assert!(guard(&p,&kill).is_err());
+  assert!(guard(&p,&call("kill_terminal",json!({"id":"different-terminal"}))).is_ok());
+  observe(&mut p,call("replace_string_in_file",json!({"filePath":"/app/test.js"})),"Applied edit");assert!(guard(&p,&kill).is_ok());
  }
  #[test] fn plans_wait_for_real_host_progress_and_prefix_eof_prevents_range_growth_loops() {
   let mut p=p();let plan=call("manage_todo_list",json!({"todoList":[]}));observe(&mut p,plan.clone(),"Updated todo list");assert!(planning_current(&p));assert!(guard(&p,&plan).is_err());
