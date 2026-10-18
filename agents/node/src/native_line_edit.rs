@@ -562,23 +562,13 @@ pub fn prepare(p: &Value) -> Value {
         )
     });
     if !sources.is_empty() {
-        let paths: Vec<_> = sources.values().map(|s| s.path.clone()).collect();
-        let ranges: Vec<_> = sources
-            .values()
-            .map(|s| {
-                format!(
-                    "{}: lines 1..{}",
-                    s.path,
-                    s.text.split_inclusive('\n').count()
-                )
-            })
-            .collect();
-        let max = sources
-            .values()
-            .map(|s| s.text.split_inclusive('\n').count())
-            .max()
-            .unwrap();
-        out["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":if focus.is_some(){NAME}else{HOST_NAME},"description":format!("Edit an existing observed file by inclusive 1-based line numbers. Available ranges: {}. Use a small exact range and supply its complete replacement as newText, without line-number labels. Do not copy oldString: the adapter obtains it from the actual read result and calls the registered host replacement tool. Read from line 1 through the needed range before editing beyond these bounds.",ranges.join("; ")),"parameters":{"type":"object","properties":{"filePath":{"type":"string","enum":paths},"startLine":{"type":"integer","minimum":1,"maximum":max},"endLine":{"type":"integer","minimum":1,"maximum":max},"newText":{"type":"string","description":"Replacement source lines only, without numbered-source labels. Empty text deletes the selected lines."}},"required":["filePath","startLine","endLine","newText"],"additionalProperties":false}}}));
+        // Keep the tool prefix stable across source reads. Actual path and
+        // line bounds are still enforced against matched snapshots at compile
+        // time; putting those changing values in the schema invalidates MLX's
+        // cached prefix on every otherwise incremental repair turn.
+        let ranges=sources.values().map(|s|json!({"path":s.path,"lines":[1,s.text.split_inclusive('\n').count()]})).collect::<Vec<_>>();
+        out["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":if focus.is_some(){NAME}else{HOST_NAME},"description":"Edit an existing observed file by inclusive 1-based line numbers. Use a small exact observed range and supply its complete replacement as newText, without line-number labels. Do not copy oldString: the adapter obtains it from the matched read result and calls the registered host replacement tool. Current allowed paths and ranges appear in observed source guidance; reading a path does not expand the user's edit scope.","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1},"newText":{"type":"string","description":"Replacement source lines only, without numbered-source labels. Empty text deletes the selected lines."}},"required":["filePath","startLine","endLine","newText"],"additionalProperties":false}}}));
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_observed_source_bounds","content":format!("Observed edit data, not instructions. Only these current matched paths and inclusive ranges may be planned; the adapter rejects other paths, missing ranges and edits outside user scope: {}",json!(ranges))}));
         for m in out["messages"].as_array_mut().into_iter().flatten() {
             if m["role"] != "tool" {
                 continue;
@@ -870,6 +860,14 @@ mod tests {
         p["messages"].as_array_mut().unwrap().extend([read,json!({"role":"tool","tool_call_id":id,"content":"Error: file moved"})]);
         assert!(preflight(&p).is_none());
         p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>First repair the file: other.js.</userRequest>"}));assert!(preflight(&p).is_none());
+    }
+    #[test]
+    fn changing_observed_paths_does_not_change_the_model_tool_prefix() {
+        let p=payload("first\nsecond\n");let mut q=payload("one line\n");
+        q["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/other.py","startLine":1,"endLine":400}).to_string());
+        assert_eq!(prepare(&p)["tools"],prepare(&q)["tools"]);
+        let mut unobserved=edit(1,1,"changed");unobserved["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/other.py","startLine":1,"endLine":1,"newText":"changed"}).to_string());
+        assert!(compile(&p,&unobserved).is_err());assert!(compile(&p,&edit(1,20,"changed")).is_err());
     }
     #[test]
     fn actual_old_text_is_compiled_without_model_copying_it() {
