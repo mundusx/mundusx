@@ -119,6 +119,17 @@ pub fn compact_validation_receipts(original:&Value,view:&mut Value) {
                 message["content"]=json!(format!("{lines}\nValidation process completed; command exit receipt: {exit}. This completed-process receipt is not an active terminal ID. Preserve and repair the actual diagnostic above; do not wait for or kill the completed validator."));
             }
         }
+        if message["role"]=="system" && matches!(message["name"].as_str(),Some("mundusx_observed_task_progress"|"mundusx_observed_compiler_failure")) {
+            if let Some(text)=message["content"].as_str() {
+                let mut text=text.to_string();
+                for (base,marker,_) in receipts.values() {
+                    let wrapped=format!("{base}{}",status_suffix(base));
+                    text=text.replace(&json!(wrapped).to_string(),&json!(base).to_string()).replace(&wrapped,base);
+                    text=text.replace(marker,"completed validator exit code:");
+                }
+                message["content"]=json!(text);
+            }
+        }
     }
 }
 /// Preserve the finite validator verbatim and visibly report its native exit
@@ -601,6 +612,9 @@ mod tests {
     fn bound_receipt_hashes_leave_the_model_view_but_keep_original_failure_evidence() {
         let base="node --test test.js";let command=format!("{base}{}",status_suffix(base));let marker=receipt(&command).unwrap().1;
         let mut p=payload();observe(&mut p,call("run_in_terminal",json!({"command":command,"mode":"sync"}),"validator_"),&format!("ERR_UNKNOWN_BUILTIN_MODULE\n{marker}1\nCommand exited with code 1"));
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"system","name":"mundusx_observed_task_progress","content":json!({"command":command}).to_string()}),
+            json!({"role":"system","name":"mundusx_observed_compiler_failure","content":format!("ERR_UNKNOWN_BUILTIN_MODULE\n{marker}1")})]);
         let original=p.clone();let mut view=p.clone();compact_validation_receipts(&p,&mut view);
         assert_eq!(p,original);assert!(!view.to_string().contains("MUNDUSX_VALIDATION_EXIT_"));
         assert!(view.to_string().contains("ERR_UNKNOWN_BUILTIN_MODULE"));assert!(view.to_string().contains("not an active terminal ID"));
