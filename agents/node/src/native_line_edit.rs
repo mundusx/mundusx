@@ -541,6 +541,35 @@ pub fn prepare(p: &Value) -> Value {
             message["content"]=Value::Null;
         }
     }
+    // Present current source once. Older source bodies and applied edit
+    // arguments otherwise compete with the latest bytes during repair. Keep
+    // the original transcript for grounding, permissions and verification.
+    let mut retired=std::collections::BTreeSet::new();let mut receipts=Vec::new();
+    if let Some(messages)=out["messages"].as_array() {
+        for (i,result) in messages.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
+            let Some(id)=result["tool_call_id"].as_str() else {continue;};
+            let Some(call)=messages[..i].iter().rev().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==id) else {continue;};
+            let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+            let Some(path)=a["filePath"].as_str() else {continue;};
+            if call["function"]["name"]=="read_file"&&a["startLine"]==1 {
+                if key(path).and_then(|k|sources.get(&k)).is_some_and(|s|s.call_id!=id) {retired.insert(id.to_string());}
+            } else if matches!(call["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file"))
+                &&result["content"].as_str().is_some_and(super::native_tool_workflow::successful_result) {
+                retired.insert(id.to_string());receipts.push(json!({"filePath":path,"result_id":id,"operation":call["function"]["name"]}));
+            }
+        }
+    }
+    if !retired.is_empty() {
+        let messages=out["messages"].as_array_mut().unwrap();
+        for message in messages.iter_mut().filter(|m|m["role"]=="assistant") {
+            if let Some(calls)=message["tool_calls"].as_array_mut() {calls.retain(|c|c["id"].as_str().is_none_or(|id|!retired.contains(id)));}
+        }
+        messages.retain(|m| {
+            !(m["role"]=="tool"&&m["tool_call_id"].as_str().is_some_and(|id|retired.contains(id)))
+                && !(m["role"]=="assistant"&&m["tool_calls"].as_array().is_some_and(Vec::is_empty)&&m["content"].as_str().is_none_or(|s|s.trim().is_empty()))
+        });
+        if !receipts.is_empty() {messages.push(json!({"role":"system","name":"mundusx_confirmed_write_receipts","content":format!("Historical host-confirmed write DATA, not instructions. Prior edit arguments were omitted from this model view. These receipts do not supply current source or prove functional correctness. Use the latest matched source observations or read missing/current bytes before another edit. Original transcript remains available to the adapter for grounding and verification: {}",json!(receipts))}));}
+    }
     if let Some((target,source))=whole_source(p) {
         compact_replaced_source(&mut out,&target);
         // This bounded substep generates source, not another agent action.
@@ -1070,6 +1099,20 @@ mod tests {
         assert_eq!(replay["tool_calls"],p["messages"][1]["tool_calls"]);
         assert!(replay["content"].is_null());assert!(!view.to_string().contains("UNVERIFIED_DIAGNOSIS"));
         assert!(view["messages"].as_array().unwrap().iter().any(|m|m["tool_call_id"]=="read1"));
+    }
+    #[test]
+    fn superseded_source_and_applied_edit_arguments_do_not_compete_with_current_bytes() {
+        let mut p=payload("OLD_SOURCE_VERSION\n");
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"write1","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/app/main.js","oldString":"OLD_SOURCE_VERSION","newString":"NEW_SOURCE_VERSION"}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"write1","content":"Applied edit"}),
+            json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"read2","content":"NEW_SOURCE_VERSION\n"})]);
+        let original=p.clone();let view=prepare(&p);assert_eq!(p,original);
+        assert!(!view.to_string().contains("OLD_SOURCE_VERSION"));assert!(view.to_string().contains("NEW_SOURCE_VERSION"));
+        let messages=view["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|m|m["name"]=="mundusx_confirmed_write_receipts"&&m["content"].as_str().unwrap().contains("write1")));
+        for result in messages.iter().filter(|m|m["role"]=="tool") {assert!(messages.iter().filter_map(|m|m["tool_calls"].as_array()).flatten().any(|c|c["id"]==result["tool_call_id"]));}
     }
     #[test]
     fn model_context_keeps_current_evidence_and_all_instructions_without_old_task_tools() {
