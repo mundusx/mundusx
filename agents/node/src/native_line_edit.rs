@@ -121,6 +121,13 @@ fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     }
     Some(target.clone())
 }
+/// An explicit single-file restriction survives completion of the first edit.
+/// An ordered first step alone is not a permanent restriction.
+pub fn explicit_edit_scope(p:&Value)->Option<String> {
+    let task=user_task(p)?.to_ascii_lowercase();
+    if !["edit only this file","edit only this test file","edit only the named file"].iter().any(|phrase|task.contains(phrase)) {return None;}
+    key(ordered_name(p)?)
+}
 fn ordered_read(p:&Value)->Option<Value> {
     let sources=snapshots(p);let target=ordered_target(p,&sources)?;
     // Small prefix reads of dependencies need the same EOF discipline as the
@@ -919,6 +926,9 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
     let source = sources
         .get(&key(path).ok_or_else(|| fail("filePath must be absolute"))?)
         .ok_or_else(|| fail("read this file from line 1 before editing"))?;
+    if explicit_edit_scope(p).is_some_and(|target|key(path).as_ref()!=Some(&target)) {
+        return Err(fail("this path is outside the user's explicit single-file edit scope; reading a dependency or completing the first edit does not expand that scope"));
+    }
     if ordered_target(p,&sources).or_else(||compiler_target(p,&sources).map(|(path,_)|path)).is_some_and(|target| key(path).as_ref() != Some(&target)) {
         return Err(fail("use the observed compiler target"));
     }

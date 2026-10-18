@@ -21,8 +21,21 @@ pub fn is_file_turn(payload: &Value) -> bool { catalog(payload).is_some() }
 
 pub fn task_constraints(payload:&Value,message:&Value)->Result<(),String> {
     let text=super::native_task_progress::task(payload).unwrap_or("").to_ascii_lowercase();
+    let edit_scope=super::native_line_edit::explicit_edit_scope(payload);
     let no_install=["do not install","don't install","without installing","without reinstalling","do not reinstall","don't reinstall","reuse installed"].iter().any(|s|text.contains(s));
     for call in message["tool_calls"].as_array().into_iter().flatten() {
+        if let Some(target)=&edit_scope {
+            if matches!(call["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file"|"multi_replace_string_in_file")) {
+                let a=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")).unwrap_or(Value::Null);
+                fn outside(value:&Value,target:&str)->bool {
+                    match value {
+                        Value::Object(fields)=>fields.iter().any(|(name,value)|if name=="filePath" {value.as_str().and_then(key).as_deref()!=Some(target)} else {outside(value,target)}),
+                        Value::Array(items)=>items.iter().any(|v|outside(v,target)),_=>false
+                    }
+                }
+                if outside(&a,target) {return Err("native task precondition failed: this edit is outside the user's explicit single-file scope. It was NOT executed. Completing an earlier edit or reading dependencies does not authorize changing them".into());}
+            }
+        }
         if call["function"]["name"]!="run_in_terminal" {continue;}
         let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         let Some(command)=a["command"].as_str() else {continue;};
@@ -728,6 +741,14 @@ mod tests {
     fn canonicalizing_a_single_path_does_not_invent_array_arguments() {
         let p=payload();let m=call("read_file",json!({"filePath":"d:/sample/main.js","startLine":1,"endLine":20}),"read_");
         let a=args(&canonical_paths(&p,&m));assert_eq!(a["filePath"],r"D:\sample\main.js");assert!(a.get("filePaths").is_none());
+    }
+    #[test]
+    fn explicit_single_file_scope_survives_prior_writes_and_covers_batch_edits() {
+        let mut p=payload();p["messages"][0]["content"]=json!("<userRequest>First repair the file: D:/app/test.rs. Edit only this file; inspect dependencies as needed.</userRequest>");
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":"D:/app/test.rs"}),"first_"),"Applied edit");
+        let allowed=call("replace_string_in_file",json!({"filePath":"d:\\app\\test.rs"}),"ok_");assert!(task_constraints(&p,&allowed).is_ok());
+        let forbidden=call("multi_replace_string_in_file",json!({"replacements":[{"filePath":"D:/app/test.rs"},{"filePath":"D:/app/src.rs"}]}),"bad_");assert!(task_constraints(&p,&forbidden).unwrap_err().contains("explicit single-file scope"));
+        p["messages"][0]["content"]=json!("<userRequest>First repair the file: D:/app/test.rs. Then fix the implementation.</userRequest>");assert!(task_constraints(&p,&forbidden).is_ok());
     }
     #[test]
     fn literal_inspection_executes_once_and_quotes_only_its_matched_output() {
