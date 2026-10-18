@@ -508,7 +508,7 @@ pub fn prepare(p: &Value) -> Value {
         out["tools"]=json!([]);out["tool_choice"]=json!("none");
         out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(false);
         out["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(false);
-        out["max_tokens"]=json!(p["max_tokens"].as_u64().unwrap_or(2048).min(2048));
+        out["max_tokens"]=json!(p["max_tokens"].as_u64().unwrap_or(4096).min(4096));
         out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal source-generation step for the user's explicitly requested complete replacement of {} ({} observed lines). All original host permissions and task constraints remain in force. Return ONLY the complete NEW source file, preferably under 100 lines and 5000 characters. Do not output tool-call markup, a plan, copied old headers, oldString, or a diff. The adapter retains the exact observed old file and will compile your source into the registered host replacement tool; this is not a final user answer and does not execute code. Implement real requested behavior and cleanup. Original user requirements:\n{}",source.path,source.text.lines().count(),user_task(p).unwrap_or(""))}));
         return out;
     }
@@ -779,7 +779,7 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
         lo = lo.saturating_sub(1);
         hi = (hi + 1).min(lines.len());
     };
-    if old.len() + new.len() > 16384 {
+    if old.len() + new.len() > if source_response_required(p) {32768} else {16384} {
         return Err(fail("compiled edit exceeds the bounded patch size"));
     }
     let mut out = message.clone();

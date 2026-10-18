@@ -2922,7 +2922,7 @@ fn run_native_openai_tool_turn(
         {
             return Err("native tool recovery returned no tool call".into());
         }
-        normalize_native_openai_tool_response(&value)
+        normalize_native_openai_tool_response_with_limit(&value,if native_line_edit::source_response_required(payload) {32768} else {16384})
     })
 }
 
@@ -3051,8 +3051,14 @@ fn complete_source_artifacts_become_host_edits_and_truncated_artifacts_never_lea
         if reason=="length" {assert!(result.unwrap_err().contains("replacement source exceeded"));assert_eq!(rx.try_iter().count(),0);} else {
             let result=result.unwrap();let envelope:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();let message=&envelope["message"];
             assert_eq!(message["tool_calls"][0]["function"]["name"],"replace_string_in_file");let a:serde_json::Value=serde_json::from_str(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(a["oldString"],"old source\n");assert_eq!(a["newString"],"fn main() {}\n");
-            for delta in rx.try_iter() {let delta:serde_json::Value=serde_json::from_str(&delta).unwrap();assert!(delta.get("content").is_none());}
+            let mut assembled=native_stream::NativeStream::default();for delta in rx.try_iter() {let delta:serde_json::Value=serde_json::from_str(&delta).unwrap();assert!(delta.get("content").is_none());assembled.push(&delta).unwrap();}assert_eq!(assembled.message()["tool_calls"],message["tool_calls"]);
         }
+    }
+    for (old_size,new_size,accepted) in [(10000,10000,true),(24000,12000,false)] {
+        let mut q=p.clone();q["messages"][2]["content"]=json!(format!("// {}\n","o".repeat(old_size)));
+        let chunk=json!({"choices":[{"delta":{"content":format!("// {}\n","n".repeat(new_size))},"finish_reason":"stop"}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
+        let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&q)));
+        if accepted {let s=result.unwrap();let envelope:serde_json::Value=serde_json::from_str(s.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();assert!(validate_native_tool_message(&envelope["message"],Some("tool_calls")).is_err());let mut assembled=native_stream::NativeStream::default();for d in rx.try_iter() {assembled.push(&serde_json::from_str(&d).unwrap()).unwrap();}assert_eq!(assembled.message()["tool_calls"],envelope["message"]["tool_calls"]);} else {assert!(result.is_err());assert_eq!(rx.try_iter().count(),0);}
     }
 }
 
@@ -3286,6 +3292,9 @@ fn validate_native_tool_message(
     message: &serde_json::Value,
     reason: Option<&str>,
 ) -> Result<(), String> {
+    validate_native_tool_message_with_limit(message,reason,16384)
+}
+fn validate_native_tool_message_with_limit(message:&serde_json::Value,reason:Option<&str>,argument_limit:usize)->Result<(),String> {
     if message["content"].as_str().is_none_or(|s|s.trim().is_empty())
         && message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()) {
         return Err(if reason==Some("length") {
@@ -3336,13 +3345,13 @@ fn validate_native_tool_message(
                 return Err("native tool arguments must be a JSON object".into());
             }
             let normalized_name = tool_name.to_ascii_lowercase();
-            if argument_chars > 16_384
+            if argument_chars > argument_limit
                 && ["edit", "replace", "patch"]
                     .iter()
                     .any(|operation| normalized_name.contains(operation))
             {
                 return Err(format!(
-                    "native edit tool arguments exceed safe patch size: tool={tool_name}; argument_chars={argument_chars}; limit=16384"
+                    "native edit tool arguments exceed safe patch size: tool={tool_name}; argument_chars={argument_chars}; limit={argument_limit}"
                 ));
             }
         }
@@ -3478,7 +3487,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
         workflow_changed=changed;
         if changed {
             pending_tools.clear();
-            if message["tool_calls"].is_array() { pending_tools.push(serde_json::json!({"tool_calls":message["tool_calls"]})); }
+            if let Some(calls)=message["tool_calls"].as_array() {let calls=calls.iter().enumerate().map(|(index,c)|{let mut c=c.clone();c["index"]=serde_json::json!(index);c}).collect::<Vec<_>>();pending_tools.push(serde_json::json!({"tool_calls":calls}));}
             reason=Some(if message["tool_calls"].is_array() {"tool_calls"} else {"stop"}.to_string());
         }
     }
@@ -3489,6 +3498,8 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     {
         return Err("native tool recovery returned no tool call".into());
     }
+    let argument_limit=if payload.is_some_and(native_line_edit::source_response_required) {32768} else {16384};
+    validate_native_tool_message_with_limit(&message,reason.as_deref(),argument_limit)?;
     if payload.is_some_and(native_tool_workflow::is_file_turn) {
         if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
             emit_stream_delta(&serde_json::json!({"content":content}).to_string());
@@ -3499,12 +3510,16 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     for delta in pending_tools {
         emit_stream_delta(&delta.to_string());
     }
-    normalize_native_openai_tool_response(
+    normalize_native_openai_tool_response_with_limit(
         &serde_json::json!({"choices":[{"message":message,"finish_reason":reason.unwrap()}]}),
+        argument_limit,
     )
 }
 
 fn normalize_native_openai_tool_response(value: &serde_json::Value) -> Result<String, String> {
+    normalize_native_openai_tool_response_with_limit(value,16384)
+}
+fn normalize_native_openai_tool_response_with_limit(value:&serde_json::Value,argument_limit:usize)->Result<String,String> {
     let message = value
         .pointer("/choices/0/message")
         .filter(|message| message.is_object())
@@ -3522,7 +3537,7 @@ fn normalize_native_openai_tool_response(value: &serde_json::Value) -> Result<St
                 "stop"
             }
         });
-    validate_native_tool_message(&message,Some(finish_reason))?;
+    validate_native_tool_message_with_limit(&message,Some(finish_reason),argument_limit)?;
     if finish_reason == "tool_calls"
         && !message
             .get("tool_calls")
