@@ -3249,6 +3249,9 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
+            if error.starts_with("native progress precondition failed: this exact source range") && native_tool_workflow::repair_pending(&payload) {
+                payload["mundusx_repair_from_observations"]=serde_json::json!(true);
+            }
             let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || (error.starts_with("native compilation verification required:")&&!native_tool_workflow::repair_pending(&payload));
             let schema_tool=error.strip_prefix("native tool schema precondition failed: ").and_then(|s|s.split_once('.').map(|p|p.0));
             let line_edit_recovery=schema_tool==Some("replace_string_in_file") && native_line_edit::prepare(&payload)["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|matches!(t["function"]["name"].as_str(),Some("replace_string_in_file"|"__mundusx_edit_observed_lines")) && t["function"]["parameters"]["properties"]["startLine"].is_object()));

@@ -613,6 +613,12 @@ pub fn prepare(p: &Value) -> Value {
         if out["chat_template_kwargs"]["opengpu_native_tool_guard"]==true {out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(true);}
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_failed_validation_repair_phase","content":"The last completed validation failed and no confirmed source edit followed it. Continue source inspection and repair the actual cause with the available file tools. Command execution is temporarily withheld for this repair phase to prevent rerunning the same failure; it becomes available automatically after a confirmed edit. Terminal execution is not globally forbidden. Preserve test expectations; do not invent a source change merely to unlock execution. Environment failures and explicit client-selected tools keep their normal path."}));
     }
+    if p["mundusx_repair_from_observations"]==true && super::native_tool_workflow::repair_pending(p)
+        && out["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|t["function"]["name"]==NAME)) {
+        out["tools"].as_array_mut().unwrap().retain(|t|t["function"]["name"]==NAME);
+        out["tool_choice"]=json!("required");
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_observed_repair_recovery","content":"The proposed duplicate inspection was rejected before execution. Current matched source observations are supplied below. This bounded correction step uses the observed-file edit planner to repair the actual failed check. Choose the file containing the cause, not necessarily the stack-frame symptom. Preserve the user requirements and test expectations. Do not repeat an unchanged statement or invent an edit merely to unlock execution. The normal catalog returns after this step."}));
+    }
     if let Some((_, line)) = &focus {
         out["tools"]
             .as_array_mut()
@@ -866,6 +872,16 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn duplicate_inspection_recovery_focuses_edits_only_during_actual_failed_validation() {
+        let mut p=payload("const faulty = 1;\n");p["mundusx_repair_from_observations"]=json!(true);
+        assert!(prepare(&p)["tools"].as_array().unwrap().len()>1);
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test main.js"}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"test1","content":"AssertionError: expected correct behavior\nCommand exited with code 1"})]);
+        let prepared=prepare(&p);assert_eq!(prepared["tools"].as_array().unwrap().len(),1);assert_eq!(prepared["tools"][0]["function"]["name"],NAME);
+        let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
     }
     #[test]
     fn stale_private_edit_returns_a_fresh_registered_read_before_any_mutation() {
