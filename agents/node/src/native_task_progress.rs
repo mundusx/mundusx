@@ -9,12 +9,19 @@ pub fn is_compaction_text(text:&str)->bool {
         && text.contains("Your task is to create a comprehensive, detailed summary of the entire conversation") && !text.contains("<userRequest>")
 }
 pub fn is_compaction(p:&Value)->bool {
-    p["messages"].as_array().and_then(|m|m.last()).is_some_and(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(is_compaction_text))
+    p["messages"].as_array().is_some_and(|messages|is_compaction_messages(messages))
+}
+fn is_compaction_messages(messages:&[Value])->bool {
+    let Some(last)=messages.last().filter(|m|m["role"]=="user").and_then(|m|m["content"].as_str()) else {return false;};
+    is_compaction_text(last)||(!last.contains("<userRequest>")&&last.trim_start().starts_with("Summarize the conversation history so far,")
+        &&last.contains("Structure your summary using the enhanced format provided in the system message.")
+        &&messages.iter().any(|m|m["role"]=="system"&&m["content"].as_str().is_some_and(|s|s.trim_start().starts_with("Your task is to create a comprehensive, detailed summary of the entire conversation")&&s.contains("This summary will be used to compact the conversation"))))
 }
 
 /// Only an exact continuation inherits the immediately preceding task. A new
 /// question or request always starts its own scope, even in the same chat.
 pub fn request_index(messages:&[Value])->Option<usize> {
+    if is_compaction_messages(messages) {return messages.len().checked_sub(1);}
     let mut latest=None;
     for (i,m) in messages.iter().enumerate().rev().filter(|(_,m)|m["role"]=="user") {
         if m["content"].as_str().is_some_and(is_compaction_text) {return Some(i);}
@@ -138,6 +145,13 @@ pub fn guidance(p:&Value)->Option<Value> {
 mod tests {
  use super::*;
  fn p()->Value {json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Fix and test this project</userRequest>"}]})}
+ #[test] fn manual_compaction_is_a_distinct_boundary_only_with_its_host_system_template() {
+    let mut p=p();p["messages"].as_array_mut().unwrap().insert(0,json!({"role":"system","content":"Your task is to create a comprehensive, detailed summary of the entire conversation. This summary will be used to compact the conversation."}));
+    p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"Summarize the conversation history so far, paying special attention to the most recent agent commands. Structure your summary using the enhanced format provided in the system message."}));
+    assert!(is_compaction(&p));assert_eq!(request_index(p["messages"].as_array().unwrap()),Some(2));assert!(task(&p).is_none());
+    let mut ordinary=p.clone();ordinary["messages"].as_array_mut().unwrap().remove(0);assert!(!is_compaction(&ordinary));
+    p["messages"][2]["content"]=json!("<userRequest>Summarize this project</userRequest>");assert!(!is_compaction(&p));
+ }
  fn call(name:&str,a:Value)->Value {json!({"role":"assistant","tool_calls":[{"id":format!("id{}",uuid::Uuid::new_v4()),"function":{"name":name,"arguments":a.to_string()}}]})}
  fn observe(p:&mut Value,c:Value,text:&str) {let id=c["tool_calls"][0]["id"].clone();p["messages"].as_array_mut().unwrap().extend([c,json!({"role":"tool","tool_call_id":id,"content":text})]);}
  #[test] fn compaction_never_inherits_the_previous_coding_action() {
