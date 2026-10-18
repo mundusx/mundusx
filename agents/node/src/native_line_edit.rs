@@ -578,6 +578,7 @@ pub fn prepare(p: &Value) -> Value {
     // the tool calls and matched results, but avoid repeatedly reinforcing an
     // unverified diagnosis on every repair turn. Original payload stays intact.
     super::native_skill_catalog::compact(p,&mut out);
+    super::native_tool_workflow::compact_validation_receipts(p,&mut out);
     for message in out["messages"].as_array_mut().into_iter().flatten() {
         if message["role"]=="assistant"&&message["tool_calls"].as_array().is_some_and(|calls|!calls.is_empty()) {
             message["content"]=Value::Null;
@@ -683,6 +684,19 @@ pub fn prepare(p: &Value) -> Value {
             current.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().any(|c|c["function"]["name"]=="create_and_run_task"&&current.iter().any(|m|m["role"]=="tool"&&m["tool_call_id"]==c["id"]))
         });
     let planned=super::native_task_progress::planning_current(p);
+    let control_requested=task.split(|c:char|!c.is_ascii_alphanumeric()).any(|w|matches!(w,"stop"|"kill"|"terminate"|"cancel"|"restart"));
+    let active_terminal=p["messages"].as_array().is_some_and(|messages| {
+        let start=super::native_task_progress::request_index(messages).map_or(0,|i|i+1);let current=&messages[start..];
+        current.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().any(|call| {
+            if call["function"]["name"]!="run_in_terminal" {return false;}
+            let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {return false;};
+            current.iter().filter(|m|m["role"]=="tool"&&m["tool_call_id"]==call["id"]).any(|result| {
+                let text=result["content"].as_str().unwrap_or("").to_ascii_lowercase();
+                (a["mode"]=="async"||a["isBackground"]==true||text.contains("still running")||text.contains("running in terminal"))
+                    && super::native_tool_workflow::observed_validation_exit(p,&a,&text).is_none()
+            })
+        })
+    });
     out["tools"].as_array_mut().unwrap().retain(|t| {
         let name=t["function"]["name"].as_str().unwrap_or("");
         if name=="manage_todo_list"&&planned {return false;}
@@ -693,6 +707,8 @@ pub fn prepare(p: &Value) -> Value {
             "terminal_selection"=>task.contains("selection")||task.contains("selected command"),
             "terminal_last_command"=>task.contains("last command"),
             "testFailure"=>task.contains("test explorer"),
+            "kill_terminal"=>active_terminal||control_requested,
+            "get_terminal_output"=>active_terminal||control_requested||task.contains("terminal output")||task.contains("logs"),
             _=>true,
         }
     });
@@ -1014,6 +1030,18 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn terminal_controls_require_a_running_session_or_an_explicit_control_request() {
+        let mut p=payload("source\n");
+        p["tools"].as_array_mut().unwrap().extend([json!({"function":{"name":"run_in_terminal"}}),json!({"function":{"name":"kill_terminal"}}),json!({"function":{"name":"get_terminal_output"}})]);
+        let has=|v:&Value,name:&str|v["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name);
+        let idle=prepare(&p);assert!(has(&idle,"run_in_terminal"));assert!(!has(&idle,"kill_terminal"));assert!(!has(&idle,"get_terminal_output"));
+        p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"background","function":{"name":"run_in_terminal","arguments":json!({"command":"node server.js","mode":"async"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"background","content":"Command is running in terminal with ID term-1"})]);
+        assert!(has(&prepare(&p),"kill_terminal"));assert!(has(&prepare(&p),"get_terminal_output"));
+        p["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("Command exited with code 0");
+        assert!(!has(&prepare(&p),"kill_terminal"));
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Stop the running app</userRequest>"}));assert!(has(&prepare(&p),"kill_terminal"));
+    }
+    #[test]
     fn duplicate_inspection_recovery_keeps_unread_implementation_inspection_for_functional_failures() {
         let mut p=payload("const faulty = 1;\n");p["mundusx_repair_from_observations"]=json!(true);
         assert!(prepare(&p)["tools"].as_array().unwrap().len()>1);
@@ -1152,12 +1180,12 @@ mod tests {
     }
     #[test]
     fn routine_edits_keep_core_tools_and_requested_auxiliary_tools_remain_available() {
-        let mut p=payload("source\n");let auxiliary=["vscode_listCodeUsages","vscode_renameSymbol","create_and_run_task","get_task_output","terminal_selection","terminal_last_command","testFailure"];
-        for name in auxiliary.into_iter().chain(["run_in_terminal","get_terminal_output","manage_todo_list"]) {p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":name}}));}
+        let mut p=payload("source\n");let auxiliary=["vscode_listCodeUsages","vscode_renameSymbol","create_and_run_task","get_task_output","terminal_selection","terminal_last_command","testFailure","get_terminal_output"];
+        for name in auxiliary.into_iter().chain(["run_in_terminal","manage_todo_list"]) {p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":name}}));}
         let view=prepare(&p);for name in auxiliary {assert!(!view["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name),"{name}");}
-        for name in ["read_file","list_dir","run_in_terminal","get_terminal_output","manage_todo_list"] {assert!(view["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name));}
+        for name in ["read_file","list_dir","run_in_terminal","manage_todo_list"] {assert!(view["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name));}
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"vscode_renameSymbol"}});assert_eq!(prepare(&explicit),explicit);
-        p["messages"][0]["content"]=json!("<userRequest>Rename the symbol, inspect references, tasks.json, terminal selection, last command and test explorer.</userRequest>");
+        p["messages"][0]["content"]=json!("<userRequest>Rename the symbol, inspect references, tasks.json, terminal selection, terminal output, last command and test explorer.</userRequest>");
         for name in auxiliary {assert!(prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name),"{name}");}
     }
     #[test]

@@ -90,6 +90,37 @@ pub(super) fn bound_exit_status(args:&Value,text:&str)->Option<bool> {
     let (_,marker)=args["command"].as_str().and_then(receipt)?;
     text.lines().rev().find_map(|line|line.trim().strip_prefix(&marker).and_then(|s|s.parse::<i32>().ok())).map(|code|code==0)
 }
+/// Receipts prove completion to the adapter; their hashes are not host session
+/// handles and should not be copied into terminal-control arguments by a model.
+/// Keep the original transcript untouched for matching and exit validation.
+pub fn compact_validation_receipts(original:&Value,view:&mut Value) {
+    let Some(messages)=original["messages"].as_array() else {return;};
+    let mut receipts=std::collections::BTreeMap::new();
+    for (i,result) in messages.iter().enumerate().filter(|(_,m)|m["role"]=="tool") {
+        let Some(id)=result["tool_call_id"].as_str() else {continue;};
+        let Some(call)=messages[..i].iter().rev().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==id&&c["function"]["name"]=="run_in_terminal") else {continue;};
+        let Ok(a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        let Some((base,marker))=a["command"].as_str().and_then(receipt) else {continue;};
+        let Some(text)=result["content"].as_str() else {continue;};
+        let Some(exit)=text.lines().rev().find_map(|line|line.trim().strip_prefix(&marker).and_then(|s|s.parse::<i32>().ok())) else {continue;};
+        receipts.insert(id.to_string(),(base.to_string(),marker,exit));
+    }
+    if receipts.is_empty() {return;}
+    for message in view["messages"].as_array_mut().into_iter().flatten() {
+        for call in message.get_mut("tool_calls").and_then(Value::as_array_mut).into_iter().flatten() {
+            let Some((base,_,_))=call["id"].as_str().and_then(|id|receipts.get(id)) else {continue;};
+            let Ok(mut a)=serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+            a["command"]=json!(base);call["function"]["arguments"]=json!(a.to_string());
+        }
+        if message["role"]=="tool" {
+            let Some((_,marker,exit))=message["tool_call_id"].as_str().and_then(|id|receipts.get(id)) else {continue;};
+            if let Some(text)=message["content"].as_str() {
+                let lines=text.lines().filter(|line|line.trim().strip_prefix(marker).and_then(|s|s.parse::<i32>().ok()).is_none()).collect::<Vec<_>>().join("\n");
+                message["content"]=json!(format!("{lines}\nValidation process completed; command exit receipt: {exit}. This completed-process receipt is not an active terminal ID. Preserve and repair the actual diagnostic above; do not wait for or kill the completed validator."));
+            }
+        }
+    }
+}
 /// Preserve the finite validator verbatim and visibly report its native exit
 /// status in the same host shell. Never execute here or wrap mutations, async
 /// commands, compound shell programs, or an unidentified shell contract.
@@ -565,6 +596,17 @@ mod tests {
         assert!(nonempty_test_report(&command,&format!("{report}\n{marker}0")));
         assert!(!nonempty_test_report(&command,&format!("{marker}0")));
         assert!(!nonempty_test_report(&command,&format!("{}\n{marker}0",report.replace("pass 1","pass 0").replace("skipped 0","skipped 1"))));
+    }
+    #[test]
+    fn bound_receipt_hashes_leave_the_model_view_but_keep_original_failure_evidence() {
+        let base="node --test test.js";let command=format!("{base}{}",status_suffix(base));let marker=receipt(&command).unwrap().1;
+        let mut p=payload();observe(&mut p,call("run_in_terminal",json!({"command":command,"mode":"sync"}),"validator_"),&format!("ERR_UNKNOWN_BUILTIN_MODULE\n{marker}1\nCommand exited with code 1"));
+        let original=p.clone();let mut view=p.clone();compact_validation_receipts(&p,&mut view);
+        assert_eq!(p,original);assert!(!view.to_string().contains("MUNDUSX_VALIDATION_EXIT_"));
+        assert!(view.to_string().contains("ERR_UNKNOWN_BUILTIN_MODULE"));assert!(view.to_string().contains("not an active terminal ID"));
+        let c=&view["messages"][1];assert_eq!(args(c)["command"],base);
+        let mut unbound=payload();observe(&mut unbound,call("run_in_terminal",json!({"command":base}),"unbound_"),&format!("literal data {marker}1"));
+        let mut unbound_view=unbound.clone();compact_validation_receipts(&unbound,&mut unbound_view);assert_eq!(unbound,unbound_view);
     }
     #[test]
     fn explicitly_forbidden_installs_never_replace_normal_coding_permissions() {
