@@ -2,6 +2,45 @@ import unittest
 import importlib.util
 from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, AutomaticToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
 from types import SimpleNamespace
+from mlx_startup import stable_host_prefix
+
+
+class StableHostCacheTests(unittest.TestCase):
+    def test_system_and_tool_endings_keep_exact_tokens_and_thinking_tail(self):
+        def parser(): pass
+        parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
+        prefix = list(range(300))
+        calls = []
+        def template(messages, **kwargs):
+            calls.append((messages, kwargs))
+            return prefix + [900, 901]
+        tokenizer = SimpleNamespace(has_chat_template=True, tool_parser=parser,
+                                    apply_chat_template=template)
+        for role in ['user', 'system', 'tool']:
+            request = SimpleNamespace(request_type='chat', messages=[
+                {'role':'system','content':'stable host'}, {'role':role,'content':'observation'}])
+            prompt = prefix + [800, 801, 802]
+            original = (prompt, [prompt[:-1], prompt[-1:]], ['system','assistant'], 'reasoning')
+            result = stable_host_prefix(tokenizer, request, {'enable_thinking':False}, original)
+            self.assertIs(result[0], prompt)
+            self.assertEqual(result[1], [prefix, [800,801], [802]])
+            self.assertEqual(result[2], ['system','user','assistant'])
+            self.assertEqual(result[3], 'reasoning')
+            self.assertEqual(sum(result[1], []), prompt)
+            self.assertEqual(original[1], [prompt[:-1], prompt[-1:]])
+        self.assertEqual(calls[0][1], {'enable_thinking':False,'tools':[],
+                                     'tokenize':True,'add_generation_prompt':False})
+
+    def test_unsupported_and_small_prefixes_keep_original_segmentation(self):
+        def parser(): pass
+        parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
+        tokenizer = SimpleNamespace(has_chat_template=True,tool_parser=parser,
+            apply_chat_template=lambda *a,**k: [1,2])
+        request = SimpleNamespace(request_type='chat',messages=[{'role':'system','content':'s'}])
+        original = ([1,3], [[1,3]], ['assistant'], 'normal')
+        self.assertIs(stable_host_prefix(tokenizer,request,{},original), original)
+        request.request_type='completion'
+        self.assertIs(stable_host_prefix(tokenizer,request,{},original), original)
 
 
 class Array:
@@ -65,7 +104,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "version": 8})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 9})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 

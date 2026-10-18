@@ -1340,7 +1340,8 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .and_then(|response| response.into_json::<serde_json::Value>().ok())
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 8))
+            && value.get("stable_host_prefix_cache").and_then(|v| v.as_bool()) == Some(true)
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 9))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
@@ -2061,7 +2062,7 @@ pub fn start_persistent_runtime(
                     // Reuse tool-turn prefixes; the startup wrapper enforces the
                     // shared byte budget reserved by mlx_context as well as this count.
                     "--prompt-cache-size",
-                    "2",
+                    "6",
                     "--host",
                     "127.0.0.1",
                     "--port",
