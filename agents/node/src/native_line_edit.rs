@@ -696,6 +696,7 @@ pub fn prepare(p: &Value) -> Value {
         }
         if ordered.is_some() {
             let source=&sources[ordered.as_ref().unwrap()];let count=source.text.lines().count();
+            out["tools"].as_array_mut().unwrap().retain(|t|matches!(t["function"]["name"].as_str(),Some(NAME|"read_file"|"list_dir"|"file_search"|"grep_search"|"get_errors")));
             if whole_replacement(p) {
                 // A complete replacement is generated from the requested
                 // behavior, not by copying the obsolete implementation.
@@ -1049,6 +1050,7 @@ mod tests {
             json!({"role":"tool","tool_call_id":"dep1","content":"module.exports = db;\n"})]);
         let prepared=prepare(&p);assert!(!source_response_required(&p));
         assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
+        assert!(!prepared["tools"].as_array().unwrap().iter().any(|t|matches!(t["function"]["name"].as_str(),Some("create_file"|"manage_todo_list"|"run_in_terminal"))));
         assert!(prepared["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("module.exports = db;"))));
         assert!(!prepared.to_string().contains("old test"));
         assert_eq!(p["messages"][2]["content"],"old test\nsecond line\n");
@@ -1068,6 +1070,8 @@ mod tests {
         p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string());
         assert!(preflight(&p).is_none());let prepared=prepare(&p);assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));assert_eq!(prepared["tool_choice"],"required");
         let compiled=compile(&p,&edit(1,2,"new source")).unwrap();assert_eq!(args(&compiled)["oldString"],"old source\nsecond line\n");
+        let mut applied=p.clone();applied["messages"].as_array_mut().unwrap().extend([compiled.clone(),json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"})]);
+        assert!(prepare(&applied)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="create_file"));
         let mut whole=p.clone();whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with the new implementation.</userRequest>");
         assert!(compile(&whole,&edit(1,1,"partial replacement")).unwrap_err().contains("complete observed file"));assert!(compile(&whole,&edit(1,2,"complete replacement")).is_ok());
         assert!(!source_response_required(&whole));
