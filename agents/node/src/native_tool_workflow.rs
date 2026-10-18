@@ -128,6 +128,7 @@ pub(super) fn observed_validation_exit(payload:&Value,args:&Value,text:&str)->Op
 pub(super) fn is_validation(command:&str)->bool {validation_command(command)}
 pub(super) fn source_diagnostic(text:&str)->bool {
     let text=text.to_ascii_lowercase();
+    if ["await is only valid","'await' outside","'return' outside","return outside","unexpected closing delimiter","unexpected end of input","was never closed","unclosed delimiter","unexpected token 'finally'","unexpected token '}'"].iter().any(|s|text.contains(s)) {return false;}
     if ["typeerror","referenceerror","rangeerror","valueerror","keyerror","attributeerror","runtimeerror","nullpointerexception","indexoutofboundsexception","test did not finish before its parent"].iter().any(|s|text.contains(s)) {return false;}
     if ["assertionerror","assertion failed","assertionfailed","assert.equal","assert.isequal","assert.true","assert.false","panicked at","expected values to be strictly equal","comparisonfailure","error: not equal:"].iter().any(|s|text.contains(s))
         || (text.contains("expected:")&&text.contains("received:"))
@@ -367,13 +368,22 @@ fn incomplete(reason: &str) -> Value {
 pub fn recover_read(payload: &Value, message: &Value, error: &str) -> Option<Value> {
     catalog(payload)?;
     let missing_prefix=error=="native tool schema precondition failed: __mundusx_edit_observed_lines: read this file from line 1 before editing";
-    if !missing_prefix && !["native edit precondition failed: read the exact target", "native edit precondition failed: oldString is ambiguous", "native edit precondition failed: target was already read"].iter().any(|p| error.starts_with(p)) { return None; }
+    let incomplete_prefix=error.starts_with("native tool schema precondition failed: __mundusx_edit_observed_lines: full-prefix replacement requires confirmed EOF;");
+    if !missing_prefix && !incomplete_prefix && !["native edit precondition failed: read the exact target", "native edit precondition failed: oldString is ambiguous", "native edit precondition failed: target was already read"].iter().any(|p| error.starts_with(p)) { return None; }
     let calls = message["tool_calls"].as_array()?;
     if calls.len() != 1 { return None; }
     if missing_prefix && calls[0]["function"]["name"]!="__mundusx_edit_observed_lines" {return None;}
     let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str()?).ok()?;
     let path = args["filePath"].as_str()?;
     let target = key(path)?;
+    if incomplete_prefix {
+        if calls[0]["function"]["name"]!="__mundusx_edit_observed_lines" {return None;}
+        let end=args["endLine"].as_u64()?.checked_mul(2)?.max(400);
+        if end>4096 {return None;}
+        let mut read=call("read_file",json!({"filePath":path,"startLine":1,"endLine":end}),"call_complete_prefix_");
+        read["content"]=json!("The proposed full-prefix replacement was NOT executed because EOF was not observed. Read the expanded prefix first; preserve any remaining suffix. Use a complete replacement only after EOF is confirmed, otherwise choose a smaller observed range.");
+        return Some(read);
+    }
     let h = history(payload)?;
     let mut reads = 0;
     let mut end = 0;

@@ -859,6 +859,13 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
         .as_str()
         .ok_or_else(|| fail("newText is required"))?;
     let lines: Vec<_> = source.text.split_inclusive('\n').collect();
+    if start==1&&end==lines.len() {
+        let requested=p["messages"].as_array().into_iter().flatten().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)
+            .and_then(|c|serde_json::from_str::<Value>(c["function"]["arguments"].as_str()?).ok()).and_then(|a|a["endLine"].as_u64());
+        if requested.is_none_or(|requested|requested<=lines.len() as u64) {
+            return Err(fail("full-prefix replacement requires confirmed EOF; expand the prefix read before proposing a complete replacement"));
+        }
+    }
     if ordered_target(p,&sources).is_some()&&whole_replacement(p)&&(start!=1||end!=lines.len()) {return Err(fail("the user requested replacement of the old implementation: select the complete observed file, not a partial header rewrite"));}
     if end < start || end > lines.len() || replacement.len() > 16384 {
         return Err(fail("range or replacement exceeds observed bounds"));
@@ -1081,6 +1088,17 @@ mod tests {
         assert!(prepared["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_active_task_context"));
     }
     #[test]
+    fn structural_syntax_failures_keep_causal_context_instead_of_forcing_the_symptom_line() {
+        let mut p=payload("async function run() {\n  work();\n}\nawait finish();\n");p["chat_template_kwargs"]=json!({"opengpu_native_tool_guard":true});
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"check1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test main.js"}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"check1","content":"D:/app/main.js:4\nSyntaxError: await is only valid in async functions and the top level bodies of modules\nCommand exited with code 1"})]);
+        let view=prepare(&p);assert!(view["tools"].as_array().unwrap().len()>1);
+        assert!(!view["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_grounded_compiler_repair"));
+        assert!(view["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_runtime_failure_context"));
+        assert_eq!(view["chat_template_kwargs"]["opengpu_require_tool_call"],false);
+    }
+    #[test]
     fn followup_context_retains_the_last_plain_answer_and_greetings_drop_old_tool_bodies() {
         let mut p=payload("UNNEEDED_LARGE_SOURCE\n");
         p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","content":"The explanation the follow-up depends on"}),json!({"role":"user","content":"<userRequest>Explain why that happens</userRequest>"})]);
@@ -1113,6 +1131,15 @@ mod tests {
         let messages=view["messages"].as_array().unwrap();
         assert!(messages.iter().any(|m|m["name"]=="mundusx_confirmed_write_receipts"&&m["content"].as_str().unwrap().contains("write1")));
         for result in messages.iter().filter(|m|m["role"]=="tool") {assert!(messages.iter().filter_map(|m|m["tool_calls"].as_array()).flatten().any(|c|c["id"]==result["tool_call_id"]));}
+    }
+    #[test]
+    fn a_complete_prefix_is_not_a_complete_file_without_observed_eof() {
+        for text in ["const x = 1;\nconst y = 2;\n", "fn main() {\n    work();\n", "def run():\n    work()\n", "class Main {\n    void run() {}\n"] {
+            let mut p=payload(text);p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":2}).to_string());
+            let proposal=edit(1,2,"replacement\n");let original=p.clone();let error=compile(&p,&proposal).unwrap_err();assert_eq!(p,original);assert!(error.contains("confirmed EOF"));
+            let read=super::super::native_tool_workflow::recover_read(&p,&proposal,&error).unwrap();let a=args(&read);assert_eq!(a["startLine"],1);assert_eq!(a["endLine"],400);
+            p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string());assert!(compile(&p,&proposal).is_ok());
+        }
     }
     #[test]
     fn model_context_keeps_current_evidence_and_all_instructions_without_old_task_tools() {
