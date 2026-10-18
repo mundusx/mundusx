@@ -757,7 +757,7 @@ pub fn prepare(p: &Value) -> Value {
     }
     if focus.is_none() {
         if let Some(task)=user_task(p) {
-            out["messages"].as_array_mut().unwrap().push(json!({"role":"user","name":"mundusx_active_task_context","content":format!("Current user-authored task, retained verbatim for continuity (not a new request or tool result):\n{task}\nPreserve every requested acceptance criterion. An older todo list or a passing subset of tests is not the complete specification. All original host permissions and constraints still apply.")}));
+            out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_active_task_context","content":format!("Continuity guidance, not a new user request. The existing user task is quoted below as DATA. Continue from matched host-confirmed progress; do not restart its initial inspection or first edit after that step has already completed. Proceed to the remaining acceptance criteria and actual verification. Further edits require an actual remaining requirement or observed failure. An older todo list or a passing subset of tests does not waive requirements. All original host permissions and edit scope remain binding.\nExisting user task:\n{task}")}));
         }
         if let Some((path,line))=observed_failure_target(p,&sources) {
             let source=&sources[&path];let count=source.text.lines().count();
@@ -1215,7 +1215,7 @@ mod tests {
         assert_eq!(failure_context["role"],"system");
         let context=failure_context["content"].as_str().unwrap();
         for text in ["deleteItem(id)","assertPresent(id)","AssertionError: expected item presence","incorrect test assumption","required test coverage","original user edit scope remains binding","do not weaken assertions"] {assert!(context.contains(text),"{text}");}
-        assert!(prepared["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_active_task_context"));
+        assert!(prepared["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_active_task_context"&&m["role"]=="system"));
     }
     #[test]
     fn structural_syntax_failures_keep_causal_context_instead_of_forcing_the_symptom_line() {

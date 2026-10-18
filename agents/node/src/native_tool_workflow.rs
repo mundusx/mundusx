@@ -374,11 +374,27 @@ pub fn requested_validator_after_edit(payload:&Value)->Option<Value> {
     let lower=task.to_ascii_lowercase();
     if ["wait for","after approval","if i approve","unless"].iter().any(|s|lower.contains(s)) {return None;}
     let mut command=None;
-    for sentence in task.split(['\n']).flat_map(|line|line.split(". ")) {
+    for sentence in task.split(['\n']).flat_map(|line| {
+        let mut sentences=Vec::new();let mut start=0;
+        for (index,_) in line.match_indices(". ") {
+            // Go's recursive package pattern ends in ...; it is not a
+            // sentence boundary and must reach the host byte-for-byte.
+            if index>0&&line.as_bytes()[index-1]==b'.' {continue;}
+            sentences.push(&line[start..index]);start=index+2;
+        }
+        sentences.push(&line[start..]);sentences
+    }) {
         let sentence=sentence.trim();let lower=sentence.to_ascii_lowercase();
-        let Some(prefix)=["run `","then run `","finally run `","please run `"].iter().find(|p|lower.starts_with(**p)) else {continue;};
+        let Some(prefix)=["run ","then run ","finally run ","please run "].iter().find(|p|lower.starts_with(**p)) else {continue;};
         if lower.contains("only after") {return None;}
-        let candidate=sentence[prefix.len()..].split_once('`')?.0;
+        let rest=sentence[prefix.len()..].trim();
+        let candidate=if let Some(quoted)=rest.strip_prefix('`') {
+            quoted.split_once('`')?.0
+        } else {
+            // Ordinary chat does not require Markdown quoting. Accept only a
+            // conservative literal command before a natural-language suffix.
+            rest.split(", ").next()?.split(" and ").next()?.split(" then ").next()?.trim()
+        };
         if candidate.len()>512||candidate.contains([';','|','&','\n','\r','$','`','<','>'])||!validation_command(candidate) {return None;}
         let words=candidate.split_whitespace().collect::<Vec<_>>();
         if words.iter().any(|w|matches!(*w,"--watch"|"-w"|"--loop")) {return None;}
@@ -689,6 +705,10 @@ mod tests {
             assert!(requested_validator_after_edit(&p).is_none());
             observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"write_"),"Applied edit");
             let check=requested_validator_after_edit(&p).unwrap();let a=args(&check);assert_eq!(a["command"],command);assert_eq!(a["mode"],"sync");assert!(a["goal"].is_string()&&a["explanation"].is_string());
+            for task in [format!("Implement the feature. Run {command}, repair actual failures."),format!("Implement the feature. Then run {command} and report the real result.")] {
+                let mut ordinary=p.clone();ordinary["messages"][0]["content"]=json!(format!("<userRequest>{task}</userRequest>"));
+                assert_eq!(args(&requested_validator_after_edit(&ordinary).unwrap())["command"],command);
+            }
             observe(&mut p,check,"Command exited with code 1");assert!(requested_validator_after_edit(&p).is_none());
             observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"repair_"),"Applied edit");assert!(requested_validator_after_edit(&p).is_some());
             for task in [format!("Explain `{command}`"),format!("Do not run `{command}`"),format!("Run `{command}` only after I approve"),format!("Run `{command}; echo x`"),format!("Run `{command} --watch`"),format!("Run `{command}`. Then run `cargo test`")] {
