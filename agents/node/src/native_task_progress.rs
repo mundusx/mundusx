@@ -49,7 +49,7 @@ fn path(s:&str)->String {
 fn ok(s:&str)->bool {
     !s.trim().is_empty()&&!['\0'].iter().any(|c|s.contains(*c))&&!["error","failed","tool execution failed","string replacement failed"].iter().any(|v|s.trim_start().to_ascii_lowercase().starts_with(v))
 }
-struct Read {start:u64,end:u64,requested_end:u64,eof:bool,id:String,digest:String}
+struct Read {start:u64,end:u64,requested_end:u64,eof:bool,id:String,digest:String,text:String}
 #[derive(Default)]
 struct Progress {reads:BTreeMap<String,Vec<Read>>,check:Option<(String,String,bool)>,check_explicit:bool,writes:usize,plan:Option<String>}
 fn progress(p:&Value)->Progress {
@@ -71,7 +71,7 @@ fn progress(p:&Value)->Progress {
                 if start==0||end<start||(start!=1&&text.lines().count() as u64!=end-start+1)||text.contains("omitted")||text.contains("truncated")||["```","<file>","File:"].iter().any(|s|text.starts_with(s)) {continue;}
                 let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
                 let eof=start==1&&(text.lines().count() as u64)<end;
-                state.reads.entry(k).or_default().push(Read{start,end:if eof{text.lines().count() as u64}else{end},requested_end:end,eof,id:id.into(),digest:digest[..12].into()});
+                state.reads.entry(k).or_default().push(Read{start,end:if eof{text.lines().count() as u64}else{end},requested_end:end,eof,id:id.into(),digest:digest[..12].into(),text:text.into()});
             },
             "create_file"|"replace_string_in_file"|"insert_edit_into_file"|"multi_replace_string_in_file"=>{
                 // A host rejection can mean the user changed the file after
@@ -99,6 +99,13 @@ fn progress(p:&Value)->Progress {
     }state
 }
 
+fn range_digest(read:&Read,start:u64,end:u64)->String {
+    let skip=start.saturating_sub(read.start) as usize;
+    let count=if start>read.end {0} else {end.min(read.end).saturating_sub(start).saturating_add(1) as usize};
+    let text=read.text.split_inclusive('\n').skip(skip).take(count).collect::<String>();
+    format!("{:x}",Sha256::digest(text.as_bytes()))
+}
+
 pub fn guard(p:&Value,message:&Value)->Result<(),String> {
     if !super::native_tool_workflow::is_file_turn(p) {return Ok(());}
     let s=progress(p);
@@ -109,7 +116,10 @@ pub fn guard(p:&Value,message:&Value)->Result<(),String> {
             if let Some(rs)=s.reads.get(&path(file)) {
                 let covered=rs.iter().filter(|r|start>=r.start&&(end<=r.end||r.eof)).collect::<Vec<_>>();
                 if let Some(r)=covered.last() {
-                    let unchanged=covered.iter().rev().take_while(|old|old.digest==r.digest).count();
+                    // Different enclosing ranges have different whole-output
+                    // hashes even when these requested bytes are unchanged.
+                    let current=range_digest(r,start,end);
+                    let unchanged=covered.iter().rev().take_while(|old|range_digest(old,start,end)==current).count();
                     // One real refresh is cheaper and more useful than a fatal
                     // correction round, and can observe external user edits.
                     // A growing read past known EOF is never useful.
@@ -169,6 +179,14 @@ mod tests {
   let mut p=p();let read=call("read_file",json!({"filePath":"/app/main.js","startLine":1,"endLine":2}));
   observe(&mut p,read.clone(),"old\nsource\n");observe(&mut p,read.clone(),"new\nsource\n");assert!(guard(&p,&read).is_ok());
   observe(&mut p,read.clone(),"new\nsource\n");assert!(guard(&p,&read).is_err());
+ }
+ #[test] fn nested_covered_ranges_share_the_same_unchanged_refresh_allowance() {
+  let mut p=p();let lines=(1..=150).map(|i|format!("source line {i}\n")).collect::<Vec<_>>();
+  observe(&mut p,call("read_file",json!({"filePath":"/app/model.js","startLine":50,"endLine":100})),&lines[49..100].concat());
+  let narrow=call("read_file",json!({"filePath":"/app/model.js","startLine":80,"endLine":100}));assert!(guard(&p,&narrow).is_ok());
+  observe(&mut p,narrow,&lines[79..100].concat());
+  assert!(guard(&p,&call("read_file",json!({"filePath":"/app/model.js","startLine":90,"endLine":100}))).is_err());
+  assert!(guard(&p,&call("read_file",json!({"filePath":"/app/model.js","startLine":101,"endLine":150}))).is_ok());
  }
  #[test] fn validation_is_not_replayed_without_changes_and_unknown_output_stays_inspectable() {
   for result in ["Command exited with code 0","Command exited with code 1"] {

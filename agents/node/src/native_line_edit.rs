@@ -122,11 +122,20 @@ fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     Some(target.clone())
 }
 fn ordered_read(p:&Value)->Option<Value> {
-    let sources=snapshots(p);let target=ordered_target(p,&sources)?;let source=&sources[&target];
-    let c=p["messages"].as_array()?.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)?;
-    let a:Value=serde_json::from_str(c["function"]["arguments"].as_str()?).ok()?;let end=a["endLine"].as_u64()?;
-    if (source.text.lines().count() as u64)<end||end>=1024 {return None;}
-    Some(json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_ordered_read_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":"read_file","arguments":json!({"filePath":source.path,"startLine":1,"endLine":(end*2).max(400).min(1024)}).to_string()}}]}))
+    let sources=snapshots(p);let target=ordered_target(p,&sources)?;
+    // Small prefix reads of dependencies need the same EOF discipline as the
+    // edit target. Expand a matched incomplete prefix directly instead of
+    // paying inference rounds for overlapping tails with no stable bounds.
+    for source in std::iter::once(&sources[&target]).chain(sources.iter().filter(|(path,_)|*path!=&target).map(|(_,source)|source)) {
+        let c=p["messages"].as_array()?.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)?;
+        let a:Value=serde_json::from_str(c["function"]["arguments"].as_str()?).ok()?;let end=a["endLine"].as_u64()?;
+        if (source.text.lines().count() as u64)<end||end>=1024 {continue;}
+        let schema=p["tools"].as_array()?.iter().find(|t|t["function"]["name"]=="read_file")?;
+        let maximum=schema["function"]["parameters"]["properties"]["endLine"]["maximum"].as_u64().unwrap_or(1024).min(1024);
+        let expanded=(end*2).max(400).min(maximum);if expanded<=end {continue;}
+        return Some(json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_ordered_read_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":"read_file","arguments":json!({"filePath":source.path,"startLine":1,"endLine":expanded}).to_string()}}]}));
+    }
+    None
 }
 // An explicitly named first edit can reuse an earlier observed path, while
 // obtaining fresh bytes for this request. Never reuse the old source itself.
@@ -1070,6 +1079,19 @@ mod tests {
         let mut wrong=edit(1,1,"unrelated mutation");wrong["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/db.js","startLine":1,"endLine":1,"newText":"unrelated mutation"}).to_string());
         assert!(compile(&p,&wrong).unwrap_err().contains("target"));
         assert!(compile(&p,&edit(1,2,"const db = require('./db.js');")).is_ok());
+    }
+    #[test]
+    fn first_edit_expands_a_matched_dependency_prefix_without_mutating_the_request() {
+        let mut p=payload("complete target\n");
+        p["messages"][0]["content"]=json!("<userRequest>First replace the test file: main.js. Replace the entire file using the actual related exports.</userRequest>");
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"dependency","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/model.js","startLine":1,"endLine":50}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"dependency","content":"source line\n".repeat(50)})]);
+        let original=p.clone();let read=preflight(&p).unwrap();assert_eq!(p,original);
+        assert_eq!(args(&read),json!({"filePath":"D:/app/model.js","startLine":1,"endLine":400}));
+        let id=read["tool_calls"][0]["id"].clone();
+        p["messages"].as_array_mut().unwrap().extend([read,json!({"role":"tool","tool_call_id":id,"content":"source line\n".repeat(136)})]);
+        assert!(preflight(&p).is_none());
     }
     #[test]
     fn explicit_first_edit_expands_partial_reads_then_preserves_dependency_reads() {
