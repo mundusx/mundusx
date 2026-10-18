@@ -283,6 +283,11 @@ fn validation_command(command:&str)->bool {
 /// Repeated inspection without a write or diagnostics is not progress. Return
 /// actual host errors once, then stop rather than rereading indefinitely.
 pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
+    // A failed real validator already supplies actionable evidence. Editor
+    // diagnostics cannot explain a runtime assertion, and the request-wide
+    // inspection count includes earlier attempts. Per-range progress guards
+    // still bound repeated reads during this repair phase.
+    if repair_pending(payload) {return None;}
     let tools=catalog(payload)?;
     tools.iter().find(|t|t["function"]["name"]=="get_errors")?;
     let calls=message["tool_calls"].as_array()?;
@@ -527,6 +532,16 @@ mod tests {
         observe(&mut p,check,"<compileError>Syntax error</compileError>");
         for _ in 0..8 {observe(&mut p,read.clone(),"source");}
         assert!(inspection_progress(&p,&read).unwrap()["content"].as_str().unwrap().contains("Verification incomplete"));
+    }
+    #[test]
+    fn runtime_repairs_do_not_replace_needed_inspection_with_editor_diagnostics() {
+        let mut p=payload();
+        observe(&mut p,call("run_in_terminal",json!({"command":"node --test test.js"}),"test_"),"AssertionError: missing item\nCommand exited with code 1");
+        for i in 0..9 {observe(&mut p,call("read_file",json!({"filePath":format!("/src/file{i}.js"),"startLine":1,"endLine":20}),"read_"),"source\n");}
+        observe(&mut p,call("get_errors",json!({"filePaths":["/src/test.js"]}),"editor_"),"No errors found");
+        let read=call("read_file",json!({"filePath":"/src/model.js","startLine":51,"endLine":100}),"needed_");
+        assert!(repair_pending(&p));assert!(inspection_progress(&p,&read).is_none());
+        assert!(compilation(&p,&json!({"content":"Done"})).is_ok()); // no source writes claimed in this fixture
     }
     #[test]
     fn model_diagnostics_cannot_reset_an_inspection_loop_without_a_write() {
