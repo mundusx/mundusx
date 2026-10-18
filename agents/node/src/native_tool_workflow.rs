@@ -405,8 +405,14 @@ pub fn inspection_progress(payload:&Value,message:&Value)->Option<Value> {
             }
         }
     }
+    // A new file or genuinely missing range is progress, even after editor
+    // diagnostics. The per-range guard separately rejects exhausted refreshes.
+    // Keep an overall bound without stopping normal dependency discovery at
+    // eight reads (server, DB, routes, controller and model can exceed that).
+    if calls[0]["function"]["name"]=="read_file" && reads<64
+        && super::native_task_progress::guard(payload,message).is_ok() {return None;}
     if reads<8 || paths.is_empty() {return None;}
-    if rounds>=1 {return Some(incomplete("inspection repeated without repairs after actionable host diagnostics."));}
+    if rounds>=1 {return Some(incomplete("inspection budget exhausted without a source change; editor diagnostics alone do not establish completion."));}
     Some(call("get_errors",json!({"filePaths":paths.into_values().take(32).collect::<Vec<_>>()}),"call_verify_progress_"))
 }
 
@@ -694,6 +700,19 @@ mod tests {
         let read=call("read_file",json!({"filePath":"/src/model.js","startLine":51,"endLine":100}),"needed_");
         assert!(repair_pending(&p));assert!(inspection_progress(&p,&read).is_none());
         assert!(compilation(&p,&json!({"content":"Done"})).is_ok()); // no source writes claimed in this fixture
+    }
+    #[test]
+    fn new_dependencies_and_missing_ranges_are_progress_after_clean_diagnostics() {
+        let mut p=payload();
+        for i in 0..9 {
+            observe(&mut p,call("read_file",json!({"filePath":format!("/src/file{i}.js"),"startLine":1,"endLine":20}),"dependency_"),&"source\n".repeat(20));
+        }
+        observe(&mut p,call("get_errors",json!({"filePaths":["/src/file8.js"]}),"editor_"),"No errors found");
+        for a in [json!({"filePath":"/src/model.js","startLine":1,"endLine":100}),json!({"filePath":"/src/file8.js","startLine":1,"endLine":40})] {
+            let read=call("read_file",a,"next_");
+            assert!(super::super::native_task_progress::guard(&p,&read).is_ok());
+            assert!(inspection_progress(&p,&read).is_none());
+        }
     }
     #[test]
     fn model_diagnostics_cannot_reset_an_inspection_loop_without_a_write() {
