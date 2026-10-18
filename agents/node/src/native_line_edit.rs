@@ -163,11 +163,9 @@ fn key(path: &str) -> Option<String> {
     })
 }
 fn compiler_target(p: &Value, sources: &BTreeMap<String, Snapshot>) -> Option<(String, usize)> {
-    let mut failure = super::native_tool_workflow::compiler_failure(p)?.replace('\\', "/");
+    let failure = super::native_tool_workflow::compiler_failure(p)?;
     if !super::native_tool_workflow::source_diagnostic(&failure) {return None;}
-    while failure.contains("//") {
-        failure = failure.replace("//", "/");
-    }
+    let failure=super::native_tool_workflow::diagnostic_paths(&failure);
     for (k, s) in sources {
         let failure = if k.as_bytes().get(1) == Some(&b':') {
             failure.to_ascii_lowercase()
@@ -213,11 +211,9 @@ pub fn preflight(p: &Value) -> Option<Value> {
         return None;
     }
     if let Some(read)=ordered_read(p).or_else(||first_target_read(p)) {return Some(read);}
-    let mut failure = super::native_tool_workflow::compiler_failure(p)?.replace('\\', "/");
-    if !super::native_tool_workflow::source_diagnostic(&failure) {return None;}
-    while failure.contains("//") {
-        failure = failure.replace("//", "/");
-    }
+    // Runtime frames can justify a fresh read, but only positive compiler
+    // evidence in compiler_target can force a line edit.
+    let failure=super::native_tool_workflow::diagnostic_paths(&super::native_tool_workflow::compiler_failure(p)?);
     let messages = p["messages"].as_array()?;
     let start = super::native_task_progress::request_index(messages)
         .map_or(0, |i| i + 1);
@@ -1032,6 +1028,7 @@ mod tests {
     fn observed_compiler_locations_focus_only_the_grounded_line_planner() {
         for diagnostic in [
             "D:\\app\\main.js:2\nSyntaxError",
+            "file:///D:/app/main.js:2\nSyntaxError: Named export is not available",
             " --> D:/app/main.js:2:5\nerror",
             "File \"D:/app/main.js\", line 2\nSyntaxError",
             "D:/app/main.js(2,5): error",
@@ -1110,6 +1107,17 @@ mod tests {
         p["messages"].as_array_mut().unwrap().push(read.clone());
         p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":read["tool_calls"][0]["id"],"content":"```unsupported host wrapper```"}));
         assert!(preflight(&p).is_none());
+    }
+    #[test]
+    fn runtime_file_uri_frames_refresh_known_source_without_forcing_a_symptom_edit() {
+        let mut p=payload("old source\n");
+        p["tools"][0]["function"]["parameters"]=json!({"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","maximum":400}},"required":["filePath","startLine","endLine"]});
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"write1","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/app/main.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"write1","content":"Applied edit"}),
+            json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test test.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"test1","content":"ReferenceError: initialization missing\n    at file:///D:/app/main.js:2:3\nCommand exited with code 1"})]);
+        let read=preflight(&p).unwrap();assert_eq!(args(&read)["filePath"],"D:/app/main.js");assert_eq!(args(&read)["startLine"],1);
+        let id=read["tool_calls"][0]["id"].clone();p["messages"].as_array_mut().unwrap().extend([read,json!({"role":"tool","tool_call_id":id,"content":"first\nsecond\n"})]);
+        assert!(preflight(&p).is_none());assert!(compiler_target(&p,&snapshots(&p)).is_none());assert!(prepare(&p)["tools"].as_array().unwrap().len()>1);
     }
     #[test]
     fn full_read_transport_and_large_duplicate_blocks_keep_edits_grounded() {

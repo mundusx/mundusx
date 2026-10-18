@@ -157,6 +157,36 @@ pub fn compiler_failure(payload:&Value)->Option<String> {
     None
 }
 
+pub(super) fn diagnostic_paths(text:&str)->String {
+    let delimiter=|c:char|c.is_whitespace()||matches!(c,'\''|'"'|'('|')'|'<'|'>');
+    let mut result=String::new();
+    for segment in text.split_inclusive(delimiter) {
+        let word=segment.trim_end_matches(delimiter);
+        let decoded=(|| {
+            let start=word.to_ascii_lowercase().find("file://")?;
+            // The URL parser can canonicalize a drive-letter file URI by
+            // discarding its authority. Reject foreign hosts before parsing.
+            let authority=word[start+7..].split('/').next()?;
+            if !authority.is_empty()&&!authority.eq_ignore_ascii_case("localhost") {return None;}
+            let uri=url::Url::parse(&word[start..]).ok()?;
+            if uri.scheme()!="file"||uri.host_str().is_some_and(|host|host!="localhost") {return None;}
+            let bytes=uri.path().as_bytes();let mut output=Vec::new();let mut i=0;
+            while i<bytes.len() {
+                if bytes[i]==b'%' {
+                    let high=char::from(*bytes.get(i+1)?).to_digit(16)?;
+                    let low=char::from(*bytes.get(i+2)?).to_digit(16)?;
+                    output.push((high*16+low) as u8);i+=3;
+                } else {output.push(bytes[i]);i+=1;}
+            }
+            let mut path=String::from_utf8(output).ok()?;
+            if path.starts_with('/')&&path.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic)&&path.as_bytes().get(2)==Some(&b':') {path.remove(0);}
+            Some(format!("{}{path}{}",&word[..start],&segment[word.len()..]))
+        })();
+        result.push_str(decoded.as_deref().unwrap_or(segment));
+    }
+    let mut result=result.replace('\\',"/");while result.contains("//") {result=result.replace("//","/");}result
+}
+
 pub fn repair_pending(payload:&Value)->bool {
     compiler_failure(payload).is_some_and(|text| {
         let text=text.to_ascii_lowercase();
@@ -181,7 +211,7 @@ pub fn validator_after_edit(payload:&Value)->Option<Value> {
     if write_index<=check_index||exit!=Some(false)||args["mode"]!="sync" {return None;}
     let command=args["command"].as_str()?;
     if command.contains([';','|','&','\n','\r','$','`','<','>']) {return None;}
-    let mut diagnostic=result.replace('\\',"/");while diagnostic.contains("//") {diagnostic=diagnostic.replace("//","/");}
+    let mut diagnostic=diagnostic_paths(&result);
     if path.as_bytes().get(1)==Some(&b':') {diagnostic=diagnostic.to_ascii_lowercase();}
     if !diagnostic.contains(&format!("{path}:"))&&!diagnostic.contains(&format!("{path}("))&&!diagnostic.contains(&format!("\"{path}\", line ")) {return None;}
     Some(call("run_in_terminal",args,"call_recheck_observed_"))
@@ -558,6 +588,14 @@ mod tests {
         }
         p["messages"][0]["content"]=json!("<userRequest>Stop all node.exe processes</userRequest>");
         assert!(task_constraints(&p,&call("run_in_terminal",json!({"command":"taskkill /F /IM node.exe"}),"kill_")).is_ok());
+    }
+    #[test]
+    fn file_uri_diagnostics_are_cross_platform_and_preserve_encoded_path_characters() {
+        for (input,expected) in [("file:///D:/app/test.js:6:3","D:/app/test.js:6:3"),("at (file:///D:/my%20project/%E5%AD%A6%E7%94%9F+test.js:2:4)","at (D:/my project/学生+test.js:2:4)"),("file:///app/test.js:6","/app/test.js:6"),("file://localhost/D:/app/test.js:6","D:/app/test.js:6")] {assert_eq!(diagnostic_paths(input),expected);}
+        assert!(!diagnostic_paths("file://untrusted-host/D:/app/test.js:6").starts_with("D:/"));
+        let mut p=payload();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));let a=json!({"command":"node --test /src/main.js","mode":"sync"});
+        observe(&mut p,call("run_in_terminal",a.clone(),"check_"),"file:///src/main.js:6\nSyntaxError\nCommand exited with code 1");
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"write_"),"Applied edit");assert_eq!(args(&validator_after_edit(&p).unwrap()),a);
     }
     #[test]
     fn observed_validator_rechecks_after_same_file_edits_without_replaying_mutations() {
