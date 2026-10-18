@@ -552,6 +552,7 @@ pub fn prepare(p: &Value) -> Value {
     // Earlier preambles are model hypotheses, not host observations. Keep
     // the tool calls and matched results, but avoid repeatedly reinforcing an
     // unverified diagnosis on every repair turn. Original payload stays intact.
+    super::native_skill_catalog::compact(p,&mut out);
     for message in out["messages"].as_array_mut().into_iter().flatten() {
         if message["role"]=="assistant"&&message["tool_calls"].as_array().is_some_and(|calls|!calls.is_empty()) {
             message["content"]=Value::Null;

@@ -10,6 +10,8 @@ mod native_terminal_report;
 mod native_http_bridge;
 #[path = "native_line_edit.rs"]
 mod native_line_edit;
+#[path = "native_skill_catalog.rs"]
+mod native_skill_catalog;
 #[path = "native_task_progress.rs"]
 mod native_task_progress;
 use crate::contracts::{
