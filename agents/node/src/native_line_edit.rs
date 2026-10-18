@@ -54,7 +54,7 @@ fn whole_replacement(p:&Value)->bool {
     ["replace that test implementation","replace the entire file","replace the whole file","replace this file entirely"].iter().any(|s|text.contains(s))
 }
 fn whole_source(p:&Value)->Option<(String,Snapshot)> {
-    if !compatible(p)||!whole_replacement(p) {return None;}
+    if p["mundusx_source_artifact_step"]!=true||!compatible(p)||!whole_replacement(p) {return None;}
     let mut sources=snapshots(p);let target=ordered_target(p,&sources)?;let source=sources.remove(&target)?;
     if ["md","txt","rst","json","yaml","yml","xml","csv","toml"].iter().any(|ext|source.path.to_ascii_lowercase().ends_with(&format!(".{ext}"))) {return None;}
     let call=p["messages"].as_array()?.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)?;
@@ -548,9 +548,9 @@ pub fn prepare(p: &Value) -> Value {
             .and_then(|c|serde_json::from_str::<Value>(c["function"]["arguments"].as_str()?).ok()).and_then(|a|a["endLine"].as_u64()).is_some_and(|end|(source.text.lines().count() as u64)<end)
     });
     let focus = ordered.clone().map(|path|(path,1)).or_else(||compiler_target(p, &sources));
-    if let Some((path, _)) = &focus {
+    if ordered.is_none() {if let Some((path, _)) = &focus {
         sources.retain(|k, _| k == path);
-    }
+    }}
     out["tools"].as_array_mut().unwrap().retain(|t| {
         !matches!(
             t["function"]["name"].as_str(),
@@ -620,10 +620,9 @@ pub fn prepare(p: &Value) -> Value {
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_observed_repair_recovery","content":"The proposed duplicate inspection was rejected before execution. Current matched source observations are supplied below. This bounded correction step uses the observed-file edit planner to repair the actual failed check. Choose the file containing the cause, not necessarily the stack-frame symptom. Preserve the user requirements and test expectations. Do not repeat an unchanged statement or invent an edit merely to unlock execution. The normal catalog returns after this step."}));
     }
     if let Some((_, line)) = &focus {
-        out["tools"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|t| t["function"]["name"] == NAME);
+        if ordered.is_none() {
+            out["tools"].as_array_mut().unwrap().retain(|t|t["function"]["name"]==NAME);
+        }
         out["tool_choice"] = json!("required");
         if out["chat_template_kwargs"]["opengpu_native_tool_guard"] == true {
             out["chat_template_kwargs"]["opengpu_require_tool_call"] = json!(true);
@@ -631,7 +630,7 @@ pub fn prepare(p: &Value) -> Value {
         if ordered.is_some() {
             let source=&sources[ordered.as_ref().unwrap()];let count=source.text.lines().count();
             let range=if whole_replacement(p) {format!("The user explicitly requested replacement of the old implementation. Replace the complete observed file using startLine=1 and endLine={count}; newText must be the complete NEW implementation, not copied legacy headers or only a partial cleanup.")} else {"Select the smallest observed range that implements the requested first change.".into()};
-            out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal next step derived from the user's explicit FIRST edit of {}. All original instructions, permissions and constraints remain in force. {range} Supply only replacement source as newText, without oldString or line labels. Implement the requested behavior rather than preserving the faulty implementation. Keep code concise and do not inspect unrelated files. After the host applies this edit, other tools become available for the remaining task. The original user request, repeated here to retain the task requirements, is:\n{}",source.path,user_task(p).unwrap_or(""))}));
+            out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":format!("Internal next step derived from the user's explicit FIRST edit of {}. All original instructions, permissions and constraints remain in force. {range} Supply only replacement source as newText, without oldString or line labels. Implement the requested behavior rather than preserving the faulty implementation. Keep code concise. Read related manifests, exports and dependencies when needed before this edit; do not guess project APIs. The requested first source change remains this target. Other implementation changes follow after the host applies this edit. The original user request, repeated here to retain the task requirements, is:\n{}",source.path,user_task(p).unwrap_or(""))}));
             return out;
         }
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_grounded_compiler_repair","content":format!("A real compiler diagnostic identifies line {line} in this observed source. Use the supplied line planner to correct the faulty statement with the smallest actual source change. Do not supply oldText or oldString: the adapter obtains old source from the actual read. Choose startLine and endLine from the observed line labels and supply corrected source as newText. Do not copy the unchanged faulty statement, inspect unrelated files, install packages or rewrite the whole file.")}));
@@ -810,6 +809,15 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
             }
         }
     }
+    let diagnostic=super::native_tool_workflow::compiler_failure(p).unwrap_or_default().to_ascii_lowercase();
+    if ["already been declared","already defined","defined multiple times","redefinition","duplicate definition","duplicate declaration"].iter().any(|word|diagnostic.contains(word)) {
+        let selected=lines[start-1..end].concat().replace("\r\n","\n");
+        for line in normalized_replacement.lines().filter(|line|line.trim().len()>=24 && !selected.lines().any(|old|old==*line)) {
+            if lines[start.saturating_sub(9)..start-1].iter().chain(lines[end..(end+8).min(lines.len())].iter()).any(|old|old.trim_end_matches(['\r','\n'])==line) {
+                return Err(fail("duplicate-definition repair introduces another repeated statement outside the selected line range; include the surrounding declarations in the selected range or omit the new duplicate"));
+            }
+        }
+    }
     let eol = if source.text.contains("\r\n") {
         "\r\n"
     } else {
@@ -897,6 +905,16 @@ mod tests {
         assert!(super::super::native_tool_workflow::recover_read(&p,&proposed,error).is_none());
     }
     #[test]
+    fn duplicate_repair_cannot_move_the_error_to_an_adjacent_declaration() {
+        let source="const db = require('./database.js');\n\nconst db = require('./database.js');\nconst app = require('./server.js');\n";
+        let mut p=payload(source);p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":"node --test main.js"}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"test1","content":"D:/app/main.js:3\nSyntaxError: Identifier 'db' has already been declared\nCommand exited with code 1"})]);
+        assert!(compile(&p,&edit(1,3,"const db = require('./database.js');\nconst app = require('./server.js');")).unwrap_err().contains("another repeated statement"));
+        assert!(compile(&p,&edit(1,4,"const db = require('./database.js');\nconst app = require('./server.js');")).is_ok());
+        assert!(compile(&p,&edit(3,3,"")).is_ok());
+    }
+    #[test]
     fn adjacent_context_cannot_be_duplicated_by_a_narrow_range() {
         let source = "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { createServer } from 'node:http';\nimport { readFile } from 'node:fs/promises';\nconst value = 1;\n";
         let p = payload(source);
@@ -908,17 +926,34 @@ mod tests {
         assert!(compile(&p, &edit(5, 5, source)).unwrap_err().contains("outside selected line range"));
     }
     #[test]
-    fn explicit_first_edit_expands_partial_reads_then_uses_only_the_grounded_planner() {
+    fn complete_replacement_can_inspect_and_retain_dependency_contracts_before_writing() {
+        let mut p=payload("old test\nsecond line\n");
+        p["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with CommonJS tests. Read related exports before writing.</userRequest>");
+        p["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","tool_calls":[{"id":"dep1","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/db.js","startLine":1,"endLine":400}).to_string()}}]}),
+            json!({"role":"tool","tool_call_id":"dep1","content":"module.exports = db;\n"})]);
+        let prepared=prepare(&p);assert!(!source_response_required(&p));
+        assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
+        assert!(prepared["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("module.exports = db;"))));
+        let mut wrong=edit(1,1,"unrelated mutation");wrong["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/db.js","startLine":1,"endLine":1,"newText":"unrelated mutation"}).to_string());
+        assert!(compile(&p,&wrong).unwrap_err().contains("target"));
+        assert!(compile(&p,&edit(1,2,"const db = require('./db.js');")).is_ok());
+    }
+    #[test]
+    fn explicit_first_edit_expands_partial_reads_then_preserves_dependency_reads() {
         let mut p=payload("old source\nsecond line\n");
         p["messages"][0]["content"]=json!("<userRequest>First replace the test file: main.js with real assertions. Then run tests.</userRequest>");
         p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":2}).to_string());
         let read=preflight(&p).unwrap();assert_eq!(args(&read)["endLine"],400);
         assert!(prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
         p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string());
-        assert!(preflight(&p).is_none());let prepared=prepare(&p);assert_eq!(prepared["tools"].as_array().unwrap().len(),1);assert_eq!(prepared["tools"][0]["function"]["name"],NAME);assert_eq!(prepared["tool_choice"],"required");
+        assert!(preflight(&p).is_none());let prepared=prepare(&p);assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));assert_eq!(prepared["tool_choice"],"required");
         let compiled=compile(&p,&edit(1,2,"new source")).unwrap();assert_eq!(args(&compiled)["oldString"],"old source\nsecond line\n");
         let mut whole=p.clone();whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with the new implementation.</userRequest>");
         assert!(compile(&whole,&edit(1,1,"partial replacement")).unwrap_err().contains("complete observed file"));assert!(compile(&whole,&edit(1,2,"complete replacement")).is_ok());
+        assert!(!source_response_required(&whole));
+        assert!(prepare(&whole)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
+        whole["mundusx_source_artifact_step"]=json!(true);
         let prepared_whole=prepare(&whole);assert!(prepared_whole["tools"].as_array().unwrap().is_empty());assert_eq!(prepared_whole["tool_choice"],"none");
         let step=prepared_whole["messages"].as_array().unwrap().last().unwrap();assert_eq!(step["role"],"system");assert_eq!(step["name"],"mundusx_source_artifact_step");
         assert!(!prepared_whole["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("old source"))));assert_eq!(whole["messages"][2]["content"],"old source\nsecond line\n");assert_eq!(prepared_whole["messages"][0],whole["messages"][0]);
