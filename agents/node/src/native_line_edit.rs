@@ -56,6 +56,7 @@ fn whole_replacement(p:&Value)->bool {
 fn whole_source(p:&Value)->Option<(String,Snapshot)> {
     if !compatible(p)||!whole_replacement(p) {return None;}
     let mut sources=snapshots(p);let target=ordered_target(p,&sources)?;let source=sources.remove(&target)?;
+    if ["md","txt","rst","json","yaml","yml","xml","csv","toml"].iter().any(|ext|source.path.to_ascii_lowercase().ends_with(&format!(".{ext}"))) {return None;}
     let call=p["messages"].as_array()?.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)?;
     let a:Value=serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
     if source.text.lines().count() as u64>=a["endLine"].as_u64()? {return None;}
@@ -630,10 +631,18 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
     if message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()) {
         if let Some((_,source))=whole_source(p) {
             let text=message["content"].as_str().filter(|s|!s.trim().is_empty()).ok_or("native tool arguments are incomplete: complete replacement source is missing")?;
-            let mut code=text.trim();
-            if code.starts_with("```") {
-                let (_,body)=code.split_once('\n').ok_or("native tool arguments are incomplete: source fence is incomplete")?;
-                code=body.strip_suffix("```").ok_or("native tool arguments are incomplete: source fence is incomplete")?.trim_end();
+            let mut code=text.trim();let mut offset=0;let mut opening=None;
+            for line in code.split_inclusive('\n') {
+                let ticks=line.bytes().take_while(|b|*b==b'`').count();
+                if ticks>=3 {opening=Some((offset+line.len(),"`".repeat(ticks)));break;}
+                offset+=line.len();
+            }
+            if let Some((begin,fence))=opening {
+                let mut end=None;let mut offset=begin;
+                for line in code[begin..].split_inclusive('\n') {if line.trim()==fence {end=Some((offset,offset+line.len()));break;}offset+=line.len();}
+                let (end,closing_end)=end.ok_or("native tool arguments are incomplete: source fence is incomplete")?;
+                if code[closing_end..].lines().any(|line|line.starts_with(&fence)) {return Err("native tool arguments are incomplete: return one complete source artifact, not multiple code blocks".into());}
+                code=code[begin..end].trim_end();
             }
             let plan=json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_observed_source_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":NAME,"arguments":json!({"filePath":source.path,"startLine":1,"endLine":source.text.lines().count(),"newText":code}).to_string()}}]});
             return compile(p,&plan);
@@ -811,6 +820,8 @@ mod tests {
         let prepared_whole=prepare(&whole);assert!(prepared_whole["tools"].as_array().unwrap().is_empty());assert_eq!(prepared_whole["tool_choice"],"none");
         assert!(!prepared_whole["messages"][2]["content"].as_str().unwrap().contains("old source"));assert_eq!(whole["messages"][2]["content"],"old source\nsecond line\n");assert_eq!(prepared_whole["messages"][0],whole["messages"][0]);
         let artifact=compile(&whole,&json!({"role":"assistant","content":"```javascript\nnew implementation\n```"})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");assert_eq!(args(&artifact)["oldString"],"old source\nsecond line\n");
+        let artifact=compile(&whole,&json!({"role":"assistant","content":"Here is the replacement:\n```javascript\nnew implementation\n\u{a0}```\nExplanation outside the artifact."})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");
+        assert!(compile(&whole,&json!({"role":"assistant","content":"```js\none\n```\n```js\ntwo\n```"})).is_err());
         whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Do not replace the entire file.</userRequest>");assert!(!whole_replacement(&whole));
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
         p["messages"].as_array_mut().unwrap().extend([compiled,json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"}),json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),json!({"role":"tool","tool_call_id":"read2","content":"new source\n"})]);
