@@ -4,6 +4,8 @@ mod download_progress;
 mod native_stream;
 #[path = "native_tool_workflow.rs"]
 mod native_tool_workflow;
+#[path = "native_terminal_report.rs"]
+mod native_terminal_report;
 #[path = "native_http_bridge.rs"]
 mod native_http_bridge;
 #[path = "native_line_edit.rs"]
@@ -2971,11 +2973,15 @@ fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_jso
         },
         Err(error) => Some(native_tool_workflow::recover_read(payload,&canonical,&error).ok_or(error)?),
     };
-    if let Some(replacement)=replacement {
+    let (result,changed)=if let Some(replacement)=replacement {
         let replacement=native_tool_workflow::canonical_paths(payload,&replacement);
         validate_native_edit_preconditions(payload,&replacement)?;
-        Ok((replacement,true))
-    } else { let changed=canonical!=*message;Ok((canonical,changed)) }
+        (replacement,true)
+    } else { let changed=canonical!=*message;(canonical,changed) };
+    if payload["tool_choice"]=="required" && result["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()) {
+        return Err("native tool schema precondition failed: required tool choice needs at least one registered tool call; brief commentary is allowed before that call".into());
+    }
+    Ok((result,changed))
 }
 
 #[test]

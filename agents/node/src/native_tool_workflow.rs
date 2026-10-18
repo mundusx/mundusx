@@ -86,7 +86,7 @@ pub fn canonical_paths(payload:&Value,message:&Value)->Value {
         if !matches!(name,"read_file"|"create_file"|"replace_string_in_file"|"get_errors"|"list_dir") {continue;}
         let Ok(mut a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         for field in ["filePath","path"] {if let Some(p)=a[field].as_str().and_then(canonical) {a[field]=json!(p);}}
-        if let Some(paths)=a["filePaths"].as_array_mut() {for p in paths {if let Some(s)=p.as_str().and_then(canonical) {*p=json!(s);}}}
+        if let Some(paths)=a.get_mut("filePaths").and_then(Value::as_array_mut) {for p in paths {if let Some(s)=p.as_str().and_then(canonical) {*p=json!(s);}}}
         c["function"]["arguments"]=json!(a.to_string());
     }
     result
@@ -110,6 +110,21 @@ fn terminal_exit(text:&str)->Option<bool> {
 }
 
 pub(super) fn observed_exit(text:&str)->Option<bool> {terminal_exit(text)}
+fn native_sync_terminal(payload:&Value,args:&Value)->bool {
+    args["mode"]=="sync" && payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal"))
+        .and_then(|t|t["function"]["parameters"]["required"].as_array())
+        .is_some_and(|fields|["command","goal","explanation","mode"].iter().all(|field|fields.iter().any(|f|f.as_str()==Some(field))))
+}
+pub(super) fn observed_validation_exit(payload:&Value,args:&Value,text:&str)->Option<bool> {
+    let explicit=terminal_exit(text);
+    if explicit==Some(false)||!native_sync_terminal(payload,args)||!args["command"].as_str().is_some_and(validation_command) {return explicit;}
+    if let Some(report)=super::native_terminal_report::complete(text) {
+        if !report.passed {return Some(false);}
+        if explicit.is_some() {return explicit;}
+        return report.executed.then_some(true);
+    }
+    explicit
+}
 pub(super) fn is_validation(command:&str)->bool {validation_command(command)}
 pub(super) fn source_diagnostic(text:&str)->bool {
     let text=text.to_ascii_lowercase();
@@ -128,8 +143,10 @@ fn requested_tests(payload:&Value)->bool {
         .is_some_and(|s|["assertions","automated http tests","automated tests","functional tests"].iter().any(|v|s.contains(v)))
 }
 fn nonempty_test_report(command:&str,result:&str)->bool {
-    let command=command.to_ascii_lowercase();let result=result.to_ascii_lowercase();
-    if !command.contains("test") {return false;}
+    let command=command.to_ascii_lowercase();let result=super::native_terminal_report::clean(result);
+    if !validation_command(&command) {return false;}
+    if let Some(report)=super::native_terminal_report::complete(&result) {return report.passed&&report.executed;}
+    if let Some(passed)=super::native_terminal_report::partial_node_pass(&result) {return passed;}
     if result.contains("no test files")||result.contains("no tests ran")||result.contains("0 tests collected") {return false;}
     result.lines().any(|line| {
         let line=line.trim();
@@ -152,7 +169,7 @@ pub fn compiler_failure(payload:&Value)->Option<String> {
         let args:Value=serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
         if !args["command"].as_str().is_some_and(validation_command) {continue;}
         let text=result["content"].as_str()?;
-        return (terminal_exit(text)==Some(false)).then(||text.chars().take(3000).collect());
+        return (observed_validation_exit(payload,&args,text)==Some(false)).then(||text.chars().take(3000).collect());
     }
     None
 }
@@ -205,7 +222,7 @@ pub fn validator_after_edit(payload:&Value)->Option<Value> {
         let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
         let Some(text)=result["content"].as_str() else {continue;};
         if matches!(c["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file"))&&successful_result(text) {if let Some(path)=a["filePath"].as_str().and_then(key) {write=Some((i,path));}}
-        if c["function"]["name"]=="run_in_terminal"&&a["command"].as_str().is_some_and(validation_command) {check=Some((i,a,text.to_string(),terminal_exit(text)));}
+        if c["function"]["name"]=="run_in_terminal"&&a["command"].as_str().is_some_and(validation_command) {let status=observed_validation_exit(payload,&a,text);check=Some((i,a,text.to_string(),status));}
     }
     let (write_index,path)=write?;let (check_index,args,result,exit)=check?;
     if write_index<=check_index||exit!=Some(false)||args["mode"]!="sync" {return None;}
@@ -239,7 +256,7 @@ pub fn compilation(payload:&Value,message:&Value)->Result<Option<Value>,String> 
                 if a["command"].as_str().is_some_and(validation_command) {
                     // The host's exit header wins over any code-looking text
                     // printed later by the program under test.
-                    verified=terminal_exit(result).unwrap_or(false)&&(!require_tests||nonempty_test_report(a["command"].as_str().unwrap_or(""),result));
+                    verified=observed_validation_exit(payload,&a,result).unwrap_or(false)&&(!require_tests||nonempty_test_report(a["command"].as_str().unwrap_or(""),result));
                     if verified {attempts=0;previous_failure=None;} else {
                         let diagnostic=result.replace("\r\n","\n");
                         attempts=if previous_failure.as_ref()==Some(&diagnostic) {attempts+1} else {1};previous_failure=Some(diagnostic);
@@ -416,6 +433,30 @@ mod tests {
         {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}},
         {"function":{"name":"get_errors","parameters":{"properties":{"filePaths":{"type":"array","items":{"type":"string"}}}}}}],
         "messages":[{"role":"user","content":"Create project"}]})}
+    #[test]
+    fn native_completed_runner_report_verifies_without_success_footer() {
+        let mut p=payload();
+        p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","explanation","mode"]}}}));
+        p["messages"][0]["content"]=json!("<userRequest>Implement real automated tests and assertions</userRequest>");
+        let a=json!({"command":"node --test test-course-api.js","mode":"sync","goal":"Test","explanation":"Verify"});
+        let output="# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 30";
+        assert_eq!(observed_validation_exit(&p,&a,output),Some(true));
+        assert_eq!(observed_validation_exit(&p,&a,&format!("Exit Code: 1\n{output}")),Some(false));
+        assert_eq!(observed_validation_exit(&p,&a,"# tests 1\n# pass 1"),None);
+        let mut async_args=a.clone();async_args["mode"]=json!("async");assert_eq!(observed_validation_exit(&p,&async_args,output),None);
+        let skipped=output.replace("pass 1","pass 0").replace("skipped 0","skipped 1");assert_eq!(observed_validation_exit(&p,&a,&skipped),None);
+        observe(&mut p,call("replace_string_in_file",json!({"filePath":"/src/main.js"}),"write_"),"Applied edit");
+        observe(&mut p,call("run_in_terminal",a.clone(),"test_"),output);
+        assert!(compilation(&p,&json!({"content":"Done"})).unwrap().is_none());
+        let mut unknown=p.clone();unknown["tools"].as_array_mut().unwrap().last_mut().unwrap()["function"]["parameters"]=json!({});
+        assert_eq!(observed_validation_exit(&unknown,&a,output),None);
+        assert!(compilation(&unknown,&json!({"content":"Done"})).is_err());
+    }
+    #[test]
+    fn canonicalizing_a_single_path_does_not_invent_array_arguments() {
+        let p=payload();let m=call("read_file",json!({"filePath":"d:/sample/main.js","startLine":1,"endLine":20}),"read_");
+        let a=args(&canonical_paths(&p,&m));assert_eq!(a["filePath"],r"D:\sample\main.js");assert!(a.get("filePaths").is_none());
+    }
     fn observe(p:&mut Value,m:Value,text:&str) {
         let id=m["tool_calls"][0]["id"].clone();
         p["messages"].as_array_mut().unwrap().extend([m,json!({"role":"tool","tool_call_id":id,"content":text})]);

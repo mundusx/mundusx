@@ -620,7 +620,10 @@ pub fn prepare(p: &Value) -> Value {
     if super::native_tool_workflow::repair_pending(p) {
         out["tools"].as_array_mut().unwrap().retain(|t|!matches!(t["function"]["name"].as_str(),Some("run_in_terminal"|"create_and_run_task"|"send_to_terminal")));
         out["tool_choice"]=json!("required");
-        if out["chat_template_kwargs"]["opengpu_native_tool_guard"]==true {out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(true);}
+        if out["chat_template_kwargs"]["opengpu_native_tool_guard"]==true {
+            let semantic=super::native_tool_workflow::compiler_failure(p).is_some_and(|failure|!super::native_tool_workflow::source_diagnostic(&failure));
+            out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(!semantic);
+        }
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_failed_validation_repair_phase","content":"The last completed validation failed and no confirmed source edit followed it. Continue source inspection and repair the actual cause with the available file tools. Command execution is temporarily withheld for this repair phase to prevent rerunning the same failure; it becomes available automatically after a confirmed edit. Terminal execution is not globally forbidden. Preserve test expectations; do not invent a source change merely to unlock execution. Environment failures and explicit client-selected tools keep their normal path."}));
     }
     if p["mundusx_repair_from_observations"]==true && super::native_tool_workflow::repair_pending(p)
