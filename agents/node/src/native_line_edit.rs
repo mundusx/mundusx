@@ -582,8 +582,31 @@ pub fn prepare(p: &Value) -> Value {
             }
         }
     }
+    let task=user_task(p).unwrap_or("").to_ascii_lowercase();
+    let semantic=["rename","refactor","references","usages","symbol","callers","call sites","where used"].iter().any(|s|task.contains(s));
+    let task_tools=["tasks.json","build task","vscode task","vs code task"].iter().any(|s|task.contains(s))
+        || p["messages"].as_array().is_some_and(|messages| {
+            let start=super::native_task_progress::request_index(messages).map_or(0,|i|i+1);let current=&messages[start..];
+            current.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().any(|c|c["function"]["name"]=="create_and_run_task"&&current.iter().any(|m|m["role"]=="tool"&&m["tool_call_id"]==c["id"]))
+        });
+    let planned=super::native_task_progress::planning_current(p);
+    out["tools"].as_array_mut().unwrap().retain(|t| {
+        let name=t["function"]["name"].as_str().unwrap_or("");
+        if name=="manage_todo_list"&&planned {return false;}
+        if task.contains(&name.to_ascii_lowercase()) {return true;}
+        match name {
+            "vscode_listCodeUsages"|"vscode_renameSymbol"=>semantic,
+            "create_and_run_task"|"get_task_output"=>task_tools,
+            "terminal_selection"=>task.contains("selection")||task.contains("selected command"),
+            "terminal_last_command"=>task.contains("last command"),
+            "testFailure"=>task.contains("test explorer"),
+            _=>true,
+        }
+    });
     if super::native_tool_workflow::repair_pending(p) {
         out["tools"].as_array_mut().unwrap().retain(|t|!matches!(t["function"]["name"].as_str(),Some("run_in_terminal"|"create_and_run_task"|"send_to_terminal")));
+        out["tool_choice"]=json!("required");
+        if out["chat_template_kwargs"]["opengpu_native_tool_guard"]==true {out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(true);}
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_failed_validation_repair_phase","content":"The last completed validation failed and no confirmed source edit followed it. Continue source inspection and repair the actual cause with the available file tools. Command execution is temporarily withheld for this repair phase to prevent rerunning the same failure; it becomes available automatically after a confirmed edit. Terminal execution is not globally forbidden. Preserve test expectations; do not invent a source change merely to unlock execution. Environment failures and explicit client-selected tools keep their normal path."}));
     }
     if let Some((_, line)) = &focus {
@@ -604,7 +627,7 @@ pub fn prepare(p: &Value) -> Value {
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_grounded_compiler_repair","content":format!("A real compiler diagnostic identifies line {line} in this observed source. Use the supplied line planner to correct the faulty statement with the smallest actual source change. Do not supply oldText or oldString: the adapter obtains old source from the actual read. Choose startLine and endLine from the observed line labels and supply corrected source as newText. Do not copy the unchanged faulty statement, inspect unrelated files, install packages or rewrite the whole file.")}));
     }
     if let Some(messages) = out["messages"].as_array_mut() {
-        messages.push(json!({"role":"system","name":"mundusx_observed_line_edit_guidance","content":"For existing files, use the observed-line edit planner after reading the target from line 1 through the needed range. If that edit tool is not yet listed, read the target from line 1 first. Line-number labels in tool results are not source text. Supply only replacement source as newText; the adapter obtains exact oldString automatically. Keep each edit small and preserve unrelated source. New paths still use create_file."}));
+        messages.push(json!({"role":"system","name":"mundusx_observed_line_edit_guidance","content":"For existing files, call __mundusx_edit_observed_lines with filePath, startLine, endLine and newText after reading the target from line 1 through the needed range. Do not call the host replace_string_in_file directly or supply oldString/newString here: the adapter compiles the observed line range into that host call. If the planner is not listed yet, read the target from line 1 first. Line labels are not source text. Supply complete replacement source for the selected range as newText. Keep each edit small and preserve unrelated source. New paths still use create_file."}));
     }
     if let Some((path, line)) = &focus {
         let source = &sources[path];
@@ -863,11 +886,21 @@ mod tests {
         p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>First repair the file: other.js.</userRequest>"}));assert!(preflight(&p).is_none());
     }
     #[test]
+    fn routine_edits_keep_core_tools_and_requested_auxiliary_tools_remain_available() {
+        let mut p=payload("source\n");let auxiliary=["vscode_listCodeUsages","vscode_renameSymbol","create_and_run_task","get_task_output","terminal_selection","terminal_last_command","testFailure"];
+        for name in auxiliary.into_iter().chain(["run_in_terminal","get_terminal_output","manage_todo_list"]) {p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":name}}));}
+        let view=prepare(&p);for name in auxiliary {assert!(!view["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name),"{name}");}
+        for name in ["read_file","list_dir","run_in_terminal","get_terminal_output","manage_todo_list"] {assert!(view["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name));}
+        let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"vscode_renameSymbol"}});assert_eq!(prepare(&explicit),explicit);
+        p["messages"][0]["content"]=json!("<userRequest>Rename the symbol, inspect references, tasks.json, terminal selection, last command and test explorer.</userRequest>");
+        for name in auxiliary {assert!(prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name),"{name}");}
+    }
+    #[test]
     fn failed_tests_return_to_repairs_before_another_execution_and_edits_unlock_checks() {
         for (command,failure) in [("node --test test.js","TypeError: undefined URL"),("cargo test","thread panicked at assertion"),("pytest","AssertionError: mismatch"),("mvn test","java.lang.NullPointerException"),("dotnet test","Assert.Equal() Failure"),("go test ./...","panic: bad state")] {
             let mut p=payload("source\n");p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"run_in_terminal"}}));
             p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"test1","function":{"name":"run_in_terminal","arguments":json!({"command":command}).to_string()}}]}),json!({"role":"tool","tool_call_id":"test1","content":format!("{failure}\nCommand exited with code 1")})]);
-            assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"),"{command}");assert!(p["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"));
+            assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"),"{command}");assert_eq!(prepare(&p)["tool_choice"],"required");assert!(p["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"));
             let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"run_in_terminal"}});assert_eq!(prepare(&explicit),explicit);
             let mut environment=p.clone();environment["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"]=json!("command not found\nCommand exited with code 1");assert!(prepare(&environment)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="run_in_terminal"));
             p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[{"id":"edit1","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/app/main.js"}).to_string()}}]}),json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"})]);
