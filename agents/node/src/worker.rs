@@ -1336,7 +1336,7 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .and_then(|response| response.into_json::<serde_json::Value>().ok())
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 7))
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 8))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
@@ -3093,7 +3093,7 @@ fn observed_line_stream_compiles_to_a_registered_grounded_host_edit() {
         tries+=1;if !retry {return Err("native tool schema precondition failed: replace_string_in_file.oldString is required".into());}
         assert!(body["tool_choice"].is_null());
         let prepared=native_line_edit::prepare(body);
-        assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="replace_string_in_file"&&t["function"]["parameters"]["properties"]["startLine"].is_object()));
+        assert!(prepared["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="__mundusx_edit_observed_lines"&&t["function"]["parameters"]["properties"]["startLine"].is_object()));
         let mut host=message.clone();host["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/sample/main.rs","startLine":2,"endLine":2,"newText":"return 3;"}).to_string());
         native_workflow_message(body,&host)?;Ok("host line edit validated".into())
     }).unwrap();assert_eq!(tries,2);
@@ -3246,7 +3246,7 @@ fn run_native_tool_attempts(
         {
             let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:");
             let schema_tool=error.strip_prefix("native tool schema precondition failed: ").and_then(|s|s.split_once('.').map(|p|p.0));
-            let line_edit_recovery=schema_tool==Some("replace_string_in_file") && native_line_edit::prepare(&payload)["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|t["function"]["name"]=="replace_string_in_file" && t["function"]["parameters"]["properties"]["startLine"].is_object()));
+            let line_edit_recovery=schema_tool==Some("replace_string_in_file") && native_line_edit::prepare(&payload)["tools"].as_array().is_some_and(|tools|tools.iter().any(|t|matches!(t["function"]["name"].as_str(),Some("replace_string_in_file"|"__mundusx_edit_observed_lines")) && t["function"]["parameters"]["properties"]["startLine"].is_object()));
             let recovery_tool=if terminal_recovery {Some("run_in_terminal")} else if line_edit_recovery {None} else {schema_tool};
             let recovery_tool=recovery_tool.filter(|name|payload["tool_choice"].as_str()!=Some("none") && payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()).is_none_or(|selected|selected==*name));
             let selected=recovery_tool.and_then(|name|payload["tools"].as_array()?.iter().find(|t|t["function"]["name"].as_str()==Some(name))).cloned();

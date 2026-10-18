@@ -1,6 +1,6 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
+from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, AutomaticToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
 from types import SimpleNamespace
 
 
@@ -65,9 +65,23 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "version": 7})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "version": 8})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
+
+    def test_automatic_names_allow_prose_and_leave_argument_values_unconstrained(self):
+        a=AutomaticToolOpening([1,2], [[1,2,3,4], [1,2,3,5]])
+        b=AutomaticToolOpening([1,2], [[1,2,3,9]])
+        self.assertIsNone(a.next_tokens([100,101]))
+        self.assertIsNone(b.next_tokens([200]))
+        self.assertIsNone(a.next_tokens([100,101,77,1]))
+        self.assertEqual(a.next_tokens([100,101,77,1,2]),[3])
+        self.assertEqual(a.next_tokens([100,101,77,1,2,3]),[4,5])
+        self.assertIsNone(a.next_tokens([100,101,77,1,2,3,5]))
+        self.assertIsNone(a.next_tokens([100,101,77,1,2,3,5,999,888]))
+        self.assertIsNone(b.next_tokens([200,66]))
+        self.assertEqual(b.next_tokens([200,66,1,2,3]),[9])
+        with self.assertRaises(ValueError):AutomaticToolOpening([],[[1]])
 
     def test_registered_name_choice_branches_and_isolates_requests(self):
         first = RegisteredToolOpening([[1, 2, 3], [1, 4, 3]])
@@ -127,6 +141,29 @@ class ProgressTests(unittest.TestCase):
             first.next_token(99)
         with self.assertRaises(ValueError):
             RequiredToolPrefix([])
+
+    @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
+    def test_automatic_opening_hook_preserves_free_text_and_masks_only_registered_name(self):
+        import mlx.core as mx
+        class Generator:
+            def _tokenize(self, tokenizer, request, args): return "prompt"
+        def parser(*_): pass
+        parser.__module__="mlx_lm.tool_parsers.qwen3_coder"
+        tokenizer=SimpleNamespace(has_tool_calling=True,tool_parser=parser,eos_token_ids={7},encode=lambda text,**kw: [1] if text=='<tool_call>' else ([1,2,3] if text.startswith('<tool_call>') else [6]),decode=lambda ids: '')
+        server=SimpleNamespace(ResponseGenerator=Generator,_make_logits_processors=lambda _: [])
+        install_required_tool_opening(server,mx)
+        request=SimpleNamespace(request_type='chat',tools=[{'function':{'name':'registered'}}])
+        args=SimpleNamespace(chat_template_kwargs={'opengpu_native_tool_guard':True})
+        self.assertEqual(Generator()._tokenize(tokenizer,request,args),'prompt')
+        processors=server._make_logits_processors(args);self.assertEqual(len(processors),2)
+        logits=mx.arange(8).astype(mx.float32);guard=processors[0]
+        self.assertIs(guard(mx.array([100,101]),logits),logits)
+        self.assertIs(guard(mx.array([100,101,55]),logits),logits)
+        masked=guard(mx.array([100,101,55,1]),logits)
+        self.assertEqual(mx.argmax(masked).item(),2);self.assertEqual(mx.sum(mx.isfinite(masked)).item(),1)
+        self.assertEqual(mx.argmax(guard(mx.array([100,101,55,1,2]),logits)).item(),3)
+        self.assertIs(guard(mx.array([100,101,55,1,2,3]),logits),logits)
+        self.assertIs(guard(mx.array([100,101,55,1,2,3,44]),logits),logits)
 
     @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
     def test_required_opening_masks_only_prefix_tokens_and_leaves_chat_unchanged(self):

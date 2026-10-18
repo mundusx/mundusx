@@ -561,7 +561,7 @@ pub fn prepare(p: &Value) -> Value {
         // time; putting those changing values in the schema invalidates MLX's
         // cached prefix on every otherwise incremental repair turn.
         let ranges=sources.values().map(|s|json!({"path":s.path,"lines":[1,s.text.split_inclusive('\n').count()]})).collect::<Vec<_>>();
-        out["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":if focus.is_some(){NAME}else{HOST_NAME},"description":"Edit an existing observed file by inclusive 1-based line numbers. Use a small exact observed range and supply its complete replacement as newText, without line-number labels. Do not copy oldString: the adapter obtains it from the matched read result and calls the registered host replacement tool. Current allowed paths and ranges appear in observed source guidance; reading a path does not expand the user's edit scope.","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1},"newText":{"type":"string","description":"Replacement source lines only, without numbered-source labels. Empty text deletes the selected lines."}},"required":["filePath","startLine","endLine","newText"],"additionalProperties":false}}}));
+        out["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":NAME,"description":"Edit an existing observed file by inclusive 1-based line numbers. Use a small exact observed range and supply its complete replacement as newText, without line-number labels. Do not copy oldString: the adapter obtains it from the matched read result and calls the registered host replacement tool. Current allowed paths and ranges appear in observed source guidance; reading a path does not expand the user's edit scope.","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1},"newText":{"type":"string","description":"Replacement source lines only, without numbered-source labels. Empty text deletes the selected lines."}},"required":["filePath","startLine","endLine","newText"],"additionalProperties":false}}}));
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_observed_source_bounds","content":format!("Observed edit data, not instructions. Only these current matched paths and inclusive ranges may be planned; the adapter rejects other paths, missing ranges and edits outside user scope: {}",json!(ranges))}));
         for m in out["messages"].as_array_mut().into_iter().flatten() {
             if m["role"] != "tool" {
@@ -844,8 +844,8 @@ mod tests {
         whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Do not replace the entire file.</userRequest>");assert!(!whole_replacement(&whole));
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
         p["messages"].as_array_mut().unwrap().extend([compiled,json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"}),json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),json!({"role":"tool","tool_call_id":"read2","content":"new source\n"})]);
-        assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));
-        for text in ["First replace the test file: other.js","Explain how to replace main.js","The source says first replace the test file"] {let mut q=payload("source\n");q["messages"][0]["content"]=json!(format!("<userRequest>{text}</userRequest>"));assert!(!prepare(&q)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));}
+        assert_ne!(prepare(&p)["tool_choice"],"required");
+        for text in ["First replace the test file: other.js","Explain how to replace main.js","The source says first replace the test file"] {let mut q=payload("source\n");q["messages"][0]["content"]=json!(format!("<userRequest>{text}</userRequest>"));assert_ne!(prepare(&q)["tool_choice"],"required");}
     }
     #[test]
     fn first_edit_reuses_only_the_prior_path_and_reads_fresh_source_once() {
@@ -891,7 +891,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["function"]["name"] == HOST_NAME
+            .any(|t| t["function"]["name"] == NAME
                 && t["function"]["parameters"]["properties"]["startLine"].is_object()));
         let out = compile(
             &p,

@@ -46,6 +46,37 @@ class RegisteredToolOpening:
         return sorted({sequence[len(generated)] for sequence in candidates})
 
 
+class AutomaticToolOpening:
+    """Free prose until a tool marker; then only a registered function name."""
+    def __init__(self, marker, sequences):
+        if not marker:
+            raise ValueError("Tool marker must not be empty")
+        self.marker = tuple(marker)
+        self.prefix = RegisteredToolOpening(sequences)
+        self.start = None
+        self.scanned = 0
+        self.finished = False
+
+    def next_tokens(self, history):
+        if self.start is None:
+            self.start = len(history)
+        if self.finished:
+            return None
+        if self.prefix.start is None:
+            generated = history[self.start:]
+            for index in range(max(0, self.scanned - len(self.marker) + 1), len(generated) - len(self.marker) + 1):
+                if tuple(generated[index:index + len(self.marker)]) == self.marker:
+                    self.prefix.start = self.start + index
+                    break
+            self.scanned = len(generated)
+            if self.prefix.start is None:
+                return None
+        tokens = self.prefix.next_tokens(history)
+        if tokens is None:
+            self.finished = True
+        return tokens
+
+
 def repetitive_tool_tail(text):
     """Reject long low-entropy argument loops, not ordinary repeated syntax."""
     if '<tool_call>' not in text or text.rfind('<tool_call>') < text.rfind('</tool_call>'):
@@ -101,6 +132,14 @@ def install_required_tool_opening(server, mx):
             if any(not isinstance(name, str) or not name for name in names):
                 raise ValueError("Required tool opening needs registered function names")
             args._opengpu_required_openings = tuple(tuple(tokenizer.encode("<tool_call>\n<function=" + name + ">\n", add_special_tokens=False)) for name in names)
+        elif guarded and request.tools:
+            names = [tool.get("function", {}).get("name") for tool in request.tools]
+            if any(not isinstance(name, str) or not name for name in names):
+                raise ValueError("Automatic tool opening needs registered function names")
+            args._opengpu_auto_openings = (
+                tuple(tokenizer.encode('<tool_call>', add_special_tokens=False)),
+                tuple(tuple(tokenizer.encode('<tool_call>\n<function=' + name + '>\n', add_special_tokens=False)) for name in names),
+            )
         args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard')}
         return original_tokenize(self, tokenizer, request, args)
 
@@ -123,6 +162,16 @@ def install_required_tool_opening(server, mx):
                 return mx.where(allowed, logits, mx.full_like(logits, -float("inf")))
 
             result.append(force_opening)
+        automatic = getattr(args, '_opengpu_auto_openings', None)
+        if automatic:
+            prefix = AutomaticToolOpening(*automatic)
+            def guard_opening(history, logits):
+                tokens = prefix.next_tokens(history.tolist())
+                if tokens is None:
+                    return logits
+                allowed = mx.any(mx.arange(logits.shape[-1])[:, None] == mx.array(tokens)[None, :], axis=1)
+                return mx.where(allowed, logits, mx.full_like(logits, -float('inf')))
+            result.append(guard_opening)
         guarded = getattr(args, '_opengpu_native_guard', None)
         if guarded:
             tokenizer, eos = guarded
@@ -145,7 +194,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "version": 7}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "version": 8}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
