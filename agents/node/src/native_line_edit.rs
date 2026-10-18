@@ -62,6 +62,31 @@ fn whole_source(p:&Value)->Option<(String,Snapshot)> {
     Some((target,source))
 }
 pub fn source_response_required(p:&Value)->bool {whole_source(p).is_some()}
+fn compact_replaced_source(p:&mut Value,target:&str) {
+    let Some(messages)=p["messages"].as_array_mut() else {return;};let mut observations=BTreeMap::new();
+    for m in messages {
+        if m["role"]=="assistant" {
+            for c in m["tool_calls"].as_array_mut().into_iter().flatten() {
+                let Ok(mut a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+                if a["filePath"].as_str().and_then(key).as_deref()!=Some(target) {continue;}
+                let read=c["function"]["name"]=="read_file";
+                let write=matches!(c["function"]["name"].as_str(),Some("replace_string_in_file"|"create_file"|"insert_edit_into_file"));
+                if !read&&!write {continue;}
+                if let Some(id)=c["id"].as_str() {observations.insert(id.to_string(),read);}
+                if write {
+                    for field in ["oldString","newString","oldText","newText","content","code"] {if a.get(field).is_some() {a[field]=json!("Previous implementation compacted for the explicitly requested whole-file replacement; exact bytes retained by the adapter.");}}
+                    c["function"]["arguments"]=json!(a.to_string());
+                }
+            }
+        }
+        if m["role"]=="tool"&&m["tool_call_id"].as_str().is_some_and(|id|observations.get(id)==Some(&true)) {
+            if let Some(text)=m["content"].as_str() {
+                let summary=format!("Previous implementation observed: {} lines, {} bytes. Its body is compacted only for this explicitly requested whole-file replacement. The adapter retains the exact source for host edit grounding. Generate the NEW implementation from the user requirements; do not reconstruct or copy the old implementation.",text.lines().count(),text.len());
+                m["content"]=json!(summary);
+            }
+        }
+    }
+}
 fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
     let messages=p["messages"].as_array()?;
     let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))?;
@@ -477,7 +502,8 @@ pub fn prepare(p: &Value) -> Value {
     }
     let mut sources = snapshots(p);
     let mut out = p.clone();
-    if let Some((_,source))=whole_source(p) {
+    if let Some((target,source))=whole_source(p) {
+        compact_replaced_source(&mut out,&target);
         out["tools"]=json!([]);out["tool_choice"]=json!("none");
         out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(false);
         out["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(false);
@@ -783,6 +809,7 @@ mod tests {
         let mut whole=p.clone();whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Replace the entire file with the new implementation.</userRequest>");
         assert!(compile(&whole,&edit(1,1,"partial replacement")).unwrap_err().contains("complete observed file"));assert!(compile(&whole,&edit(1,2,"complete replacement")).is_ok());
         let prepared_whole=prepare(&whole);assert!(prepared_whole["tools"].as_array().unwrap().is_empty());assert_eq!(prepared_whole["tool_choice"],"none");
+        assert!(!prepared_whole["messages"][2]["content"].as_str().unwrap().contains("old source"));assert_eq!(whole["messages"][2]["content"],"old source\nsecond line\n");assert_eq!(prepared_whole["messages"][0],whole["messages"][0]);
         let artifact=compile(&whole,&json!({"role":"assistant","content":"```javascript\nnew implementation\n```"})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");assert_eq!(args(&artifact)["oldString"],"old source\nsecond line\n");
         whole["messages"][0]["content"]=json!("<userRequest>First repair the file: main.js. Do not replace the entire file.</userRequest>");assert!(!whole_replacement(&whole));
         let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
