@@ -281,7 +281,8 @@ pub(super) fn source_diagnostic(text:&str)->bool {
 
 fn requested_tests(payload:&Value)->bool {
     super::native_task_progress::task(payload).map(str::to_ascii_lowercase)
-        .is_some_and(|s|["assertions","automated http tests","automated tests","functional tests"].iter().any(|v|s.contains(v)))
+        .is_some_and(|s|["assertions","automated http tests","automated tests","functional tests","integration tests","unit tests","end-to-end tests","test suite",
+            "node --test","npm test","pnpm test","yarn test","cargo test","pytest","mvn test","dotnet test","go test","swift test","gradle test","gradlew test"].iter().any(|v|s.contains(v)))
 }
 fn nonempty_test_report(command:&str,result:&str)->bool {
     let report=if let Some((_,marker))=receipt(command) {result.lines().filter(|line|!line.trim().strip_prefix(&marker).is_some_and(|s|s.parse::<i32>().is_ok())).collect::<Vec<_>>().join("\n")} else {result.into()};
@@ -741,6 +742,15 @@ mod tests {
     fn canonicalizing_a_single_path_does_not_invent_array_arguments() {
         let p=payload();let m=call("read_file",json!({"filePath":"d:/sample/main.js","startLine":1,"endLine":20}),"read_");
         let a=args(&canonical_paths(&p,&m));assert_eq!(a["filePath"],r"D:\sample\main.js");assert!(a.get("filePaths").is_none());
+    }
+    #[test]
+    fn explicit_integration_and_language_runner_requests_require_nonempty_tests_after_continue() {
+        for task in ["Complete real HTTP integration tests","Add unit tests","Run node --test test.cjs","Run cargo test","Run pytest","Run mvn test","Run dotnet test","Run go test ./..."] {
+            let mut p=payload();p["messages"][0]["content"]=json!(format!("<userRequest>{task}</userRequest>"));
+            p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Continue</userRequest>"}));
+            assert!(requested_tests(&p),"{task}");
+        }
+        let mut p=payload();p["messages"][0]["content"]=json!("<userRequest>Check this source file syntax</userRequest>");assert!(!requested_tests(&p));
     }
     #[test]
     fn explicit_single_file_scope_survives_prior_writes_and_covers_batch_edits() {
