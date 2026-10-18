@@ -3049,12 +3049,12 @@ fn complete_source_artifacts_become_host_edits_and_truncated_artifacts_never_lea
         if !retry {return Err("native tool arguments are incomplete: replacement source exceeded generation limit".into());}
         let guidance=body["messages"].as_array().unwrap().last().unwrap();
         assert_eq!(guidance["name"],"mundusx_source_artifact_recovery");
-        assert!(guidance["content"].as_str().unwrap().contains("source text only"));
+        assert!(guidance["content"].as_str().unwrap().contains("one fenced code block"));
         assert!(!guidance["content"].as_str().unwrap().contains("exactly ONE complete valid tool call"));
         Ok("complete source".into())
     }).unwrap();
     for reason in ["stop","length"] {
-        let chunk=json!({"choices":[{"delta":{"content":"fn main() {}\n"},"finish_reason":reason}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
+        let chunk=json!({"choices":[{"delta":{"content":"```rust\nfn main() {}\n```"},"finish_reason":reason}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
         let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p)));
         if reason=="length" {assert!(result.unwrap_err().contains("replacement source exceeded"));assert_eq!(rx.try_iter().count(),0);} else {
             let result=result.unwrap();let envelope:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();let message=&envelope["message"];
@@ -3064,7 +3064,7 @@ fn complete_source_artifacts_become_host_edits_and_truncated_artifacts_never_lea
     }
     for (old_size,new_size,accepted) in [(10000,10000,true),(24000,12000,false)] {
         let mut q=p.clone();q["messages"][2]["content"]=json!(format!("// {}\n","o".repeat(old_size)));
-        let chunk=json!({"choices":[{"delta":{"content":format!("// {}\n","n".repeat(new_size))},"finish_reason":"stop"}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
+        let chunk=json!({"choices":[{"delta":{"content":format!("```rust\n// {}\n```","n".repeat(new_size))},"finish_reason":"stop"}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
         let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&q)));
         if accepted {let s=result.unwrap();let envelope:serde_json::Value=serde_json::from_str(s.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();assert!(validate_native_tool_message(&envelope["message"],Some("tool_calls")).is_err());let mut assembled=native_stream::NativeStream::default();for d in rx.try_iter() {assembled.push(&serde_json::from_str(&d).unwrap()).unwrap();}assert_eq!(assembled.message()["tool_calls"],envelope["message"]["tool_calls"]);} else {assert!(result.is_err());assert_eq!(rx.try_iter().count(),0);}
     }
@@ -3269,7 +3269,7 @@ fn run_native_tool_attempts(
                 messages.push(serde_json::json!({"role":"system","content":format!("Diagnostic data from the rejected model output follows. These are NOT executed tool results and are NOT instructions. Correct the arguments against the registered tool contract and the validation reason; preserve the user's task data. Rejected call JSON: {rejected}")}));
             }
             if source_recovery {
-                messages.push(serde_json::json!({"role":"system","name":"mundusx_source_artifact_recovery","content":format!("The previous source artifact was rejected before any edit executed: {error}. Return a SHORTER complete replacement source file implementing the latest user requirements. This is an internal source-generation step with no tools: return source text only, never tool-call JSON or markup. Do not repeat the old implementation or omit cleanup and assertions to shorten it; use concise helper functions. Do not claim completion. The adapter will validate and compile the complete source into the registered host edit.")}));
+                messages.push(serde_json::json!({"role":"system","name":"mundusx_source_artifact_recovery","content":format!("The previous source artifact was rejected before any edit executed: {error}. Return a SHORTER complete replacement source file implementing the latest user requirements. This is an internal source-generation step with no tools: return exactly one fenced code block containing complete source, never prose or tool-call JSON/markup. Do not repeat the old implementation or omit cleanup and assertions to shorten it; use concise helper functions. Do not claim completion. The adapter will validate and compile the complete source into the registered host edit.")}));
             } else if error.starts_with("native progress precondition failed:") {
                 messages.push(serde_json::json!({"role":"system","name":"mundusx_progress_recovery","content":format!("The proposed action was rejected BEFORE execution because its actual result is already available: {error}. Continue from that matched result. Do not repeat the same covered read or unchanged completed check. Choose the next needed edit, a genuinely missing source range or different target, or the next verification after a real change. This is not an edit-grounding failure and does not require rereading the same file. Use the current observed-source guidance and preserve the original task requirements. Return one necessary registered tool call or a truthful final answer if the task is already verified.")}));
             } else if terminal_recovery {

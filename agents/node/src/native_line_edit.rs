@@ -511,6 +511,14 @@ pub fn prepare(p: &Value) -> Value {
     }
     let mut sources = snapshots(p);
     let mut out = p.clone();
+    // Keep all instructions and the effective task transcript. Earlier task
+    // tool bodies are stale for grounding and need not be prefetched on every
+    // call. Exact continuation uses the original boundary, retaining progress.
+    if let Some(messages)=p["messages"].as_array() {
+        if let Some(start)=super::native_task_progress::request_index(messages) {
+            out["messages"]=json!(messages.iter().enumerate().filter(|(i,m)|*i>=start||matches!(m["role"].as_str(),Some("user"|"system"|"developer"))).map(|(_,m)|m.clone()).collect::<Vec<_>>());
+        }
+    }
     if let Some((target,source))=whole_source(p) {
         compact_replaced_source(&mut out,&target);
         // This bounded substep generates source, not another agent action.
@@ -527,7 +535,7 @@ pub fn prepare(p: &Value) -> Value {
         out["chat_template_kwargs"]["opengpu_require_tool_call"]=json!(false);
         out["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(false);
         out["max_tokens"]=json!(p["max_tokens"].as_u64().unwrap_or(4096).min(4096));
-        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_source_artifact_step","content":format!("Internal source-generation step for the user's explicitly requested complete replacement of {} ({} observed lines). All original host permissions and task constraints remain in force. Return ONLY the complete NEW source file, preferably under 100 lines and 5000 characters. Do not output tool-call markup, a plan, copied old headers, oldString, or a diff. The adapter retains the exact observed old file and will compile your source into the registered host replacement tool; this is not a final user answer and does not execute code. Implement real requested behavior and cleanup. Original user requirements:\n{}",source.path,source.text.lines().count(),user_task(p).unwrap_or(""))}));
+        out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_source_artifact_step","content":format!("Internal source-generation step for the user's explicitly requested complete replacement of {} ({} observed lines). All original host permissions and task constraints remain in force. Return exactly ONE fenced code block containing the complete NEW source file, preferably under 100 lines and 5000 characters. No text outside that block. Do not output tool-call markup, a plan, copied old headers, oldString, or a diff. The adapter retains the exact observed old file and will compile your source into the registered host replacement tool; this is not a final user answer and does not execute code. Implement real requested behavior and cleanup. Original user requirements:\n{}",source.path,source.text.lines().count(),user_task(p).unwrap_or(""))}));
         return out;
     }
     let ordered=ordered_target(p,&sources).filter(|target| {
@@ -651,7 +659,8 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
                 let (end,closing_end)=end.ok_or("native tool arguments are incomplete: source fence is incomplete")?;
                 if code[closing_end..].lines().any(|line|line.starts_with(&fence)) {return Err("native tool arguments are incomplete: return one complete source artifact, not multiple code blocks".into());}
                 code=code[begin..end].trim_end();
-            }
+            } else {return Err("native tool arguments are incomplete: return exactly one complete fenced source artifact; prose or an unfenced answer is not replacement source".into());}
+            if code.trim().is_empty() {return Err("native tool arguments are incomplete: replacement source artifact is empty".into());}
             let plan=json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_observed_source_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":NAME,"arguments":json!({"filePath":source.path,"startLine":1,"endLine":source.text.lines().count(),"newText":code}).to_string()}}]});
             return compile(p,&plan);
         }
@@ -828,6 +837,7 @@ mod tests {
         let prepared_whole=prepare(&whole);assert!(prepared_whole["tools"].as_array().unwrap().is_empty());assert_eq!(prepared_whole["tool_choice"],"none");
         let step=prepared_whole["messages"].as_array().unwrap().last().unwrap();assert_eq!(step["role"],"system");assert_eq!(step["name"],"mundusx_source_artifact_step");
         assert!(!prepared_whole["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("old source"))));assert_eq!(whole["messages"][2]["content"],"old source\nsecond line\n");assert_eq!(prepared_whole["messages"][0],whole["messages"][0]);
+        for text in ["I will read the file first.","fn main() {}","```rust\n\n```"] {assert!(compile(&whole,&json!({"role":"assistant","content":text})).is_err());}
         let artifact=compile(&whole,&json!({"role":"assistant","content":"```javascript\nnew implementation\n```"})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");assert_eq!(args(&artifact)["oldString"],"old source\nsecond line\n");
         let artifact=compile(&whole,&json!({"role":"assistant","content":"Here is the replacement:\n```javascript\nnew implementation\n\u{a0}```\nExplanation outside the artifact."})).unwrap();assert_eq!(args(&artifact)["newString"],"new implementation\n");
         assert!(compile(&whole,&json!({"role":"assistant","content":"```js\none\n```\n```js\ntwo\n```"})).is_err());
@@ -847,6 +857,17 @@ mod tests {
         p["messages"].as_array_mut().unwrap().extend([read,json!({"role":"tool","tool_call_id":id,"content":"Error: file moved"})]);
         assert!(preflight(&p).is_none());
         p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>First repair the file: other.js.</userRequest>"}));assert!(preflight(&p).is_none());
+    }
+    #[test]
+    fn model_context_keeps_current_evidence_and_all_instructions_without_old_task_tools() {
+        let mut p=payload("old task body\n");
+        p["messages"].as_array_mut().unwrap().insert(0,json!({"role":"system","content":"Keep every permission and user constraint"}));
+        p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Fix the next file</userRequest>"}));
+        let original=p.clone();let view=prepare(&p);
+        assert_eq!(view["messages"][0],p["messages"][0]);assert_eq!(view["messages"][1],p["messages"][1]);
+        assert!(!view["messages"].as_array().unwrap().iter().any(|m|m["tool_call_id"]=="read1"));assert_eq!(p,original);
+        let mut resumed=payload("current source\n");resumed["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Continue</userRequest>"}));
+        assert!(prepare(&resumed)["messages"].as_array().unwrap().iter().any(|m|m["tool_call_id"]=="read1"));
     }
     #[test]
     fn changing_observed_paths_does_not_change_the_model_tool_prefix() {
