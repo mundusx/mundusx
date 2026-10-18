@@ -1161,6 +1161,7 @@ mod tests {
     fn checkpoint_paths_can_only_request_fresh_reads_for_the_continued_explicit_target() {
         let task="First edit the file: main.js. Preserve data and run tests.";let mut p=payload("old source\n");
         p["messages"]=json!([{"role":"user","content":format!("<conversation-summary>\nExtractive conversation checkpoint from existing client messages.\n<userRequest>{task}</userRequest>\n{}\nHost transcript hint.\n</conversation-summary>",json!({"active_user_request":task,"observed_source_paths":["D:/app/main.js"]}))},{"role":"user","content":"<userRequest>Continue</userRequest>"}]);
+        p["messages"].as_array_mut().unwrap().insert(1,json!({"role":"user","content":"<userRequest>\n\n</userRequest>"}));
         let original=p.clone();let read=preflight(&p).unwrap();assert_eq!(args(&read)["filePath"],"D:/app/main.js");assert_eq!(args(&read)["startLine"],1);assert_eq!(args(&read)["endLine"],400);assert_eq!(p,original);
         assert!(compile(&p,&edit(1,1,"changed")).is_err());
         p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>First edit the file: main.js. This is a new task.</userRequest>"}));assert!(preflight(&p).is_none());

@@ -26,6 +26,7 @@ pub fn request_index(messages:&[Value])->Option<usize> {
     for (i,m) in messages.iter().enumerate().rev().filter(|(_,m)|m["role"]=="user") {
         if m["content"].as_str().is_some_and(is_compaction_text) {return Some(i);}
         let Some(text)=m["content"].as_str().and_then(|s|s.split_once("<userRequest>")?.1.split_once("</userRequest>").map(|p|p.0)) else {continue;};
+        if text.trim().is_empty() {continue;}
         latest.get_or_insert(i);
         let text=text.trim().trim_end_matches(['.','!','?']).trim().to_ascii_lowercase();
         if !matches!(text.as_str(),"continue"|"resume"|"continue the task"|"continue this task"|"continue the same task"|"resume the task") {return Some(i);}
