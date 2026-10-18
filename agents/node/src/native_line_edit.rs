@@ -923,7 +923,7 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
         lo = lo.saturating_sub(1);
         hi = (hi + 1).min(lines.len());
     };
-    if old.len() + new.len() > if source_response_required(p) {32768} else {16384} {
+    if old.len() + new.len() > 32768 {
         return Err(fail("compiled edit exceeds the bounded patch size"));
     }
     let mut out = message.clone();

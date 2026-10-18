@@ -2942,7 +2942,7 @@ fn native_host_argument_limit(payload:Option<&serde_json::Value>,message:&serde_
     // text and new text, plus JSON escaping. That is not model generation.
     if changed&&payload.is_some_and(native_tool_workflow::is_file_turn)
         &&message["tool_calls"].as_array().is_some_and(|calls|!calls.is_empty()&&calls.iter().all(|c|c["function"]["name"]=="replace_string_in_file")) {
-        if artifact {65536}else{32768}
+        65536
     } else if artifact {32768}else{16384}
 }
 
@@ -7673,13 +7673,14 @@ fn rejected_line_compile_arguments_are_retained_for_private_recovery() {
 #[test]
 fn compiled_observed_edits_have_a_separate_serialization_budget() {
  use serde_json::json;
- let source=(0..220).map(|i|format!("const x{i} = \"a\\\\b\"; // \"quoted\"\n")).collect::<String>();
+ let source=(0..300).map(|i|format!("const x{i} = \"a\\\\b\"; // \"quoted\"\n")).collect::<String>();
  let replacement=source.replacen("const x0", "const y0",1);
  let p=json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}},"required":["filePath","oldString","newString"]}}}],"messages":[{"role":"user","content":"<userRequest>Fix /app/main.js</userRequest>"},{"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":json!({"filePath":"/app/main.js","startLine":1,"endLine":400}).to_string()}}]},{"role":"tool","tool_call_id":"read1","content":source}]});
- let generated=json!({"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"edit1","type":"function","function":{"name":"__mundusx_edit_observed_lines","arguments":json!({"filePath":"/app/main.js","startLine":1,"endLine":220,"newText":replacement}).to_string()}}]});
+ assert!(source.len()+replacement.len()>16384&&source.len()+replacement.len()<=32768);
+ let generated=json!({"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"edit1","type":"function","function":{"name":"__mundusx_edit_observed_lines","arguments":json!({"filePath":"/app/main.js","startLine":1,"endLine":300,"newText":replacement}).to_string()}}]});
  validate_native_tool_message(&generated,Some("tool_calls")).unwrap();
  let (compiled,changed)=native_workflow_message(&p,&generated).unwrap();assert!(changed);
- let encoded=compiled["tool_calls"][0]["function"]["arguments"].as_str().unwrap().chars().count();assert!(encoded>16384&&encoded<32768,"{encoded}");
+ let encoded=compiled["tool_calls"][0]["function"]["arguments"].as_str().unwrap().chars().count();assert!(encoded>16384&&encoded<65536,"{encoded}");
  assert!(validate_native_tool_message(&compiled,Some("tool_calls")).is_err());
  assert_eq!(native_host_argument_limit(Some(&p),&compiled,false),16384);
  validate_native_tool_message_with_limit(&compiled,Some("tool_calls"),native_host_argument_limit(Some(&p),&compiled,changed)).unwrap();
