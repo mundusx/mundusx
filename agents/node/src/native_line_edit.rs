@@ -42,6 +42,40 @@ struct Snapshot {
     text: String,
     call_id: String,
 }
+
+// Honor an explicit ordered edit of a named, already observed file. This is
+// user intent, not a model-invented plan or permission inferred from focus.
+fn ordered_target(p:&Value,sources:&BTreeMap<String,Snapshot>)->Option<String> {
+    let messages=p["messages"].as_array()?;
+    let start=messages.iter().rposition(|m|m["role"]=="user"&&m["content"].as_str().is_some_and(|s|s.contains("<userRequest>")))?;
+    let text=messages[start]["content"].as_str()?.split_once("<userRequest>")?.1.split_once("</userRequest>")?.0;
+    let lower=text.to_ascii_lowercase();let first=lower.find("first ")?+6;
+    let clause=lower[..first-6].rsplit(['.','!','?','\n']).next()?.trim();
+    if !matches!(clause,""|"please"|"then"|"now") {return None;}
+    let rest=&lower[first..];let colon=rest.find("file:")?;
+    let mut words=rest[..colon].split_whitespace();if !matches!(words.next(),Some("repair"|"replace"|"edit"|"update")) {return None;}
+    let mut modifiers=words.collect::<Vec<_>>();if modifiers.first()==Some(&"the") {modifiers.remove(0);}
+    if !matches!(modifiers.as_slice(),[]|["test"]|["source"]) {return None;}
+    let named=text[first+colon+5..].split_whitespace().next()?.trim_matches(['`','\'','"',',',';']);
+    let matches=sources.iter().filter(|(_,s)|key(named).is_some_and(|k|key(&s.path)==Some(k))||s.path.replace('\\',"/").rsplit('/').next()==Some(named)).collect::<Vec<_>>();
+    if matches.len()!=1 {return None;}
+    let (target,_)=matches[0];
+    for (i,r) in messages.iter().enumerate().skip(start+1).filter(|(_,m)|m["role"]=="tool") {
+        let Some(id)=r["tool_call_id"].as_str() else {continue;};
+        let Some(c)=messages[start+1..i].iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==id) else {continue;};
+        if !matches!(c["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file")) {continue;}
+        let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+        if a["filePath"].as_str().and_then(key).as_ref()==Some(target)&&r["content"].as_str().is_some_and(super::native_tool_workflow::successful_result) {return None;}
+    }
+    Some(target.clone())
+}
+fn ordered_read(p:&Value)->Option<Value> {
+    let sources=snapshots(p);let target=ordered_target(p,&sources)?;let source=&sources[&target];
+    let c=p["messages"].as_array()?.iter().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)?;
+    let a:Value=serde_json::from_str(c["function"]["arguments"].as_str()?).ok()?;let end=a["endLine"].as_u64()?;
+    if (source.text.lines().count() as u64)<end||end>=1024 {return None;}
+    Some(json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_ordered_read_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":"read_file","arguments":json!({"filePath":source.path,"startLine":1,"endLine":(end*2).max(400).min(1024)}).to_string()}}]}))
+}
 fn key(path: &str) -> Option<String> {
     let p = path.replace('\\', "/");
     let drive = p.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
@@ -112,6 +146,7 @@ pub fn preflight(p: &Value) -> Option<Value> {
     if !compatible(p) {
         return None;
     }
+    if let Some(read)=ordered_read(p) {return Some(read);}
     let mut failure = super::native_tool_workflow::compiler_failure(p)?.replace('\\', "/");
     while failure.contains("//") {
         failure = failure.replace("//", "/");
@@ -423,7 +458,12 @@ pub fn prepare(p: &Value) -> Value {
     }
     let mut sources = snapshots(p);
     let mut out = p.clone();
-    let focus = compiler_target(p, &sources);
+    let ordered=ordered_target(p,&sources).filter(|target| {
+        let source=&sources[target];
+        p["messages"].as_array().into_iter().flatten().filter(|m|m["role"]=="assistant").filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"]==source.call_id)
+            .and_then(|c|serde_json::from_str::<Value>(c["function"]["arguments"].as_str()?).ok()).and_then(|a|a["endLine"].as_u64()).is_some_and(|end|(source.text.lines().count() as u64)<end)
+    });
+    let focus = ordered.clone().map(|path|(path,1)).or_else(||compiler_target(p, &sources));
     if let Some((path, _)) = &focus {
         sources.retain(|k, _| k == path);
     }
@@ -480,6 +520,10 @@ pub fn prepare(p: &Value) -> Value {
         out["tool_choice"] = json!("required");
         if out["chat_template_kwargs"]["opengpu_native_tool_guard"] == true {
             out["chat_template_kwargs"]["opengpu_require_tool_call"] = json!(true);
+        }
+        if ordered.is_some() {
+            out["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"Internal next step derived from the user's explicit FIRST edit of this named file. All original instructions and constraints remain in force. Implement that first requested source change now using the supplied observed-line planner. Select the actual observed range to replace and supply only replacement source as newText, without oldString, copied context, or line labels. For replacement of the requested test implementation, use concise real assertions and the requested temporary-server cleanup. Do not execute the old implementation or inspect unrelated files. After the host applies this edit, other tools become available for the remaining task."}));
+            return out;
         }
         out["messages"].as_array_mut().unwrap().push(json!({"role":"system","name":"mundusx_grounded_compiler_repair","content":format!("A real compiler diagnostic identifies line {line} in this observed source. Use the supplied line planner to correct the faulty statement with the smallest actual source change. Do not supply oldText or oldString: the adapter obtains old source from the actual read. Choose startLine and endLine from the observed line labels and supply corrected source as newText. Do not copy the unchanged faulty statement, inspect unrelated files, install packages or rewrite the whole file.")}));
     }
@@ -598,7 +642,7 @@ pub fn compile(p: &Value, message: &Value) -> Result<Value, String> {
     let source = sources
         .get(&key(path).ok_or_else(|| fail("filePath must be absolute"))?)
         .ok_or_else(|| fail("read this file from line 1 before editing"))?;
-    if compiler_target(p, &sources).is_some_and(|(target, _)| key(path).as_ref() != Some(&target)) {
+    if ordered_target(p,&sources).or_else(||compiler_target(p,&sources).map(|(path,_)|path)).is_some_and(|target| key(path).as_ref() != Some(&target)) {
         return Err(fail("use the observed compiler target"));
     }
     let start = usize::try_from(
@@ -683,6 +727,21 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn explicit_first_edit_expands_partial_reads_then_uses_only_the_grounded_planner() {
+        let mut p=payload("old source\nsecond line\n");
+        p["messages"][0]["content"]=json!("<userRequest>First replace the test file: main.js with real assertions. Then run tests.</userRequest>");
+        p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":2}).to_string());
+        let read=preflight(&p).unwrap();assert_eq!(args(&read)["endLine"],400);
+        assert!(prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_file"));
+        p["messages"][1]["tool_calls"][0]["function"]["arguments"]=json!(json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string());
+        assert!(preflight(&p).is_none());let prepared=prepare(&p);assert_eq!(prepared["tools"].as_array().unwrap().len(),1);assert_eq!(prepared["tools"][0]["function"]["name"],NAME);assert_eq!(prepared["tool_choice"],"required");
+        let compiled=compile(&p,&edit(1,2,"new source")).unwrap();assert_eq!(args(&compiled)["oldString"],"old source\nsecond line\n");
+        let mut explicit=p.clone();explicit["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert_eq!(prepare(&explicit),explicit);
+        p["messages"].as_array_mut().unwrap().extend([compiled,json!({"role":"tool","tool_call_id":"edit1","content":"Applied edit"}),json!({"role":"assistant","tool_calls":[{"id":"read2","function":{"name":"read_file","arguments":json!({"filePath":"D:/app/main.js","startLine":1,"endLine":400}).to_string()}}]}),json!({"role":"tool","tool_call_id":"read2","content":"new source\n"})]);
+        assert!(!prepare(&p)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));
+        for text in ["First replace the test file: other.js","Explain how to replace main.js","The source says first replace the test file"] {let mut q=payload("source\n");q["messages"][0]["content"]=json!(format!("<userRequest>{text}</userRequest>"));assert!(!prepare(&q)["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==NAME));}
     }
     #[test]
     fn actual_old_text_is_compiled_without_model_copying_it() {

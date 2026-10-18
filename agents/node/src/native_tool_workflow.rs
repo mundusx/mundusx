@@ -92,7 +92,7 @@ pub fn canonical_paths(payload:&Value,message:&Value)->Value {
     result
 }
 
-fn successful_result(text:&str)->bool {
+pub(super) fn successful_result(text:&str)->bool {
     let lower=text.trim_start().to_ascii_lowercase();
     !["error","string replacement failed:","tool execution failed","failed to"].iter().any(|s|lower.starts_with(s))
 }
