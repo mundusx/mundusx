@@ -1052,6 +1052,45 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn contributor_canary_checks_file_and_command_boundaries() {
+        let (manager, workspace, repository, root) = workspace();
+        let outside = temporary_directory("owner-canary");
+        let secret = outside.join("FAKE-CREDENTIAL-TEST-ONLY.txt");
+        fs::write(&secret, "FAKE-CONTRIBUTOR-CANARY-NOT-A-REAL-PASSWORD").unwrap();
+        let tools = RepositoryToolRunner::default();
+        // Both absolute paths and parent traversal must fail before any read.
+        assert!(tools.read_file(&workspace, &secret, 4096).is_err());
+        assert!(tools.read_file(&workspace, Path::new("../FAKE-CREDENTIAL-TEST-ONLY.txt"), 4096).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, workspace.path().join("src/canary-link")).unwrap();
+            assert!(tools.read_file(&workspace, Path::new("src/canary-link"), 4096).is_err());
+        }
+        // Demonstrate the trust boundary using ONLY our disposable canary.
+        // Setting a command's cwd does not sandbox it from the host filesystem.
+        let mut profile = helper_profile("owner-canary", 5000, 20000);
+        profile.environment.insert("MUNDUSX_TEST_OWNER_CANARY".into(), secret.display().to_string());
+        let runner = ValidationRunner::new(ValidationIsolation::TrustedHybrid).unwrap();
+        let result = runner.run(&workspace, &profile, &AtomicBool::new(false));
+        match result {
+            Ok(result) => {
+                assert!(result.stdout.contains("owner-canary-readable"), "{result:?}");
+                println!("CANARY: typed file access denied; trusted host command read the outside dummy file");
+            }
+            #[cfg(target_os = "macos")]
+            Err(error) if error.code == "HARNESS_VALIDATION_PROFILE_DENIED"
+                && error.message.contains("Invalid argument") => {
+                println!("CANARY: typed file access denied; macOS command probe could not start (resource-limit error); host command isolation remains unverified");
+            }
+            Err(error) => panic!("unexpected canary command failure: {error:?}"),
+        }
+        manager.cleanup(&workspace).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
     fn helper_profile(mode: &str, timeout_ms: u64, max_output_bytes: usize) -> ValidationProfile {
         let mut environment = BTreeMap::new();
         environment.insert("MUNDUSX_HARNESS_TEST_HELPER".to_string(), mode.to_string());
@@ -1175,6 +1214,12 @@ mod tests {
             "pass" => {
                 println!("validation-ok");
                 println!("api_key=must-not-leak");
+            }
+            "owner-canary" => {
+                let path = std::env::var("MUNDUSX_TEST_OWNER_CANARY").unwrap();
+                let value = fs::read_to_string(path).unwrap();
+                assert_eq!(value, "FAKE-CONTRIBUTOR-CANARY-NOT-A-REAL-PASSWORD");
+                println!("owner-canary-readable");
             }
             "large" => println!("{}", "x".repeat(8_192)),
             value if value.starts_with("tree:") => {
