@@ -1,3 +1,5 @@
+#[path = "desktop_activity.rs"]
+mod desktop_activity;
 #[path = "download_progress.rs"]
 mod download_progress;
 #[path = "native_stream.rs"]
@@ -4196,6 +4198,18 @@ fn worker_executable() -> Result<PathBuf, String> {
 }
 
 pub fn launch_worker_with_stream(
+    request: &WorkerLaunchRequest,
+    model_dir: &Path,
+    delta_sender: Option<mpsc::Sender<String>>,
+) -> Result<WorkerLaunchResponse, String> {
+    let activity = (!cfg!(test) || env::var_os("OPENGPU_HOME").is_some())
+        .then(|| desktop_activity::JobActivity::start(&opengpu_home_dir(), request));
+    let result = launch_worker_with_stream_inner(request, model_dir, delta_sender);
+    if let Some(activity) = activity { activity.finish(&result); }
+    result
+}
+
+fn launch_worker_with_stream_inner(
     request: &WorkerLaunchRequest,
     model_dir: &Path,
     delta_sender: Option<mpsc::Sender<String>>,
