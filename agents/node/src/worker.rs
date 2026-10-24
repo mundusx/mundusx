@@ -1171,6 +1171,8 @@ fn served_vllm_context_at(url: &str, model: &str) -> Option<u32> {
 /// A model listing proves liveness, not that the first inference has executed.
 /// Exercise prefill and one decode step before publishing the managed MLX URL.
 fn warm_mlx_runtime(url: &str, model: &str, timeout: Duration) -> Result<(), String> {
+    env::remove_var(MLX_TOOL_PROOF_ENV);
+    let _ = fs::remove_file(mlx_proof_path());
     let started = Instant::now();
     let _progress = crate::operation_progress::OperationProgress::start("Warming MLX model");
     if timeout.is_zero() {
@@ -1197,30 +1199,125 @@ fn warm_mlx_runtime(url: &str, model: &str, timeout: Duration) -> Result<(), Str
     }
     println!("persistentRuntime: MLX model warm-up complete");
     let remaining = timeout.saturating_sub(started.elapsed()).min(Duration::from_secs(30));
-    let tools = !remaining.is_zero() && probe_managed_mlx_tools(url, model, remaining);
-    *VERIFIED_MLX_TOOLS.lock().expect("MLX tools lock") = tools.then(|| (url.to_string(), model.to_string()));
+    let probe_started = Instant::now();
+    let first_budget = remaining / 2;
+    let mut tools = !first_budget.is_zero() && probe_managed_mlx_tools(url, model, first_budget);
+    if !tools {
+        // Only the synthetic, side-effect-free probe may be retried. Never
+        // replay a user tool turn, whose outcome may already have effects.
+        let retry_budget = remaining.saturating_sub(probe_started.elapsed());
+        if !retry_budget.is_zero() {
+            tools = probe_managed_mlx_tools(url, model, retry_budget);
+        }
+    }
+    if tools {
+        publish_mlx_tool_proof(url, model);
+    }
     println!("persistentRuntime: MLX native tools {}", if tools { "verified" } else { "unavailable" });
     Ok(())
 }
 
-static VERIFIED_MLX_TOOLS: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+// Inherited by re-executed workers. A process-local static loses this proof at
+// every `worker` invocation, even though the parent advertises native tools.
+const MLX_TOOL_PROOF_ENV: &str = "OPENGPU_MLX_TOOL_PROOF";
+
+#[derive(Serialize, Deserialize)]
+struct MlxToolProof {
+    version: u32,
+    url: String,
+    model: String,
+    generation: String,
+    endpoint_identity: Option<String>,
+}
+
+fn mlx_proof_path() -> PathBuf {
+    opengpu_home_dir().join("runtimes/mlx/tool-verification.json")
+}
+
+// MLX is managed on macOS. Bind verification to the actual listening process,
+// including its start time, so replacing a server on the same port revokes it.
+fn mlx_endpoint_identity(url: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let port = url::Url::parse(url).ok()?.port_or_known_default()?;
+        let output = Command::new("/usr/sbin/lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output().ok()?;
+        if !output.status.success() { return None; }
+        let pid = String::from_utf8(output.stdout).ok()?.lines().next()?.trim().to_string();
+        let started = Command::new("/bin/ps").args(["-p", &pid, "-o", "lstart="])
+            .output().ok()?;
+        let started = String::from_utf8(started.stdout).ok()?;
+        if started.trim().is_empty() { return None; }
+        Some(format!("{pid}:{}", started.trim()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = url; None }
+}
+
+fn publish_mlx_tool_proof(url: &str, model: &str) {
+    let proof = MlxToolProof { version: 1, url: url.into(), model: model.into(),
+        generation: uuid::Uuid::new_v4().to_string(), endpoint_identity: mlx_endpoint_identity(url) };
+    #[cfg(target_os = "macos")]
+    if proof.endpoint_identity.is_none() { return; }
+    let Ok(encoded) = serde_json::to_string(&proof) else { return; };
+    let path = mlx_proof_path();
+    let Some(parent) = path.parent() else { return; };
+    if fs::create_dir_all(parent).is_err() { return; }
+    // Publish before exporting the proof: a partial write fails closed. Workers
+    // also compare the generation on disk, revoking inherited older proofs.
+    if fs::write(&path, &encoded).is_err() { return; }
+    env::set_var(MLX_TOOL_PROOF_ENV, encoded);
+}
 
 pub fn managed_mlx_tools_verified(model: &str) -> bool {
-    VERIFIED_MLX_TOOLS.lock().expect("MLX tools lock").as_ref()
-        .is_some_and(|(url, name)| name == model && configured_mlx_server_url().as_deref() == Some(url.as_str()))
+    let Some(proof) = env::var(MLX_TOOL_PROOF_ENV).ok()
+        .and_then(|value| serde_json::from_str::<MlxToolProof>(&value).ok()) else { return false; };
+    if proof.version != 1 || proof.model != model
+        || configured_mlx_server_url().as_deref() != Some(proof.url.as_str())
+        || proof.endpoint_identity != mlx_endpoint_identity(&proof.url) { return false; }
+    fs::read(mlx_proof_path()).ok()
+        .and_then(|bytes| serde_json::from_slice::<MlxToolProof>(&bytes).ok())
+        .is_some_and(|current| current.generation == proof.generation)
 }
 
 fn probe_managed_mlx_tools(url: &str, model: &str, timeout: Duration) -> bool {
-    let payload = serde_json::json!({"model": model, "stream": false, "max_tokens": 64, "temperature": 0,
+    let started = Instant::now();
+    let mut payload = serde_json::json!({"model": model, "stream": false, "max_tokens": 128, "temperature": 0,
         "messages": [{"role":"user", "content":"Call mundusx_capability_probe exactly once with an empty object."}],
         "tools": [{"type":"function", "function":{"name":"mundusx_capability_probe", "description":"Side-effect-free capability probe.", "parameters":{"type":"object","properties":{},"additionalProperties":false}}}],
         "tool_choice":{"type":"function","function":{"name":"mundusx_capability_probe"}}});
-    ureq::AgentBuilder::new().redirects(0).timeout(timeout).build()
-        .post(&format!("{url}/v1/chat/completions")).send_json(payload).ok()
-        .and_then(|r| r.into_json::<serde_json::Value>().ok())
-        .is_some_and(|v| v.get("error").is_none_or(|e| e.is_null()) &&
-            v.pointer("/choices/0/message/tool_calls").and_then(|c| c.as_array())
-                .is_some_and(|calls| calls.iter().any(|c| c.pointer("/function/name").and_then(|n| n.as_str()) == Some("mundusx_capability_probe"))))
+    let post = |body: &serde_json::Value, budget: Duration| -> Option<serde_json::Value> {
+        if budget.is_zero() { return None; }
+        let response = ureq::AgentBuilder::new().redirects(0).timeout(budget).build()
+            .post(&format!("{url}/v1/chat/completions")).send_json(body.clone()).ok()?;
+        let mut bytes = Vec::new();
+        response.into_reader().take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 1024 * 1024 { return None; }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        if value.get("error").is_some_and(|e| !e.is_null()) { return None; }
+        Some(value)
+    };
+    let Some(first) = post(&payload, timeout) else { return false; };
+    let Some(message) = first.pointer("/choices/0/message") else { return false; };
+    let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) else { return false; };
+    if calls.len() != 1 || first.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) != Some("tool_calls") { return false; }
+    let call = &calls[0];
+    let Some(id) = call.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) else { return false; };
+    if call.pointer("/function/name").and_then(|v| v.as_str()) != Some("mundusx_capability_probe")
+        || call.pointer("/function/arguments").and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()) != Some(serde_json::json!({})) {
+        return false;
+    }
+    let sentinel = format!("probe_{}", uuid::Uuid::new_v4().simple());
+    payload["messages"].as_array_mut().unwrap().extend([
+        message.clone(), serde_json::json!({"role":"tool","tool_call_id":id,"content":sentinel}),
+        serde_json::json!({"role":"user","content":"Return the preceding tool result verbatim without any other text."})]);
+    payload["tool_choice"] = serde_json::json!("none");
+    let Some(second) = post(&payload, timeout.saturating_sub(started.elapsed())) else { return false; };
+    second.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("stop")
+        && second.pointer("/choices/0/message/content").and_then(|v| v.as_str()).is_some_and(|s| s.contains(&sentinel))
+        && second.pointer("/choices/0/message/tool_calls").is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
 }
 
 fn mlx_warm_stream_ready(bytes: &[u8]) -> bool {
@@ -1365,6 +1462,10 @@ pub fn external_runtime_blocks_media() -> bool {
 
 impl Drop for PersistentRuntimeHandle {
     fn drop(&mut self) {
+        if self.environment_variable == "OPENGPU_MLX_SERVER_URL" {
+            env::remove_var(MLX_TOOL_PROOF_ENV);
+            let _ = fs::remove_file(mlx_proof_path());
+        }
         stop_persistent_runtime_process(self.child.id(), self.container_name.as_deref());
         let _ = self.child.wait();
         remove_persistent_runtime_state();
@@ -4464,10 +4565,10 @@ mod tests {
             let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
             let url = format!("http://{}", server.server_addr());
             let handle = std::thread::spawn(move || {
-                for stage in 0..4 {
+                for stage in 0..5 {
                     let mut request = server.recv_timeout(Duration::from_secs(5)).unwrap().expect("MLX request");
                     let mut text = String::new(); request.as_reader().read_to_string(&mut text).unwrap();
-                    let body = if stage == 2 {
+                    let body = if stage == 3 {
                         assert_eq!(request.url(), "/v1/models");
                         r#"{"data":[{"id":"test-model"}]}"#.to_string()
                     } else {
@@ -4476,8 +4577,11 @@ mod tests {
                         if stage == 0 {
                             assert_eq!(payload["stream"], true);
                             "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n".to_string()
+                        } else if stage == 2 {
+                            assert_eq!(payload["messages"][2]["tool_call_id"], "call_1");
+                            serde_json::json!({"choices":[{"message":{"role":"assistant","content":payload["messages"][2]["content"]},"finish_reason":"stop"}]}).to_string()
                         } else {
-                            if stage == 3 {
+                            if stage == 4 {
                                 assert_eq!(payload["messages"][0]["content"], "Read student.js");
                                 assert_eq!(payload["tools"][0]["function"]["name"], "read_file");
                             }
@@ -4499,6 +4603,85 @@ mod tests {
             assert_eq!(result.runtime_mode.as_deref(), Some("persistent-warm-mlx-native-openai-tools"));
             handle.join().unwrap();
             let _ = home;
+        });
+    }
+
+    #[test]
+    fn mlx_tool_probe_rejects_incomplete_follow_up_and_repeated_calls() {
+        for repeated in [false, true] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.server_addr());
+            let handle = std::thread::spawn(move || {
+                let request = server.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+                let call = serde_json::json!({"id":"probe_call","type":"function","function":{"name":"mundusx_capability_probe","arguments":"{}"}});
+                let calls = if repeated { vec![call.clone(),call] } else { vec![call] };
+                request.respond(tiny_http::Response::from_string(serde_json::json!({"choices":[{"message":{"role":"assistant","tool_calls":calls},"finish_reason":"tool_calls"}]}).to_string())).unwrap();
+                if !repeated {
+                    let request = server.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+                    request.respond(tiny_http::Response::from_string(r#"{"choices":[{"message":{"role":"assistant","content":"unverified"},"finish_reason":"length"}]}"#)).unwrap();
+                }
+            });
+            assert!(!super::probe_managed_mlx_tools(&url, "test-model", Duration::from_secs(3)));
+            handle.join().unwrap();
+        }
+    }
+
+    // Executed in a new OS process by the regression below. No in-memory
+    // startup state can cross this boundary.
+    #[test]
+    fn mlx_tool_proof_child_process() {
+        if env::var_os("OPENGPU_TEST_MLX_PROOF_CHILD").is_none() { return; }
+        assert!(super::managed_mlx_tools_verified("test-model"));
+        assert!(!super::managed_mlx_tools_verified("different-model"));
+    }
+
+    #[test]
+    fn mlx_tool_proof_survives_process_boundary_and_revokes_old_generations() {
+        with_temp_runtime_home(|_| {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.server_addr());
+            env::set_var("OPENGPU_MLX_SERVER_URL", &url);
+            super::publish_mlx_tool_proof(&url, "test-model");
+            assert!(super::managed_mlx_tools_verified("test-model"));
+            let inherited = env::var(super::MLX_TOOL_PROOF_ENV).unwrap();
+            let result = std::process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", "worker::tests::mlx_tool_proof_child_process", "--nocapture"])
+                .env("OPENGPU_TEST_MLX_PROOF_CHILD", "1").output().unwrap();
+            assert!(result.status.success(), "{} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            super::publish_mlx_tool_proof(&url, "test-model");
+            env::set_var(super::MLX_TOOL_PROOF_ENV, inherited);
+            assert!(!super::managed_mlx_tools_verified("test-model"));
+            super::publish_mlx_tool_proof(&url, "test-model");
+            env::set_var("OPENGPU_MLX_SERVER_URL", "http://127.0.0.1:1");
+            assert!(!super::managed_mlx_tools_verified("test-model"));
+            env::set_var("OPENGPU_MLX_SERVER_URL", &url);
+            fs::write(super::mlx_proof_path(), b"truncated").unwrap();
+            assert!(!super::managed_mlx_tools_verified("test-model"));
+            env::remove_var(super::MLX_TOOL_PROOF_ENV);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an already running local MLX model and a built worker binary"]
+    fn mlx_live_reexecuted_worker_round_trip() {
+        let url = env::var("OPENGPU_TEST_MLX_URL").expect("live MLX URL");
+        let model = env::var("OPENGPU_TEST_MLX_MODEL").expect("live MLX model");
+        let binary = env::var("OPENGPU_TEST_WORKER_BINARY").expect("built worker binary");
+        with_temp_runtime_home(|_| {
+            super::warm_mlx_runtime(&url, &model, Duration::from_secs(90)).unwrap();
+            env::set_var("OPENGPU_MLX_SERVER_URL", &url);
+            assert!(super::managed_mlx_tools_verified(&model), "live model failed complete tool verification");
+            let prompt = format!("{}{}", super::OPENAI_TOOL_TURN_PREFIX, serde_json::json!({
+                "messages":[{"role":"user","content":"Call echo exactly once with an empty object."}],
+                "tools":[{"type":"function","function":{"name":"echo","description":"Side-effect-free test","parameters":{"type":"object","properties":{},"additionalProperties":false}}}],
+                "tool_choice":{"type":"function","function":{"name":"echo"}}}));
+            let result = std::process::Command::new(binary)
+                .args(["worker", "--job-id", "mlx-verification-test", "--node-id", "verification-only",
+                    "--backend", "m", "--model", &model, "--prompt", &prompt, "--max-tokens", "128", "--json"])
+                .output().unwrap();
+            assert!(result.status.success(), "{} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            assert!(String::from_utf8_lossy(&result.stdout).contains("echo"));
         });
     }
 
