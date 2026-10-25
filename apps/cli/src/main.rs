@@ -3110,6 +3110,16 @@ fn latest_agent_state(config: &Config) -> Option<Heartbeat> {
     }
 }
 
+fn confirmed_agent_readiness(config: &Config, agent: &Heartbeat, active_model: Option<&str>) -> Option<LocalReadiness> {
+    let stamp=agent.updated_at.parse::<u64>().ok()?;
+    let now=now_millis()/1000;
+    if !config.connected || config.paused || agent.node_id!=config.device_id || stamp>now || now.saturating_sub(stamp)>=35 {return None;}
+    let cap=agent.capabilities.as_ref()?;
+    if cap.active_model.as_ref().map(|m|m.name.as_str())!=active_model || active_model.is_none(){return None;}
+    if cap.ready_for_jobs && !matches!(agent.agent_state,types::AgentState::Ready|types::AgentState::Busy){return None;}
+    live_readiness_from_agent(agent)
+}
+
 fn live_readiness_from_agent(agent: &Heartbeat) -> Option<LocalReadiness> {
     let capabilities = agent.capabilities.as_ref()?;
     Some(LocalReadiness {
@@ -3142,7 +3152,7 @@ fn print_config_summary(config: &Config, path: &std::path::Path) -> usize {
         .unwrap_or(fallback_allowed);
     let readiness = agent
         .as_ref()
-        .and_then(live_readiness_from_agent)
+        .and_then(|agent|confirmed_agent_readiness(config,agent,active_model.as_deref()))
         .unwrap_or_else(|| {
             local_readiness(config, &power, active_model.as_deref(), identity_ready)
         });
@@ -3249,7 +3259,7 @@ fn print_startup_summary(config: &Config, path: &std::path::Path) {
     let active_model = effective_active_model(config);
     let identity_ready = identity_ready();
     let allowed = policy_allowed(config, &power, active_model.as_deref(), identity_ready);
-    let readiness = local_readiness(config, &power, active_model.as_deref(), identity_ready);
+    let readiness = latest_agent_state(config).as_ref().and_then(|agent|confirmed_agent_readiness(config,agent,active_model.as_deref())).unwrap_or_else(||local_readiness(config, &power, active_model.as_deref(), identity_ready));
 
     theme::section("Startup ready");
     theme::field("deviceId", &config.device_id);
@@ -7356,8 +7366,7 @@ fn main() {
             let identity_ready = identity_ready();
             let policy_allowed =
                 policy_allowed(&config, &power, active_model.as_deref(), identity_ready);
-            let readiness =
-                local_readiness(&config, &power, active_model.as_deref(), identity_ready);
+            let readiness = latest_agent_state(&config).as_ref().and_then(|agent|confirmed_agent_readiness(&config,agent,active_model.as_deref())).unwrap_or_else(||local_readiness(&config, &power, active_model.as_deref(), identity_ready));
             let provider_count = if readiness.ready_for_jobs { 1 } else { 0 };
 
             let payload = serde_json::json!({
@@ -8006,6 +8015,30 @@ mod tests {
                 .command,
             Commands::Resume
         ));
+    }
+
+    #[test]
+    fn status_readiness_uses_only_fresh_matching_agent_confirmation() {
+        use super::{Heartbeat, now_millis, confirmed_agent_readiness};
+        assert!(serde_json::from_str::<crate::types::NodeRole>("\"chunk_analysis\"").is_ok());
+        assert!(serde_json::from_str::<crate::types::NodeRole>("\"future_capability\"").is_ok());
+        let mut config=ready_config();
+        let mut agent:Heartbeat=serde_json::from_value(serde_json::json!({
+            "node_id":config.device_id,"backend":"cuda","agent_state":"ready",
+            "available_memory_mb":1024,"available_gpu_percent":100,
+            "updated_at":(now_millis()/1000).to_string(),"contribution_percent":80,"hostname":"fixture",
+            "capabilities":{"backend":"cuda","contribution_percent":80,"runtime_mode":"cuda",
+                "active_model":{"name":config.active_model},"ready_for_jobs":true}
+        })).unwrap();
+        assert!(confirmed_agent_readiness(&config,&agent,config.active_model.as_deref()).unwrap().ready_for_jobs);
+        agent.updated_at=(now_millis()/1000-60).to_string();
+        assert!(confirmed_agent_readiness(&config,&agent,config.active_model.as_deref()).is_none());
+        agent.updated_at=(now_millis()/1000).to_string();agent.node_id="other-node".to_string();
+        assert!(confirmed_agent_readiness(&config,&agent,config.active_model.as_deref()).is_none());
+        agent.node_id=config.device_id.clone();
+        assert!(confirmed_agent_readiness(&config,&agent,Some("other-model")).is_none());
+        config.paused=true;
+        assert!(confirmed_agent_readiness(&config,&agent,config.active_model.as_deref()).is_none());
     }
 
     #[test]

@@ -250,6 +250,9 @@ pub enum NodeRole {
     ToolUse,
     Reducer,
     Batch,
+    ChunkAnalysis,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
