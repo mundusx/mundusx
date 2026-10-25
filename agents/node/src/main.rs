@@ -2254,6 +2254,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             std::process::exit(3);
         }
     };
+    worker::publish_worker_build();
     let mut config = load_config_or_exit();
     if normalize_verified_tool_capability(&mut config) {
         if let Err(error) = save_agent_config(&config) {

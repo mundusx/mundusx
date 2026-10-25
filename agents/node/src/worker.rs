@@ -4197,6 +4197,16 @@ fn worker_executable() -> Result<PathBuf, String> {
     ))
 }
 
+pub fn publish_worker_build() {
+    let Ok(executable)=env::current_exe() else {return;};
+    let Ok(bytes)=fs::read(executable) else {return;};
+    let report=serde_json::json!({"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION"),
+        "sha256":format!("{:x}",sha2::Sha256::digest(bytes)),"desktop_activity":1,"shared_mlx_tool_proof":true});
+    let path=opengpu_home_dir().join("desktop-worker.json");
+    let Ok(bytes)=serde_json::to_vec(&report) else {return;};
+    if fs::write(path.with_extension("json.tmp"),bytes).is_ok() {let _=fs::rename(path.with_extension("json.tmp"),path);}
+}
+
 pub fn launch_worker_with_stream(
     request: &WorkerLaunchRequest,
     model_dir: &Path,
