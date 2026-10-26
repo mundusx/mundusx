@@ -1,6 +1,6 @@
 [package]
 name = "opengpu"
-version = "0.2.52"
+version = "0.2.53"
 edition = "2021"
 description = "MundusX CLI"
 license = "Apache-2.0"
