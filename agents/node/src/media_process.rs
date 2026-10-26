@@ -95,6 +95,7 @@ fn media_selected(config: &AgentConfig) -> bool {
             crate::contribution_contract::Operation::ImageToVideo
                 | crate::contribution_contract::Operation::TextToVideo
                 | crate::contribution_contract::Operation::TextToImage
+                | crate::contribution_contract::Operation::ImageEdit
         )
     })
 }
@@ -104,14 +105,14 @@ mod tests {
     use super::*;
     use crate::contribution_contract::Operation;
     #[test]
-    fn starts_for_image_or_video_but_not_llm_or_editing_only() {
+    fn starts_for_image_video_and_editing_but_not_llm_only() {
         let mut cfg = AgentConfig::default();
         for (operation, expected) in [
             (Operation::TextToImage, true),
             (Operation::TextToVideo, true),
             (Operation::ImageToVideo, true),
             (Operation::Llm, false),
-            (Operation::ImageEdit, false),
+            (Operation::ImageEdit, true),
         ] {
             cfg.contribution.operations = vec![operation];
             assert_eq!(media_selected(&cfg), expected);

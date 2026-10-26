@@ -336,7 +336,8 @@ mod tests {
         configure_with_budget(&mut config, Some("llm,image"), None, &budget).unwrap();
         let saved = config.contribution.clone();
         for value in ["video", "all", "llm,image,video"] {
-            assert!(configure_with_budget(&mut config, Some(value), None, &budget).unwrap_err().contains("64 GiB"));
+            let expected=if value=="all" {"48 GiB"} else {"64 GiB"};
+            assert!(configure_with_budget(&mut config, Some(value), None, &budget).unwrap_err().contains(expected));
             assert_eq!(config.contribution, saved);
         }
         let budget = MediaBudget::new(Some(32 * GIB),75);

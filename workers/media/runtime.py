@@ -55,7 +55,7 @@ def is_video(profile):
 
 
 def profile_record(root, profile, name):
-    return root / (name + ('-i2v' if profile.get('operation') == 'image_to_video' else '-video' if is_video(profile) else '') + ('-fast' if profile.get('variant') == 'lightning' else '') + (('-' + str(profile['frames']) + 'f') if name == 'verified' and is_video(profile) and profile['frames'] != profile['fps'] * 2 + 1 else '') + '.json')
+    return root / (name + ('-edit' if profile.get('operation') == 'image_edit' else '-i2v' if profile.get('operation') == 'image_to_video' else '-video' if is_video(profile) else '') + ('-fast' if profile.get('variant') == 'lightning' else '') + (('-' + str(profile['frames']) + 'f') if name == 'verified' and is_video(profile) and profile['frames'] != profile['fps'] * 2 + 1 else '') + '.json')
 
 
 class MediaError(Exception):
@@ -221,7 +221,9 @@ class Comfy:
         models = [("UNETLoader", "unet_name", 0), ("CLIPLoader", "clip_name", 1), ("VAELoader", "vae_name", 2)]
         if profile.get('architecture') in ('wan22_t2v_a14b', 'wan22_i2v_a14b'):
             models.append(("UNETLoader", "unet_name", 3))
-        if profile.get('variant') == 'lightning':
+        if profile.get('operation') == 'image_edit':
+            models.append(("LoraLoaderModelOnly", "lora_name", 3))
+        elif profile.get('variant') == 'lightning':
             models.extend([("LoraLoaderModelOnly", "lora_name", 4), ("LoraLoaderModelOnly", "lora_name", 5)])
         for node, field, index in models:
             name = Path(profile["files"][index]["path"]).name
@@ -301,6 +303,25 @@ def workflow(profile, prompt, seed, prefix, input_image=None):
             # Pinned ComfyUI's explicit format path assumes an enum; AUTO produces MP4.
             # Validate H.264/MP4 after export instead of relying on the output extension.
             "10": node("SaveVideo", video=["11", 0], filename_prefix="opengpu/" + prefix, format="auto", codec="h264"),
+        }
+    if profile.get('operation') == 'image_edit':
+        if input_image is None:
+            input_image = 'opengpu-inspect.png'  # Node inventory only; generation enforces a real upload.
+        return {
+            "1": node("UNETLoader", unet_name=Path(profile["files"][0]["path"]).name, weight_dtype="default"),
+            "2": node("CLIPLoader", clip_name=Path(profile["files"][1]["path"]).name, type="qwen_image", device="default"),
+            "3": node("VAELoader", vae_name=Path(profile["files"][2]["path"]).name),
+            "11": node("LoadImage", image=input_image),
+            "12": node("ImageScale", image=["11", 0], upscale_method="lanczos", width=profile["width"], height=profile["height"], crop="center"),
+            "4": node("TextEncodeQwenImageEditPlus", prompt=prompt, clip=["2",0], vae=["3",0], image1=["12",0]),
+            "5": node("TextEncodeQwenImageEditPlus", prompt="", clip=["2",0], vae=["3",0], image1=["12",0]),
+            "6": node("VAEEncode", pixels=["12",0], vae=["3",0]),
+            "13": node("LoraLoaderModelOnly", model=["1",0], lora_name=Path(profile["files"][3]["path"]).name, strength_model=1.0),
+            "7": node("ModelSamplingAuraFlow", model=["13",0], shift=3.1),
+            "14": node("CFGNorm", model=["7",0], strength=1.0),
+            "8": node("KSampler", model=["14",0], positive=["4",0], negative=["5",0], latent_image=["6",0], seed=seed, steps=profile["steps"], cfg=profile["cfg"], sampler_name="euler", scheduler="simple", denoise=1.0),
+            "9": node("VAEDecode", samples=["8",0], vae=["3",0]),
+            "10": node("SaveImage", images=["9",0], filename_prefix="opengpu/"+prefix),
         }
     if profile.get('operation') != 'text_to_image':
         raise MediaError('Unsupported media operation')
@@ -425,10 +446,10 @@ def fit_input_image(data, profile):
 def generate(client, profile, prompt, seed, output, timeout=None, input_image=None):
     if is_video(profile) and (not shutil.which('ffprobe') or not shutil.which('ffmpeg')):
         raise MediaError('Video generation requires ffprobe and ffmpeg on PATH for validation')
-    if profile.get('operation') == 'image_to_video' and input_image is None:
-        raise MediaError('Image-to-video requires --input-image pointing to a PNG')
-    if input_image is not None and profile.get('operation') != 'image_to_video':
-        raise MediaError('--input-image requires the image-to-video profile')
+    if profile.get('operation') in ('image_to_video','image_edit') and input_image is None:
+        raise MediaError('Image editing and image-to-video require --input-image pointing to a PNG')
+    if input_image is not None and profile.get('operation') not in ('image_to_video','image_edit'):
+        raise MediaError('--input-image requires an image-edit or image-to-video profile')
     image_data = read_input_png(input_image) if input_image is not None else None
     if image_data is not None:
         image_data = fit_input_image(image_data, profile)
@@ -985,6 +1006,7 @@ def main():
     parser.add_argument('--managed-output')
     parser.add_argument('--input-image', type=Path)
     parser.add_argument('--image-to-video', action='store_true')
+    parser.add_argument('--image-edit', action='store_true')
     parser.add_argument('--fast', action='store_true')
     parser.add_argument('--video', action='store_true')
     parser.add_argument('--seconds', type=int, choices=range(1, 11), default=2)
@@ -1042,11 +1064,11 @@ def main():
              budget_bytes=budget, minimum_media_budget_bytes=MINIMUM_MEDIA_BUDGET,
              runtime_retained=retained_runtime(root), network_dispatch_enabled=False); return
     require_media_budget(budget, profile)
-    if profile.get('operation') == 'image_to_video' and args.action in ('verify', 'generate'):
-        if args.input_image is None: raise MediaError('Image-to-video requires --input-image pointing to a PNG')
+    if profile.get('operation') in ('image_to_video','image_edit') and args.action in ('verify', 'generate'):
+        if args.input_image is None: raise MediaError('Image editing and image-to-video require --input-image pointing to a PNG')
         read_input_png(args.input_image)
     elif args.input_image is not None:
-        raise MediaError('--input-image requires image-to-video verify or generate')
+        raise MediaError('--input-image requires image-edit or image-to-video verify or generate')
     with lock(root):
         if args.action == 'setup' or not persistent_owner(root): stop_owned_container(root)
         if args.action == 'setup':

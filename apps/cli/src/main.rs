@@ -185,6 +185,9 @@ enum Commands {
         /// Select Wan image-to-video with PNG input
         #[arg(long, global = true, conflicts_with = "video", group = "media_video_profile")]
         image_to_video: bool,
+        /// Select Qwen Image Edit with a reference PNG
+        #[arg(long, global = true, conflicts_with_all = ["video", "image_to_video"])]
+        image_edit: bool,
         /// Four-step Lightning video at 832x480 (default for video)
         #[arg(long, global = true, requires = "media_video_profile")]
         fast: bool,
@@ -7304,7 +7307,7 @@ fn main() {
             setup_media,
             yes,
         ),
-        Commands::Media { command, video, image_to_video, fast, quality, seconds } => {
+        Commands::Media { command, video, image_to_video, image_edit, fast, quality, seconds } => {
             if !(1..=10).contains(&seconds) { eprintln!("Video seconds must be an integer from 1 to 10"); std::process::exit(2); }
             if let MediaCommands::Serve { server, once } = command {
                 if let Err(error) = media_worker::serve(server, once) { eprintln!("{error}"); std::process::exit(1); }
@@ -7329,6 +7332,7 @@ fn main() {
                     ("generate", args)
                 },
             };
+            if image_edit { extra.push("--image-edit".into()); }
             if image_to_video { extra.push("--image-to-video".into()); }
             if fast_video_selected(video, image_to_video, fast, quality) { extra.push("--fast".into()); }
             extra.extend(["--seconds".into(), seconds.to_string()]);

@@ -258,7 +258,7 @@ fn worker_readiness(config: &AgentConfig) -> (WorkerHealthReport, WorkerPolicyRe
         .max(1);
     let verified = media_runtime::verified_profiles(&storage::config_dir(), config.contribution.comfyui_url.as_deref(), config.contribution_percent);
     health.media_profiles = verified.into_iter().filter(|id| {
-        config.contribution.operations.contains(&if (id.starts_with("qwen-") || id.starts_with("dreamshaper-")) { contribution_contract::Operation::TextToImage } else if id.starts_with("wan22-i2v-") { contribution_contract::Operation::ImageToVideo } else { contribution_contract::Operation::TextToVideo })
+        config.contribution.operations.contains(&if id.starts_with("qwen-image-edit-") { contribution_contract::Operation::ImageEdit } else if (id.starts_with("qwen-") || id.starts_with("dreamshaper-")) { contribution_contract::Operation::TextToImage } else if id.starts_with("wan22-i2v-") { contribution_contract::Operation::ImageToVideo } else { contribution_contract::Operation::TextToVideo })
     }).collect();
     health.media_budget_bytes = media_runtime::memory::MediaBudget::detect(config.contribution_percent).contribution_budget_bytes.unwrap_or(0);
     if !config.contribution.llm_enabled() {
@@ -1346,7 +1346,26 @@ fn send_registration(
     }
 }
 
-fn send_heartbeat(
+// The owner may mirror media presence to the public plane. LLM claims remain
+// confined to the primary plane; one media worker serializes both queues.
+fn send_heartbeat(config:&AgentConfig,identity:&DeviceIdentity,heartbeat:&Heartbeat,verbose:bool)->Option<NodeAdmissionStatus> {
+    let primary=send_heartbeat_once(config,identity,heartbeat,verbose);
+    if !config.contribution.llm_enabled() && std::env::var("OPENGPU_SECONDARY_CONTROL_PLANE_URL").as_deref()==Ok("https://control.mundusx.ai") && config.control_plane_url.trim_end_matches('/')!="https://control.mundusx.ai" {
+        let mut mirror=config.clone();mirror.control_plane_url="https://control.mundusx.ai".into();
+        static REGISTERED:std::sync::OnceLock<std::sync::Mutex<bool>>=std::sync::OnceLock::new();
+        if let Ok(mut registered)=REGISTERED.get_or_init(||std::sync::Mutex::new(false)).lock() {
+            if !*registered {*registered=send_registration(&mirror,identity,&build_registration(&mirror,identity),verbose);}
+            let mut mirrored = heartbeat.clone();
+            if let Ok(selected) = std::env::var("OPENGPU_MEDIA_SECONDARY_PROFILES") {
+                mirrored.worker_health.media_profiles.retain(|p| selected.split(',').any(|s| s == p));
+            }
+            if *registered && send_heartbeat_once(&mirror,identity,&mirrored,verbose).is_none(){*registered=false;}
+        }
+    }
+    primary
+}
+
+fn send_heartbeat_once(
     config: &AgentConfig,
     identity: &DeviceIdentity,
     heartbeat: &Heartbeat,

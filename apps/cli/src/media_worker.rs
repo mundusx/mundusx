@@ -23,9 +23,10 @@ fn request(
     mut body: Value,
 ) -> Result<Value, String> {
     let url = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(if action == "claim" { 8 } else { 120 }))
         .redirects(0)
         .build();
+    if let Some(v)=body.as_object_mut(){v.remove("_server");}
     body["_nonce"] = json!(uuid::Uuid::new_v4().to_string());
     let text = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let stamp = SystemTime::now()
@@ -75,6 +76,11 @@ fn private_json(path: &std::path::Path, value: &Value) -> Result<(), String> {
     file.sync_all().map_err(|e| e.to_string())
 }
 fn execution_profile(job: &Value) -> Result<(bool, u64, String), String> {
+    if job["quote"]["operation"] == "image_edit" {
+        let profile:Value=serde_json::from_str(media_runtime::EDIT_PROFILE).map_err(|e|e.to_string())?;
+        if job["profile_id"]!=profile["id"] || job["quote"]["model"]!=profile["model"] || job["quote"]["steps"]!=4 || job["quote"]["width"]!=832 || job["quote"]["height"]!=480 {return Err("Image edit workflow mismatch".into())}
+        return Ok((false,2,"verified-edit-fast.json".into()));
+    }
     let i2v = job["quote"]["operation"] == "image_to_video";
     let video = i2v || job["quote"]["operation"] == "text_to_video";
     let fast = job["profile_id"].as_str().is_some_and(|id| id.contains("-lightning-"));
@@ -211,7 +217,10 @@ fn execute_with(
     let (video, seconds, name) = execution_profile(job)?;
     let i2v = job["quote"]["operation"] == "image_to_video";
     let fast = job["profile_id"].as_str().is_some_and(|id| id.contains("-lightning-"));
-    let operation = if i2v {
+    let editing = job["quote"]["operation"] == "image_edit";
+    let operation = if editing {
+        crate::contribution_contract::Operation::ImageEdit
+    } else if i2v {
         crate::contribution_contract::Operation::ImageToVideo
     } else if video {
         crate::contribution_contract::Operation::TextToVideo
@@ -232,7 +241,7 @@ fn execute_with(
     let reference_path = home
         .join("media")
         .join(format!("reference-{}.png", uuid::Uuid::new_v4()));
-    if i2v {
+    if i2v || editing {
         use base64::Engine;
         use sha2::{Digest, Sha256};
         let reference = call(
@@ -253,14 +262,14 @@ fn execute_with(
         }
         fs::write(&reference_path, bytes).map_err(|e| e.to_string())?;
         generation_args.extend([
-            "--image-to-video".into(),
+            if editing {"--image-edit".into()} else {"--image-to-video".into()},
             "--input-image".into(),
             reference_path.to_string_lossy().into_owned(),
         ]);
     }
-    if fast { generation_args.push("--fast".into()); }
+    if fast && !editing { generation_args.push("--fast".into()); }
     let generated = run("generate", video, &generation_args);
-    if i2v {
+    if i2v || editing {
         let _ = fs::remove_file(&reference_path);
     }
     generated?;
@@ -307,6 +316,7 @@ fn execute_with(
         complete["_local_cleanup"]["comfy_output_filename"] = result["source_filename"].clone();
     }
     let pending = home.join("media/pending-completion.json");
+    complete["_server"]=server.into();
     private_json(&pending, &complete)?;
     for attempt in 0..4 {
         let mut body = complete.clone();
@@ -408,6 +418,24 @@ fn occupy_media_slot(home: &Path) -> Result<fs::File, String> {
     Ok(file)
 }
 
+fn configured_servers(primary: &str, secondary: Option<&str>) -> Result<Vec<String>, String> {
+    let mut servers = vec![primary.trim_end_matches('/').to_string()];
+    if let Some(secondary) = secondary {
+        // Explicit owner configuration; remote jobs cannot select another queue.
+        if secondary != "https://chat.mundusx.ai" {
+            return Err("Secondary media queue must be https://chat.mundusx.ai".into());
+        }
+        if !servers.iter().any(|s| s == secondary) { servers.push(secondary.into()); }
+    }
+    Ok(servers)
+}
+fn completion_origin<'a>(body: &'a Value, servers: &'a [String]) -> Result<&'a str, String> {
+    let origin = body["_server"].as_str().unwrap_or(&servers[0]);
+    if !servers.iter().any(|s| s == origin) {
+        return Err("Pending completion belongs to an unconfigured service; artifact preserved".into());
+    }
+    Ok(origin)
+}
 pub fn serve(server: String, once: bool) -> Result<(), String> {
     if !(server.starts_with("https://") || server.starts_with("http://127.0.0.1:"))
         || server.contains('@')
@@ -416,6 +444,8 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
     {
         return Err("Use an HTTPS media-server origin".into());
     }
+    let servers = configured_servers(&server, std::env::var("OPENGPU_MEDIA_SECONDARY_SERVER_URL").ok().as_deref())?;
+    let mut cursor=0usize;
     let id = identity::load_identity()
         .map_err(|e| e.to_string())?
         .ok_or("Run opengpu install first")?;
@@ -434,8 +464,9 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
     let warm = if !once && warm_eligible(&initial) {
         Some(WarmRuntime::start(&home, initial.contribution_percent)?)
     } else { None };
-    println!("Media contributor listening for queued jobs");
+    println!("Media contributor listening for queued jobs on {} configured service(s)",servers.len());
     loop {
+        let server=servers[cursor%servers.len()].clone();cursor=cursor.wrapping_add(1);
         let cfg = config::load_config()
             .map_err(|e| e.to_string())?
             .ok_or("Missing contributor configuration")?;
@@ -457,7 +488,7 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
         )
         .into_iter()
         .filter(|profile| {
-            let op = if (profile.starts_with("qwen-") || profile.starts_with("dreamshaper-")) {
+            let op = if profile.starts_with("qwen-image-edit-") { crate::contribution_contract::Operation::ImageEdit } else if (profile.starts_with("qwen-") || profile.starts_with("dreamshaper-")) {
                 crate::contribution_contract::Operation::TextToImage
             } else if profile.starts_with("wan22-i2v-") {
                 crate::contribution_contract::Operation::ImageToVideo
@@ -465,6 +496,11 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
                 crate::contribution_contract::Operation::TextToVideo
             };
             cfg.contribution.operations.contains(&op)
+        })
+        .filter(|profile| {
+            // Optional narrow rollout on the additional queue only.
+            server == servers[0] || std::env::var("OPENGPU_MEDIA_SECONDARY_PROFILES").ok()
+                .is_none_or(|selected| selected.split(',').any(|p| p == profile))
         })
         .collect();
         if profiles.is_empty() {
@@ -484,7 +520,8 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
                 .as_object_mut()
                 .ok_or("Invalid pending completion")?
                 .remove("_local_cleanup");
-            request(&server, &id, &cfg.device_id, "complete", completion)?;
+            let origin = completion_origin(&body, &servers)?;
+            request(origin, &id, &cfg.device_id, "complete", completion)?;
             cleanup_completed_media(&home, &body["_local_cleanup"])?;
             fs::remove_file(&pending).map_err(|e| e.to_string())?;
         }
@@ -501,8 +538,8 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
                 if once {
                     return Err(error);
                 }
-                eprintln!("Media queue: {error}; retrying in 30 seconds");
-                thread::sleep(Duration::from_secs(30));
+                eprintln!("Media queue: {error}; checking the next configured queue after a short delay");
+                thread::sleep(Duration::from_secs(if servers.len()>1 {1}else{30}));
                 continue;
             }
         };
@@ -573,6 +610,16 @@ fn bundled_video_profiles() -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dual_queue_completions_are_bound_to_the_originating_service() {
+        let servers = configured_servers("https://private.example", Some("https://chat.mundusx.ai")).unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(completion_origin(&json!({"_server":"https://chat.mundusx.ai"}), &servers).unwrap(), "https://chat.mundusx.ai");
+        assert_eq!(completion_origin(&json!({}), &servers).unwrap(), "https://private.example");
+        assert!(completion_origin(&json!({"_server":"https://attacker.example"}), &servers).is_err());
+        assert!(configured_servers("https://private.example", Some("https://attacker.example")).is_err());
+        assert_eq!(configured_servers("https://chat.mundusx.ai/", Some("https://chat.mundusx.ai")).unwrap().len(), 1);
+    }
     #[test]
     fn serving_job_slot_is_exclusive_and_released_after_upload_scope() {
         let home = std::env::temp_dir().join(format!("media-slot-{}", uuid::Uuid::new_v4()));
@@ -799,6 +846,19 @@ mod tests {
     }
 
     #[test]
+    fn editing_requires_the_exact_model_profile_and_png_dimensions() {
+        let profile: Value = serde_json::from_str(media_runtime::EDIT_PROFILE).unwrap();
+        let mut job = json!({"profile_id":profile["id"],"quote":{"operation":"image_edit",
+            "model":profile["model"],"width":832,"height":480,"steps":4}});
+        assert_eq!(execution_profile(&job).unwrap(), (false, 2, "verified-edit-fast.json".into()));
+        job["quote"]["model"] = json!("Qwen/Qwen-Image");
+        assert!(execution_profile(&job).is_err());
+        job["quote"]["model"] = profile["model"].clone();
+        job["quote"]["width"] = json!(1024);
+        assert!(execution_profile(&job).is_err());
+    }
+
+    #[test]
     fn chooses_image_and_supported_video_profiles_and_rejects_mismatch() {
         let image: Value = serde_json::from_str(media_runtime::PROFILE).unwrap();
         let image_job = json!({"profile_id":image["id"],"quote":{"operation":"text_to_image"}});
@@ -882,6 +942,7 @@ fn execute_dreamshaper(server:&str,cfg:&Config,id:&DeviceIdentity,job:&Value)->R
  let artifact=Path::new(result["artifact"].as_str().ok_or("Missing artifact")?);
  if artifact.parent()!=Some(home.join("media/artifacts").as_path()){return Err("Image artifact escaped output root".into())}
  lease["_local_cleanup"]=json!({"artifact_name":artifact.file_name().and_then(|n|n.to_str()),"sha256":result["sha256"]});
+ lease["_server"]=server.into();
  let pending=home.join("media/pending-completion.json");private_json(&pending,&lease)?;
  let mut packet=lease.clone();packet.as_object_mut().unwrap().remove("_local_cleanup");
  request(server,id,&cfg.device_id,"complete",packet)?;
