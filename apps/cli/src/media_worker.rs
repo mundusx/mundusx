@@ -504,6 +504,8 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
         })
         .collect();
         if profiles.is_empty() {
+            // An unverified optional profile must not stop the primary queue.
+            if server != servers[0] { thread::sleep(Duration::from_secs(1)); continue; }
             return Err(
                 "Select image/video workloads and verify at least one profile before serving media"
                     .into(),
