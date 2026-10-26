@@ -37,6 +37,7 @@ pub fn resident(home: &Path) -> bool {
 /// A live helper owns the shared GPU slot; a leftover container alone is recovery.
 pub fn active(home: &Path) -> bool {
     let media = home.join("media");
+    if locked(&media.join("worker.lock")) && locked(&media.join("job.lock")) { return true; }
     if live_owner(home).is_some() && locked(&media.join("job.lock")) { return true; }
     let Ok(bytes) = fs::read(media.join("drain-request.json")) else { return false; };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false; };
@@ -53,6 +54,7 @@ pub fn request(home: &Path) -> Option<String> {
     if media.join("active-container.json").exists() && !resident(home) {
         return Some("container-recovery-required".to_string());
     }
+    if locked(&media.join("worker.lock")) && locked(&media.join("job.lock")) { return Some("media-job-active".into()); }
     // Keep the GPU reserved while idle without reporting a running job.
     if resident(home) && !locked(&media.join("media.lock")) {
         return Some("media-runtime-resident".into());
@@ -80,6 +82,15 @@ pub fn acknowledge(home: &Path, id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_image_job_reserves_slot_without_a_container_lease() {
+        let home=std::env::temp_dir().join(format!("native-drain-{}",uuid::Uuid::new_v4()));
+        let media=home.join("media");fs::create_dir_all(&media).unwrap();
+        let worker=fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(media.join("worker.lock")).unwrap();worker.lock().unwrap();
+        let job=fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(media.join("job.lock")).unwrap();job.lock().unwrap();
+        assert!(active(&home));assert_eq!(request(&home).as_deref(),Some("media-job-active"));
+        drop(job);assert!(!active(&home));assert!(request(&home).is_none());drop(worker);fs::remove_dir_all(home).unwrap();
+    }
     #[test]
     fn resident_runtime_reserves_memory_but_only_a_job_occupies_the_slot() {
         let home = std::env::temp_dir().join(format!("opengpu-warm-{}", uuid::Uuid::new_v4()));

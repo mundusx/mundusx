@@ -1,3 +1,5 @@
+#[path = "dreamshaper-runtime.rs"]
+pub mod dreamshaper;
 #[path = "operation-progress.rs"]
 mod operation_progress;
 // Embedded media helper used by the CLI and local node worker.
@@ -164,6 +166,7 @@ pub fn run_profile_with_owner(home: &Path, cap: u8, endpoint: Option<&str>, acti
 }
 
 pub fn verification(home: &Path, endpoint: Option<&str>, cap: u8) -> Option<Value> {
+    if dreamshaper::selected(home) { return dreamshaper::verification(home, cap); }
     profile_verification(home, endpoint, cap, false)
 }
 
@@ -223,6 +226,7 @@ fn profile_verification_with_memory(
 /// Exact duration/profile certificates eligible for queue advertisement.
 pub fn verified_profiles(home: &Path, endpoint: Option<&str>, cap: u8) -> Vec<String> {
     use sha2::{Digest, Sha256};
+    if dreamshaper::selected(home) { return if dreamshaper::require(home, cap).is_ok() { vec![dreamshaper::ID.into()] } else { vec![] }; }
     let budget = memory::MediaBudget::detect(cap);
     let mut profiles = vec![];
     for (source, suffix) in [(PROFILE, ""), (VIDEO_PROFILE, "-video"), (VIDEO_FAST_PROFILE, "-video-fast"), (I2V_PROFILE, "-i2v"), (I2V_FAST_PROFILE, "-i2v-fast")] {

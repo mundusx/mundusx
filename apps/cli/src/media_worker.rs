@@ -175,6 +175,7 @@ fn cleanup_completed_media(home: &std::path::Path, cleanup: &Value) -> Result<()
 }
 
 fn execute(server: &str, cfg: &Config, id: &DeviceIdentity, job: &Value, owner: Option<&str>) -> Result<(), String> {
+    if job["profile_id"] == media_runtime::dreamshaper::ID { return execute_dreamshaper(server,cfg,id,job); }
     execute_with(
         cfg,
         job,
@@ -456,7 +457,7 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
         )
         .into_iter()
         .filter(|profile| {
-            let op = if profile.starts_with("qwen-") {
+            let op = if (profile.starts_with("qwen-") || profile.starts_with("dreamshaper-")) {
                 crate::contribution_contract::Operation::TextToImage
             } else if profile.starts_with("wan22-i2v-") {
                 crate::contribution_contract::Operation::ImageToVideo
@@ -529,7 +530,10 @@ pub fn serve(server: String, once: bool) -> Result<(), String> {
                     }
                 }
             });
+            let activity_id=uuid::Uuid::new_v4().to_string();let activity_started=std::time::Instant::now();
+            let _=record_media_activity(&home,&activity_id,job,"running",None);
             let result = execute(&server, &cfg, &id, job, warm.as_ref().map(|runtime| runtime.owner.as_str()));
+            let _=record_media_activity(&home,&activity_id,job,if result.is_ok(){"completed"}else{"failed"},Some(activity_started.elapsed().as_millis() as u64));
             done.store(true, Ordering::Relaxed);
             let _ = thread.join();
             if let Err(e) = result {
@@ -864,4 +868,35 @@ mod tests {
         assert_eq!(fs::read_dir(home.join("media")).unwrap().count(), 0);
         fs::remove_dir_all(home).unwrap();
     }
+}
+
+fn execute_dreamshaper(server:&str,cfg:&Config,id:&DeviceIdentity,job:&Value)->Result<(),String>{
+ let home=config::config_dir();
+ if cfg.contribution.operations!=vec![crate::contribution_contract::Operation::TextToImage] ||
+ job["profile_id"]!=media_runtime::dreamshaper::ID || job["quote"]["operation"]!="text_to_image" || job["quote"]["width"]!=512 || job["quote"]["height"]!=512 || job["quote"]["steps"]!=20 || job["quote"]["model"]!=media_runtime::dreamshaper::MODEL {return Err("Job does not match the selected DreamShaper workflow".into())}
+ let result=media_runtime::dreamshaper::generate(&home,cfg.contribution_percent,job["prompt"].as_str().ok_or("Missing prompt")?,job["seed"].as_u64().ok_or("Missing seed")?)?;
+ let mut lease=json!({"job_id":job["job_id"],"lease_token":job["lease_token"]});let mut reserve=lease.clone();reserve["metadata"]=json!({"sha256":result["sha256"],"byte_size":result["bytes"]});
+ let ticket=request(server,id,&cfg.device_id,"reserve",reserve)?;
+ media_runtime::dreamshaper::upload(server,&ticket,&result)?;
+ lease["generation_ms"]=result["duration_ms"].clone();
+ let artifact=Path::new(result["artifact"].as_str().ok_or("Missing artifact")?);
+ if artifact.parent()!=Some(home.join("media/artifacts").as_path()){return Err("Image artifact escaped output root".into())}
+ lease["_local_cleanup"]=json!({"artifact_name":artifact.file_name().and_then(|n|n.to_str()),"sha256":result["sha256"]});
+ let pending=home.join("media/pending-completion.json");private_json(&pending,&lease)?;
+ let mut packet=lease.clone();packet.as_object_mut().unwrap().remove("_local_cleanup");
+ request(server,id,&cfg.device_id,"complete",packet)?;
+ cleanup_completed_media(&home,&lease["_local_cleanup"])?;fs::remove_file(pending).map_err(|e|e.to_string())?;
+ println!("DreamShaper image job completed and upload verified");Ok(())
+}
+
+fn record_media_activity(home:&Path,record:&str,job:&Value,status:&str,duration:Option<u64>)->Result<(),String>{
+ fs::create_dir_all(home).map_err(|e|e.to_string())?;
+ let lock=fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(home.join("desktop-jobs.lock")).map_err(|e|e.to_string())?;
+ lock.lock().map_err(|e|e.to_string())?;
+ let path=home.join("desktop-jobs.json");let mut rows:Vec<Value>=fs::read(&path).ok().filter(|b|b.len()<=256000).and_then(|b|serde_json::from_slice(&b).ok()).unwrap_or_default();
+ let started=rows.iter().find(|r|r["record_id"]==record).and_then(|r|r["started_at"].as_u64()).unwrap_or_else(now_seconds);
+ rows.retain(|r|r["record_id"]!=record);
+ rows.push(json!({"record_id":record,"job_id":job["job_id"],"model":job["quote"]["model"],"operation":"Generating image","status":status,"started_at":started,"updated_at":now_seconds(),"duration_ms":duration,"process_id":std::process::id()}));
+ while rows.len()>200 {let i=rows.iter().position(|r|r["status"]!="running").unwrap_or(0);rows.remove(i);}
+ atomic_value(&path,&json!(rows))
 }

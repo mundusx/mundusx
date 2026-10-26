@@ -258,7 +258,7 @@ fn worker_readiness(config: &AgentConfig) -> (WorkerHealthReport, WorkerPolicyRe
         .max(1);
     let verified = media_runtime::verified_profiles(&storage::config_dir(), config.contribution.comfyui_url.as_deref(), config.contribution_percent);
     health.media_profiles = verified.into_iter().filter(|id| {
-        config.contribution.operations.contains(&if id.starts_with("qwen-") { contribution_contract::Operation::TextToImage } else if id.starts_with("wan22-i2v-") { contribution_contract::Operation::ImageToVideo } else { contribution_contract::Operation::TextToVideo })
+        config.contribution.operations.contains(&if (id.starts_with("qwen-") || id.starts_with("dreamshaper-")) { contribution_contract::Operation::TextToImage } else if id.starts_with("wan22-i2v-") { contribution_contract::Operation::ImageToVideo } else { contribution_contract::Operation::TextToVideo })
     }).collect();
     health.media_budget_bytes = media_runtime::memory::MediaBudget::detect(config.contribution_percent).contribution_budget_bytes.unwrap_or(0);
     if !config.contribution.llm_enabled() {
@@ -850,7 +850,7 @@ fn build_scheduler_capabilities(
             operations: {
                 let mut operations = if config.contribution.llm_enabled() { vec![contribution_contract::Operation::Llm] } else { vec![] };
                 for profile in &health.media_profiles {
-                    let operation = if profile.starts_with("qwen-") { contribution_contract::Operation::TextToImage } else if profile.starts_with("wan22-i2v-") { contribution_contract::Operation::ImageToVideo } else { contribution_contract::Operation::TextToVideo };
+                    let operation = if (profile.starts_with("qwen-") || profile.starts_with("dreamshaper-")) { contribution_contract::Operation::TextToImage } else if profile.starts_with("wan22-i2v-") { contribution_contract::Operation::ImageToVideo } else { contribution_contract::Operation::TextToVideo };
                     if !operations.contains(&operation) { operations.push(operation); }
                 }
                 operations
@@ -2273,6 +2273,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             std::process::exit(3);
         }
     };
+    worker::publish_worker_build();
     let mut config = load_config_or_exit();
     if normalize_verified_tool_capability(&mut config) {
         if let Err(error) = save_agent_config(&config) {
@@ -2397,6 +2398,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
         return;
     }
 
+    let mut last_paused=config.paused;
     loop {
         // Job claims should not wait for the five-second heartbeat cadence.
         // Keep presence traffic at its normal rate while checking for work
@@ -2420,7 +2422,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             }
         };
 
-        if !should_agent_run(&latest_config) {
+        if !latest_config.connected {
             let heartbeat = heartbeat_from_snapshot(
                 &heartbeat_snapshot,
                 &latest_config,
@@ -2456,6 +2458,15 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             thread::sleep(Duration::from_millis(200));
             continue;
         }
+        if latest_config.paused {
+            if !last_paused || last_heartbeat_sent.elapsed()>=Duration::from_secs(interval) {
+                let heartbeat=heartbeat_from_snapshot(&heartbeat_snapshot,&latest_config,AgentState::Paused);
+                let _=save_agent_state(&heartbeat);let _=save_heartbeat(&heartbeat);send_heartbeat(&latest_config,&identity,&heartbeat,verbose);last_heartbeat_sent=Instant::now();
+            }
+            last_paused=true;
+            thread::sleep(Duration::from_millis(200));continue;
+        }
+        if last_paused {last_heartbeat_sent=Instant::now()-Duration::from_secs(interval);last_paused=false;}
         if let Some(worker) = media_worker.as_mut() { worker.maintain(&latest_config); }
 
         while let Ok(mut refreshed) = health_refresh_rx.try_recv() {
