@@ -30,3 +30,14 @@ opengpu-node-agent run
 These are owner-side environment settings. Remote requests cannot choose new servers or local input paths. One worker lock and GPU job lock serialize both queues. Pending completion records retain their original server; completion retries cannot send a private result to another service. Existing endpoint-scoped gateway credentials are never applied to the public origin. The secondary heartbeat advertises only the configured subset; no LLM work is mirrored.
 
 The helper handoff token takes precedence over the generic active-job marker so the node acknowledges the actual GPU handoff request.
+
+
+## Two-image local edits
+
+`workers/media/edit-with-reference.sh` is a local convenience launcher for the installed two-input CLI. On the media GX10 it is installed as `~/.opengpu/media/edit-with-reference.sh`, with shortcut `~/.local/bin/opengpu-edit-reference`.
+
+```sh
+opengpu-edit-reference /home/a/artifacts/TARGET.png /home/a/artifacts/REFERENCE.png "Apply the jacket from image 2 to the person in image 1."
+```
+
+The first file is the target scene; the second file is the reference. The script validates both PNG headers, prints the exact underlying command, and leaves source images intact. Add `--dry-run` before the paths for validation without model execution. Optional trailing arguments include `--seed 42` or slower `--quality --preserve-size`.
