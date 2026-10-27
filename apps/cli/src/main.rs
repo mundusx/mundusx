@@ -188,6 +188,9 @@ enum Commands {
         /// Select Qwen Image Edit with a reference PNG
         #[arg(long, global = true, conflicts_with_all = ["video", "image_to_video"])]
         image_edit: bool,
+        /// Second PNG reference for a local image edit; the primary input remains the scene
+        #[arg(long, global = true, requires = "image_edit", conflicts_with_all = ["video", "image_to_video"])]
+        reference_image: Option<PathBuf>,
         /// Four-step Lightning video at 832x480 (default for video)
         #[arg(long, global = true, requires = "media_video_profile")]
         fast: bool,
@@ -7319,7 +7322,7 @@ fn main() {
             setup_media,
             yes,
         ),
-        Commands::Media { command, video, image_to_video, image_edit, fast, quality, preserve_size, width, height, steps, seconds } => {
+        Commands::Media { command, video, image_to_video, image_edit, reference_image, fast, quality, preserve_size, width, height, steps, seconds } => {
             if !(1..=10).contains(&seconds) { eprintln!("Video seconds must be an integer from 1 to 10"); std::process::exit(2); }
             if let MediaCommands::Serve { server, once } = command {
                 if let Err(error) = media_worker::serve(server, once) { eprintln!("{error}"); std::process::exit(1); }
@@ -7344,6 +7347,7 @@ fn main() {
                     ("generate", args)
                 },
             };
+            if let Some(path) = reference_image { extra.extend(["--reference-image".into(), path.to_string_lossy().into_owned()]); }
             if image_edit { extra.push("--image-edit".into()); }
             if image_edit && quality { extra.push("--quality".into()); }
             if preserve_size { extra.push("--preserve-size".into()); }
@@ -10372,5 +10376,21 @@ mod edit_flag_tests {
             vec!["opengpu","media","--image-edit","--steps","40","plan"],
             vec!["opengpu","media","--image-edit","--preserve-size","--width","1024","--height","1536","plan"],
         ] { assert!(Cli::try_parse_from(args).is_err()); }
+    }
+}
+
+#[cfg(test)]
+mod reference_image_flag_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn second_reference_is_limited_to_image_edit() {
+        let cli=Cli::try_parse_from(["opengpu","media","--image-edit","--quality","--reference-image","reference.png","generate","--input-image","scene.png","--prompt","Use the reference color palette"]).unwrap();
+        assert!(matches!(cli.command,Commands::Media{reference_image:Some(_),image_edit:true,..}));
+        for args in [
+            vec!["opengpu","media","--reference-image","reference.png","plan"],
+            vec!["opengpu","media","--image-to-video","--reference-image","reference.png","plan"],
+            vec!["opengpu","media","--image-edit","--reference-image","one.png","--reference-image","two.png","plan"],
+        ] {assert!(Cli::try_parse_from(args.clone()).is_err(), "accepted {args:?}");}
     }
 }
