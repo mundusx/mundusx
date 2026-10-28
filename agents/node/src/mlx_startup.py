@@ -118,7 +118,11 @@ def stable_host_prefix(tokenizer, request, template_args, tokenized):
     host instructions separately from changing tool catalogs and observations,
     including requests whose final message is a system or tool message.
     """
-    prompt, segments, segment_types, initial_state = tokenized
+    # MLX versions with vision support append a fifth item. Preserve all
+    # runtime metadata and leave multimodal prompts untouched.
+    if len(tokenized) < 4 or (len(tokenized) > 4 and tokenized[4] is not None):
+        return tokenized
+    prompt, segments, segment_types, initial_state = tokenized[:4]
     if (request.request_type != 'chat' or not request.messages
             or request.messages[0].get('role') != 'system'
             or not getattr(tokenizer, 'has_chat_template', False)
@@ -153,7 +157,7 @@ def stable_host_prefix(tokenizer, request, template_args, tokenized):
         result.append(prompt[start:end])
         kinds.append(kind)
         start = end
-    return prompt, result, kinds, initial_state
+    return (prompt, result, kinds, initial_state, *tokenized[4:])
 
 
 def install_stable_host_cache(server):
@@ -251,7 +255,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 9}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 10}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))

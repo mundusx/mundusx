@@ -6,6 +6,22 @@ from mlx_startup import stable_host_prefix
 
 
 class StableHostCacheTests(unittest.TestCase):
+    def test_vision_runtime_tuple_preserves_metadata(self):
+        def parser(): pass
+        parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
+        prefix = list(range(300))
+        tokenizer = SimpleNamespace(has_chat_template=True, tool_parser=parser,
+            apply_chat_template=lambda *a, **k: prefix + [999])
+        request = SimpleNamespace(request_type='chat', messages=[{'role':'system','content':'s'}])
+        original = (prefix + [800], [prefix + [800]], ['assistant'], 'normal', None)
+        result = stable_host_prefix(tokenizer, request, {}, original)
+        self.assertEqual(len(result), 5)
+        self.assertIsNone(result[4])
+        self.assertEqual(sum(result[1], []), original[0])
+        vision = object()
+        multimodal = (*original[:4], vision)
+        self.assertIs(stable_host_prefix(tokenizer, request, {}, multimodal), multimodal)
+
     def test_system_and_tool_endings_keep_exact_tokens_and_thinking_tail(self):
         def parser(): pass
         parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
@@ -104,7 +120,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 9})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 10})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 
