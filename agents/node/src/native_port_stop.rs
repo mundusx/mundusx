@@ -19,9 +19,11 @@ pub fn applies(payload:&Value)->bool { active_port(payload).is_some() }
 pub fn guard(payload:&Value,message:&Value)->Option<Value> {
     let port=active_port(payload)?;
     let expected=probe(port);
-    let messages=payload["messages"].as_array()?;
+    let all=payload["messages"].as_array()?;
+    let start=all.iter().rposition(|m|m["role"]=="user")?+1;
+    let messages=&all[start..];
     // Only accept evidence from a result tied to our exact read-only command.
-    if let Some(result)=messages.last().filter(|m|m["role"]=="tool") {
+    if let Some(result)=messages.iter().rev().find(|m|m["role"]=="tool") {
         let id=result["tool_call_id"].as_str()?;
         let matched=messages.iter().filter_map(|m|m["tool_calls"].as_array()).flatten().any(|call|{
             call["id"]==id && call["function"]["name"]=="run_in_terminal" &&
@@ -58,4 +60,5 @@ pub fn guard(payload:&Value,message:&Value)->Option<Value> {
  #[test]fn matching_no_listener_evidence_ends_the_loop(){let mut p=body();p["messages"].as_array_mut().unwrap().extend([call(&probe(3000)),json!({"role":"tool","tool_call_id":"c","content":"MUNDUSX_NO_LISTENER:3000"})]);let result=guard(&p,&call("taskkill /F /IM npm.cmd")).unwrap();assert!(result.get("tool_calls").is_none());p["messages"][2]["tool_call_id"]="wrong".into();assert!(guard(&p,&json!({"role":"assistant","content":"x"})).is_none());}
  #[test]fn other_tasks_and_injected_ports_are_untouched(){for text in ["hello","kill localhost:3000; anything","stop localhost:99999"]{let p=json!({"messages":[{"role":"user","content":text}]});assert!(guard(&p,&call("taskkill /F /IM node.exe")).is_none());}}
  #[test]fn repeated_blanket_kill_after_inspection_ends_without_claiming_shutdown(){let mut p=body();p["messages"].as_array_mut().unwrap().extend([call(&probe(3000)),json!({"role":"tool","tool_call_id":"c","content":"Listener PID 123"})]);let result=guard(&p,&call("taskkill /F /IM node.exe")).unwrap();assert!(result.get("tool_calls").is_none());assert!(result["content"].as_str().unwrap().contains("not confirmed"));}
+ #[test]fn developer_guidance_does_not_hide_current_result_and_new_requests_do_not_reuse_it(){let mut p=body();p["messages"].as_array_mut().unwrap().extend([call(&probe(3000)),json!({"role":"tool","tool_call_id":"c","content":"MUNDUSX_NO_LISTENER:3000"}),json!({"role":"developer","content":"Stop only a verified listener."})]);assert!(guard(&p,&json!({})).is_some());p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"stop localhost:3000"}));assert!(guard(&p,&json!({})).is_none());}
 }

@@ -2921,6 +2921,10 @@ fn run_native_openai_tool_turn_with_mode(
     let streaming = live_delta_enabled();
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
+    if let Some(message)=native_port_stop::guard(&payload,&serde_json::json!({})) {
+        if streaming {emit_stream_delta(&serde_json::json!({"content":message["content"]}).to_string());}
+        return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"stop"}]}));
+    }
     if let Some(message)=(!host_managed).then(||native_tool_workflow::literal_inspection_output(&payload)).flatten() {
         if streaming {emit_stream_delta(&serde_json::json!({"content":message["content"]}).to_string());}
         return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"stop"}]}));
