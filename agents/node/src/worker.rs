@@ -2,6 +2,8 @@
 mod download_progress;
 #[path = "native_stream.rs"]
 mod native_stream;
+#[path = "native_port_stop.rs"]
+mod native_port_stop;
 #[path = "native_tool_workflow.rs"]
 mod native_tool_workflow;
 #[path = "native_terminal_report.rs"]
@@ -2954,6 +2956,7 @@ fn native_host_argument_limit(payload:Option<&serde_json::Value>,message:&serde_
 }
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     (|| {
         let compiled=native_http_bridge::compile(payload,message)?;
         let compiled=match native_line_edit::compile(payload,&compiled) {
@@ -3532,7 +3535,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
             }
             // Tool arguments remain private until the entire batch is valid.
             // Prose still streams immediately; recovery must not duplicate it.
-            if !retry && !payload.is_some_and(native_tool_workflow::is_file_turn) {
+            if !retry && !payload.is_some_and(|p|native_tool_workflow::is_file_turn(p)||native_port_stop::applies(p)) {
                 if let Some(content) = delta["content"].as_str().filter(|s| !s.is_empty()) {
                     output.push_str(content);
                     pending_content.push_str(content);
@@ -3554,7 +3557,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     if !done || reason.is_none() {
         return Err("native stream ended before terminal event".into());
     }
-    if !pending_content.is_empty() && !payload.is_some_and(native_tool_workflow::is_file_turn) {
+    if !pending_content.is_empty() && !payload.is_some_and(|p|native_tool_workflow::is_file_turn(p)||native_port_stop::applies(p)) {
         emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
     }
     let mut message = assembled.message();
@@ -3580,7 +3583,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     }
     let argument_limit=native_host_argument_limit(payload,&message,workflow_changed);
     validate_native_tool_message_with_limit(&message,reason.as_deref(),argument_limit)?;
-    if payload.is_some_and(native_tool_workflow::is_file_turn) {
+    if payload.is_some_and(|p|native_tool_workflow::is_file_turn(p)||native_port_stop::applies(p)) {
         if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
             emit_stream_delta(&serde_json::json!({"content":content}).to_string());
         }
