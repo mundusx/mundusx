@@ -4,6 +4,8 @@ mod desktop_activity;
 mod download_progress;
 #[path = "native_stream.rs"]
 mod native_stream;
+#[path = "native_host_recovery.rs"]
+mod native_host_recovery;
 #[path = "native_port_stop.rs"]
 mod native_port_stop;
 #[path = "native_tool_workflow.rs"]
@@ -3013,6 +3015,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
     if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     if host_managed_tools(payload) {
         // The IDE owns its filesystem, tool execution, approvals and recovery.
+        native_host_recovery::reject_existing_create(payload,message)?;
         // Validate the registered wire contract without inventing host actions.
         let metadata = native_tool_workflow::terminal_metadata(payload, message);
         validate_native_tool_schema(payload, &metadata)?;
@@ -3465,11 +3468,11 @@ fn run_native_tool_attempts(
         let mut output = String::new();
         return match attempt(&payload, &mut output, false) {
             Err(error) if error.starts_with("native tool schema precondition failed:")
-                || error.starts_with("native tool arguments are incomplete:") => {
-                let messages = payload["messages"].as_array_mut().ok_or_else(||error.clone())?;
-                messages.push(serde_json::json!({"role":"system","name":"opengpu_schema_repair",
-                    "content":format!("The previous model output was rejected before execution: {error}. Return one corrected function call with valid JSON arguments matching the registered schema. Include every required property. Preserve the user's operation and data. No tool was executed by this failed attempt; do not claim success.")}));
-                attempt(&payload, &mut output, true)
+                || error.starts_with("native tool arguments are incomplete:")
+                || error.starts_with("native host action precondition failed:") => {
+                let repaired=native_host_recovery::repair_request(&payload,&error);
+                output.clear();
+                attempt(&repaired, &mut output, true).map_err(|e|format!("native tool recovery failed after one retry: {e}"))
             }
             result => result,
         };
@@ -3559,6 +3562,23 @@ fn run_native_tool_attempts(
             })
         }
         Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn host_schema_repair_stops_after_one_retry_for_every_model() {
+    for model in ["qwen3-coder","nemotron","another-provider"] {
+        let schema=serde_json::json!({"type":"object","required":["command","mode"],"properties":{"command":{"type":"string"},"mode":{"type":"string","enum":["sync","async"]}}});
+        let tool=serde_json::json!({"function":{"name":"run_in_terminal","parameters":schema}});
+        let p=serde_json::json!({"model":model,HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"start the server"}],"tools":[tool]});
+        assert!(host_managed_tools(&p));
+        let mut attempts=0;
+        let result=run_native_tool_attempts(p,|body,_,retry|{
+            attempts+=1;assert_eq!(body["model"],model);
+            if retry {assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");}
+            Err("native tool schema precondition failed: run_in_terminal.mode is required".into())
+        });
+        assert_eq!(attempts,2);assert!(result.unwrap_err().starts_with("native tool recovery failed after one retry:"));
     }
 }
 
