@@ -333,6 +333,14 @@ def bounded_prompt_cache(cache_class, max_bytes):
             kwargs["max_bytes"] = min(kwargs.get("max_bytes", max_bytes), max_bytes)
             super().__init__(max_size=max_size, **kwargs)
 
+        def insert_cache(self, model, tokens, prompt_cache, **kwargs):
+            # MLX removes shorter prefixes before enforcing its byte limit.
+            # An oversized replacement would therefore erase useful prefixes
+            # and then evict itself, making every later tool turn fully cold.
+            if sum(entry.nbytes for entry in prompt_cache) > self.max_bytes:
+                return
+            return super().insert_cache(model, tokens, prompt_cache, **kwargs)
+
     return BoundedPromptCache
 
 
