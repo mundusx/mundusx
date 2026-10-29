@@ -3471,7 +3471,9 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool arguments are incomplete:")
                 || error.starts_with("native host action precondition failed:") => {
                 let repaired=native_host_recovery::repair_request(&payload,&error);
-                output.clear();
+                // Prose from the first attempt may already be visible to the
+                // client. Retry parsing suppresses new prose; retain the
+                // delivered prefix so the final message can reconcile it.
                 attempt(&repaired, &mut output, true).map_err(|e|format!("native tool recovery failed after one retry: {e}"))
             }
             result => result,
@@ -3562,6 +3564,41 @@ fn run_native_tool_attempts(
             })
         }
         Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn host_schema_repair_preserves_streamed_prose_in_final_message() {
+    use serde_json::{json, Value};
+    for model in ["qwen3-coder", "nemotron", "another-provider"] {
+        let mut payload=terminal_metadata_fixture();
+        payload[HOST_MANAGED_TOOLS]=json!(true);
+        payload["model"]=json!(model);
+        let prose="I'll examine the current files first.\n";
+        let wire=|retry:bool| {
+            let args=if retry {json!({"command":"Get-Content index.html","mode":"sync","goal":"Inspect layout","explanation":"Read existing HTML"})}
+                else {json!({"command":"Get-Content index.html","goal":"Inspect layout","explanation":"Read existing HTML"})};
+            let text=if retry {"Retry prose must not be emitted twice."} else {prose};
+            let call=json!({"index":0,"id":if retry {"valid"} else {"rejected"},"type":"function","function":{"name":"run_in_terminal","arguments":args.to_string()}});
+            format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":text}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]}))
+        };
+        let (tx,rx)=mpsc::channel();
+        let mut attempts=0;
+        let encoded=with_stream_delta_sender(Some(tx),||run_native_tool_attempts(payload,|body,output,retry| {
+            attempts+=1;
+            parse_native_openai_stream_with_context(io::Cursor::new(wire(retry)),output,retry,Some(body))
+        })).unwrap();
+        assert_eq!(attempts,2);
+        let final_result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+        let mut delivered=native_stream::NativeStream::default();
+        for delta in rx.try_iter() { delivered.push(&serde_json::from_str::<Value>(&delta).unwrap()).unwrap(); }
+        assert_eq!(delivered.message()["content"],prose);
+        assert_eq!(final_result["message"]["content"],prose);
+        assert_eq!(delivered.message()["tool_calls"][0]["id"],"valid");
+        assert_eq!(delivered.remainder(&final_result["message"]).unwrap(),json!({}));
+        assert_eq!(delivered.message(),final_result["message"]);
     }
 }
 
