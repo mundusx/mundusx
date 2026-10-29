@@ -9,8 +9,24 @@ use std::{
 const GIB: u64 = 1 << 30;
 // Shared across all sessions, in addition to active per-slot KV caches.
 pub fn prompt_cache_bytes(physical_mb:u32, cap:u8)->u64 {
+    let requested=std::env::var("OPENGPU_MLX_RETAINED_CACHE_GIB").ok().and_then(|s|s.parse::<u64>().ok()).filter(|n|*n<=8);
+    retained_cache_budget(physical_mb,cap,requested)
+}
+fn retained_cache_budget(physical_mb:u32, cap:u8, requested_gib:Option<u64>)->u64 {
     let budget = u64::from(physical_mb) * (1 << 20) * u64::from(cap.min(100)) / 100;
-    if budget >= 32 * GIB { 4 * GIB } else { 0 }
+    if budget < 32 * GIB {return 0}
+    // Opt-in only: the context admission calculation below reserves this same
+    // amount before allocating per-slot KV memory. Fleet defaults stay intact.
+    requested_gib.map(|n|n.min(8)*GIB).unwrap_or(4*GIB).min(budget/4)
+}
+
+#[test]
+fn retained_cache_override_remains_inside_the_contribution_budget() {
+    assert_eq!(retained_cache_budget(65536,100,Some(8)),8*GIB);
+    assert_eq!(retained_cache_budget(65536,80,None),4*GIB);
+    assert_eq!(retained_cache_budget(16384,100,Some(8)),0);
+    assert_eq!(retained_cache_budget(65536,100,Some(0)),0);
+    assert!(retained_cache_budget(65536,50,Some(8))<=32*GIB/4);
 }
 
 pub fn context_tokens(

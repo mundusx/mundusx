@@ -6,6 +6,41 @@ from mlx_startup import stable_host_prefix
 
 
 class StableHostCacheTests(unittest.TestCase):
+    def test_oversized_replacement_does_not_enter_destructive_parent_insert(self):
+        class Parent:
+            def __init__(self, max_size, max_bytes):
+                self.max_bytes = max_bytes
+                self.entries = []
+            def insert_cache(self, model, tokens, cache, **kwargs):
+                # Reproduce MLX removing prefixes before enforcing the cap.
+                self.entries = [(model, tokens, cache)]
+                if sum(c.nbytes for c in cache) > self.max_bytes:
+                    self.entries = []
+        cache = bounded_prompt_cache(Parent, 4 * 1024**3)(max_size=6)
+        prefix = [SimpleNamespace(nbytes=1024)]
+        cache.insert_cache('model', [1, 2], prefix, cache_type='system')
+        cache.insert_cache('model', [1, 2, 3], [SimpleNamespace(nbytes=4800000000)])
+        self.assertEqual(cache.entries, [('model', [1, 2], prefix)])
+        # A fitting replacement is still admitted; explicit smaller limits win.
+        cache.insert_cache('model', [1, 2, 4], [SimpleNamespace(nbytes=2048)])
+        self.assertEqual(cache.entries[0][1], [1, 2, 4])
+        self.assertEqual(bounded_prompt_cache(Parent, 4096)(max_bytes=512).max_bytes, 512)
+
+    @unittest.skipUnless(importlib.util.find_spec('mlx'), 'requires native MLX')
+    def test_real_mlx_preserves_reusable_prefix_after_oversized_insert(self):
+        from mlx_lm.models.cache import LRUPromptCache
+        class KV:
+            def __init__(self, nbytes): self.nbytes = nbytes
+            def is_trimmable(self): return True
+        cache = bounded_prompt_cache(LRUPromptCache, 4294967296)(max_size=6)
+        cache.insert_cache('model', [1, 2, 3], [KV(1024)], cache_type='system')
+        cache.insert_cache('model', [1, 2, 3, 4], [KV(4800000000)])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 1024)
+        _, rest = cache.fetch_nearest_cache('model', [1, 2, 3, 4])
+        self.assertEqual(rest, [4])
+
+
     def test_vision_runtime_tuple_preserves_metadata(self):
         def parser(): pass
         parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
