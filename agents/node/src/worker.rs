@@ -3591,13 +3591,21 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
         emit_stream_delta(&delta.to_string());
     }
     normalize_native_openai_tool_response_with_limit(
-        &serde_json::json!({"choices":[{"message":message,"finish_reason":reason.unwrap()}]}),
+        &serde_json::json!({"choices":[{"message":message,"finish_reason":reason.unwrap()}],"usage":usage}),
         argument_limit,
     )
 }
 
 fn normalize_native_openai_tool_response(value: &serde_json::Value) -> Result<String, String> {
     normalize_native_openai_tool_response_with_limit(value,16384)
+}
+
+#[test]
+fn native_envelope_preserves_actual_cached_token_usage() {
+    let usage=serde_json::json!({"prompt_tokens":49197,"completion_tokens":12,"total_tokens":49209,"prompt_tokens_details":{"cached_tokens":43000}});
+    let encoded=normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":{"role":"assistant","content":"Done"},"finish_reason":"stop"}],"usage":usage})).unwrap();
+    let result:serde_json::Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    assert_eq!(result["usage"],usage);
 }
 fn normalize_native_openai_tool_response_with_limit(value:&serde_json::Value,argument_limit:usize)->Result<String,String> {
     let message = value
@@ -3630,7 +3638,7 @@ fn normalize_native_openai_tool_response_with_limit(value:&serde_json::Value,arg
     }
     Ok(format!(
         "{OPENAI_TOOL_RESULT_PREFIX}{}",
-        serde_json::json!({"message": message, "finish_reason": finish_reason})
+        serde_json::json!({"message": message, "finish_reason": finish_reason, "usage": value.get("usage").filter(|v|v.is_object())})
     ))
 }
 
