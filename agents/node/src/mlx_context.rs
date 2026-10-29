@@ -9,8 +9,23 @@ use std::{
 const GIB: u64 = 1 << 30;
 // Shared across all sessions, in addition to active per-slot KV caches.
 pub fn prompt_cache_bytes(physical_mb:u32, cap:u8)->u64 {
-    let requested=std::env::var("OPENGPU_MLX_RETAINED_CACHE_GIB").ok().and_then(|s|s.parse::<u64>().ok()).filter(|n|*n<=8);
+    let requested=std::env::var("OPENGPU_MLX_RETAINED_CACHE_GIB").ok().and_then(|s|s.parse::<u64>().ok()).filter(|n|*n<=8)
+        .or_else(||read_retained_policy(&crate::storage::config_dir().join("mlx-runtime-policy.json")));
     retained_cache_budget(physical_mb,cap,requested)
+}
+fn read_retained_policy(path:&Path)->Option<u64> {
+    if fs::metadata(path).ok()?.len()>4096 {return None}
+    let value:Value=serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    value["retained_cache_gib"].as_u64().filter(|n|*n<=8)
+}
+
+#[test]
+fn retained_cache_policy_validates_values_without_environment_mutation() {
+    let path=std::env::temp_dir().join(format!("mlx-policy-{}.json",uuid::Uuid::new_v4()));
+    for (content,expected) in [(r#"{"retained_cache_gib":8}"#,Some(8)),(r#"{"retained_cache_gib":0}"#,Some(0)),(r#"{"retained_cache_gib":99}"#,None),(r#"{"retained_cache_gib":"8"}"#,None),("invalid",None)] {
+        fs::write(&path,content).unwrap();assert_eq!(read_retained_policy(&path),expected);
+    }
+    fs::remove_file(path).unwrap();
 }
 fn retained_cache_budget(physical_mb:u32, cap:u8, requested_gib:Option<u64>)->u64 {
     let budget = u64::from(physical_mb) * (1 << 20) * u64::from(cap.min(100)) / 100;
@@ -44,7 +59,7 @@ pub fn context_tokens(
     let config: Value =
         serde_json::from_slice(&fs::read(directory.join("config.json")).ok()?).ok()?;
     let weights = weight_bytes(&directory).or(model.size_bytes)?;
-    limit(&config, weights, physical_mb, cap, slots, override_tokens)
+    limit_with_retained(&config, weights, physical_mb, cap, slots, override_tokens, prompt_cache_bytes(physical_mb,cap))
 }
 
 fn weight_bytes(directory: &Path) -> Option<u64> {
@@ -138,13 +153,19 @@ fn cached_directory(model: &ModelCapability, model_dir: &Path) -> Option<PathBuf
     None
 }
 
-fn limit(
+#[cfg(test)]
+fn limit(config:&Value,weights:u64,physical_mb:u32,cap:u8,slots:u8,requested:Option<u32>)->Option<u32> {
+    limit_with_retained(config,weights,physical_mb,cap,slots,requested,retained_cache_budget(physical_mb,cap,None))
+}
+
+fn limit_with_retained(
     config: &Value,
     weights: u64,
     physical_mb: u32,
     cap: u8,
     slots: u8,
     requested: Option<u32>,
+    retained_bytes: u64,
 ) -> Option<u32> {
     let c = config.get("text_config").unwrap_or(config);
     // Next keeps dense KV only at its full-attention layers, plus fixed
@@ -205,7 +226,7 @@ fn limit(
     // fixed 4 GiB workspace reserve for Next, separately from its full weights,
     // fixed recurrent state, retained prefix cache and active KV allocations.
     let workspace=if hybrid {4*GIB} else {(4*GIB).max(weights/4)};
-    let reserve = workspace + prompt_cache_bytes(physical_mb, cap);
+    let reserve = workspace + retained_bytes;
     let remaining = budget.checked_sub(weights)?.checked_sub(reserve)?
         .checked_sub(fixed_per_slot.checked_mul(u64::from(slots.max(1)))?)?;
     let memory_limit = remaining / per_token.checked_mul(u64::from(slots.max(1)))?;
@@ -248,10 +269,10 @@ mod tests {
     }
     #[test]
     fn retained_cache_is_disabled_when_the_contribution_budget_is_small() {
-        assert_eq!(prompt_cache_bytes(8192, 50), 0);
-        assert_eq!(prompt_cache_bytes(32768, 80), 0);
-        assert_eq!(prompt_cache_bytes(65536, 30), 0);
-        assert_eq!(prompt_cache_bytes(65536, 80), 4 * GIB);
+        assert_eq!(retained_cache_budget(8192, 50,None), 0);
+        assert_eq!(retained_cache_budget(32768, 80,None), 0);
+        assert_eq!(retained_cache_budget(65536, 30,None), 0);
+        assert_eq!(retained_cache_budget(65536, 80,None), 4 * GIB);
     }
     #[test]
     fn override_is_clamped_to_model_and_memory_limits() {
