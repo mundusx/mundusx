@@ -2,7 +2,44 @@ import unittest
 import importlib.util
 from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, AutomaticToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
 from types import SimpleNamespace
-from mlx_startup import stable_host_prefix
+from mlx_startup import stable_host_prefix, install_generation_progress
+from unittest.mock import patch
+import io
+
+
+class GenerationProgressTests(unittest.TestCase):
+    def test_only_actual_tokens_report_progress_and_requests_remain_independent(self):
+        items = [SimpleNamespace(token=1), SimpleNamespace(token=2), SimpleNamespace(token=3)]
+        class Generator:
+            def generate(self): return 'ctx', iter(items)
+        class Handler:
+            def handle_completion(self):
+                ctx, response = Generator().generate()
+                self.assert_ctx = ctx
+                return list(response)
+        install_generation_progress(SimpleNamespace(APIHandler=Handler, ResponseGenerator=Generator))
+        handler = Handler()
+        handler.body = {'chat_template_kwargs': {'opengpu_report_token_progress': True}}
+        handler.stream = True
+        handler.wfile = io.BytesIO()
+        with patch('mlx_startup.time.monotonic', side_effect=[0, .2, 1.1]):
+            self.assertEqual(handler.handle_completion(), items)
+        self.assertEqual(handler.wfile.getvalue(), b': opengpu-model-tokens 1\n\n: opengpu-model-tokens 3\n\n')
+        handler.wfile = io.BytesIO()
+        with patch('mlx_startup.time.monotonic', side_effect=[0, .2, 1.1]):
+            handler.handle_completion()
+        self.assertTrue(handler.wfile.getvalue().startswith(b': opengpu-model-tokens 1\n'))
+        for streamed, body in [(False, handler.body), (True, {})]:
+            handler.stream, handler.body, handler.wfile = streamed, body, io.BytesIO()
+            self.assertEqual(handler.handle_completion(), items)
+            self.assertEqual(handler.wfile.getvalue(), b'')
+        # An active request with no generated tokens reports no progress.
+        items.clear()
+        handler.stream = True
+        handler.body = {'chat_template_kwargs': {'opengpu_native_tool_guard': True}}
+        handler.wfile = io.BytesIO()
+        self.assertEqual(handler.handle_completion(), [])
+        self.assertEqual(handler.wfile.getvalue(), b'')
 
 
 class StableHostCacheTests(unittest.TestCase):
@@ -155,7 +192,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 10})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "buffered_tool_token_progress": True, "version": 12})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 

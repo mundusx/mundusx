@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import threading
 import re
+import time
 
 PREFIX = "MUNDUSX_LOAD_PROGRESS:"
 BATCH_BYTES = 64 * 1024 * 1024
@@ -201,7 +202,7 @@ def install_required_tool_opening(server, mx):
                 tuple(tokenizer.encode('<tool_call>', add_special_tokens=False)),
                 tuple(tuple(tokenizer.encode('<tool_call>\n<function=' + name + '>\n', add_special_tokens=False)) for name in names),
             )
-        args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard')}
+        args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard', 'opengpu_report_token_progress')}
         return original_tokenize(self, tokenizer, request, args)
 
     def processors(args):
@@ -255,7 +256,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 10}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "buffered_tool_token_progress": True, "version": 12}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -282,6 +283,46 @@ def complete_qwen_call_parser(parser):
         # Never synthesize missing values, closing tags, or additional calls.
         return parser(block, tools)
     return parse
+
+
+def install_generation_progress(server):
+    """Report actual generated tokens while MLX buffers a complete tool call."""
+    local = threading.local()
+    original_handle = server.APIHandler.handle_completion
+    original_generate = server.ResponseGenerator.generate
+
+    def handle(self, *args, **kwargs):
+        previous = getattr(local, 'handler', None)
+        options = self.body.get('chat_template_kwargs') or {}
+        guarded = options.get('opengpu_report_token_progress') is True or options.get('opengpu_native_tool_guard') is True
+        local.handler = self if self.stream and guarded else None
+        try:
+            return original_handle(self, *args, **kwargs)
+        finally:
+            local.handler = previous
+
+    def generate(self, *args, **kwargs):
+        ctx, response = original_generate(self, *args, **kwargs)
+        handler = getattr(local, 'handler', None)
+        if handler is None:
+            return ctx, response
+
+        def observed():
+            count, last_sent = 0, None
+            for item in response:
+                token = getattr(item, 'token', None)
+                if token is not None and token >= 0:
+                    count += 1
+                    now = time.monotonic()
+                    if last_sent is None or now - last_sent >= 1:
+                        handler.wfile.write(f': opengpu-model-tokens {count}\n\n'.encode())
+                        handler.wfile.flush()
+                        last_sent = now
+                yield item
+        return ctx, observed()
+
+    server.APIHandler.handle_completion = handle
+    server.ResponseGenerator.generate = generate
 
 
 def install_complete_qwen_parser(server):
@@ -425,6 +466,7 @@ def main():
     install_required_tool_opening(server, mx)
     install_stable_host_cache(server)
     install_complete_qwen_parser(server)
+    install_generation_progress(server)
     install_capabilities_endpoint(server)
     server.main()
 

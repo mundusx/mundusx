@@ -86,6 +86,12 @@ fn emit_stream_delta(delta: &str) {
     });
 }
 
+fn native_buffered_token_progress(line:&str,previous:&mut u64)->bool {
+    let Some(count)=line.strip_prefix(": opengpu-model-tokens ").and_then(|s|s.parse::<u64>().ok()) else{return false;};
+    if count<=*previous{return false;}
+    *previous=count;true
+}
+
 fn native_chunk_has_token_progress(chunk: &serde_json::Value) -> bool {
     let Some(delta)=chunk.pointer("/choices/0/delta") else { return false; };
     ["content","reasoning_content","reasoning"].iter().any(|key|
@@ -1347,7 +1353,8 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
             && value.get("stable_host_prefix_cache").and_then(|v| v.as_bool()) == Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 10))
+            && value.get("buffered_tool_token_progress").and_then(|v| v.as_bool()) == Some(true)
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 12))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
@@ -2879,6 +2886,12 @@ fn host_managed_tools(payload: &serde_json::Value) -> bool {
     payload[HOST_MANAGED_TOOLS] == true
 }
 
+fn native_runtime_streaming(host_managed:bool,mlx:bool)->bool {
+    // Queued jobs can have public streaming disabled. Still consume the local
+    // MLX stream privately so actual generation can keep its watchdog alive.
+    live_delta_enabled() || (host_managed && mlx)
+}
+
 fn legacy_file_turn(payload: &serde_json::Value) -> bool {
     !host_managed_tools(payload) && native_tool_workflow::is_file_turn(payload)
 }
@@ -2910,7 +2923,8 @@ fn run_native_openai_tool_turn_with_mode(
     if !host_managed { native_line_edit::normalize_read_results(&mut payload); }
     payload["model"] = serde_json::Value::String(model.to_string());
     inherit_native_output_budget(&mut payload, request.max_tokens);
-    if configured_mlx_server_url().as_deref() == Some(url) {
+    let mlx_runtime=configured_mlx_server_url().as_deref() == Some(url);
+    if mlx_runtime {
         crate::model_profile::apply_mlx(model, &mut payload);
     } else {
         crate::model_profile::apply(model, &mut payload);
@@ -2920,7 +2934,7 @@ fn run_native_openai_tool_turn_with_mode(
         payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(false);
         payload["chat_template_kwargs"]["opengpu_native_tool_guard"]=serde_json::json!(false);
     }
-    let streaming = live_delta_enabled();
+    let streaming = native_runtime_streaming(host_managed,mlx_runtime);
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
     if let Some(message)=native_port_stop::guard(&payload,&serde_json::json!({})) {
@@ -2985,9 +2999,10 @@ fn run_native_openai_tool_turn_with_mode(
         if let Some(error)=value.pointer("/choices/0/opengpu_tool_error").and_then(|v|v.as_str()) {
             return Err(format!("native tool arguments are incomplete: runtime rejected {error}"));
         }
-        validate_native_tool_message(
+        validate_native_tool_message_with_limit(
             &value["choices"][0]["message"],
             value["choices"][0]["finish_reason"].as_str(),
+            native_host_argument_limit(Some(payload),&value["choices"][0]["message"],false),
         )?;
         let (message, changed) = native_workflow_message(payload, &value["choices"][0]["message"])?;
         if changed {
@@ -3008,6 +3023,11 @@ fn run_native_openai_tool_turn_with_mode(
 const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__";
 
 fn native_host_argument_limit(payload:Option<&serde_json::Value>,message:&serde_json::Value,changed:bool)->usize {
+    // The IDE validates and applies its own registered edit calls. Do not
+    // impose the legacy adapter's patch-size policy on complete host JSON:
+    // oldString plus newString and escaping can exceed that limit normally.
+    // Runtime generation limits, truncation checks and schema checks remain.
+    if payload.is_some_and(host_managed_tools) {return usize::MAX;}
     let artifact=payload.is_some_and(native_line_edit::source_response_required);
     // Generated calls retain their original limit. After the adapter has
     // grounded an edit, serialized host arguments contain BOTH observed old
@@ -3887,8 +3907,17 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     let mut done = false;
     let mut runtime_tool_error = None;
     let mut last_activity:Option<Instant>=None;
+    let mut generated_tokens=0u64;
     for line in reader.lines() {
         let line = line.map_err(|e| format!("native stream read failed: {e}"))?;
+        if native_buffered_token_progress(&line,&mut generated_tokens) {
+            if last_activity.is_none_or(|last|last.elapsed()>=Duration::from_secs(1)) {
+                let mut stderr=io::stderr().lock();
+                let _=writeln!(stderr,"{MODEL_ACTIVITY_MARKER}");let _=stderr.flush();
+                last_activity=Some(Instant::now());
+            }
+            continue;
+        }
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
@@ -3968,7 +3997,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     }
     let mut message = assembled.message();
     if reason.as_deref()==Some("length")&&payload.is_some_and(native_line_edit::source_response_required) {return Err("native tool arguments are incomplete: replacement source exceeded generation limit; return a shorter complete implementation".into());}
-    validate_native_tool_message(&message, reason.as_deref())?;
+    validate_native_tool_message_with_limit(&message, reason.as_deref(),native_host_argument_limit(payload,&message,false))?;
     let mut workflow_changed=false;
     if let Some(payload)=payload {
         let (checked,changed)=native_workflow_message(payload,&message)?;
@@ -6002,12 +6031,15 @@ mod tests {
                         let payload:serde_json::Value=serde_json::from_str(&text).unwrap();
                         assert_eq!(payload["messages"][0]["content"],"Read student.js");
                         assert_eq!(payload["tools"][0]["function"]["name"],"read_file");
-                        request.respond(tiny_http::Response::from_string(r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":5,"prompt_tokens":10}}"#)).unwrap();
+                        assert_eq!(payload["stream"],true);
+                        assert_eq!(payload["chat_template_kwargs"]["opengpu_report_token_progress"],true);
+                        request.respond(tiny_http::Response::from_string(concat!(": opengpu-model-tokens 1\n\n",r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":5,"prompt_tokens":10}}"#,"\n\ndata: [DONE]\n\n"))).unwrap();
                     }
                 }
             });
             env::set_var("OPENGPU_MLX_SERVER_URL",&url);
             let mut request=speakai_request(Some("test-model"));request.mode=None;
+            request.stream=false;
             request.prompt=format!("{}{}",super::OPENAI_TOOL_TURN_PREFIX,serde_json::json!({"messages":[{"role":"user","content":"Read student.js"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]}));
             let result=super::run_llama_request(&request,Backend::M).unwrap();
             assert!(result.output.contains("read_file"));handle.join().unwrap();
@@ -8150,6 +8182,71 @@ fn rejected_line_compile_arguments_are_retained_for_private_recovery() {
  let error=native_workflow_message(&p,&bad).unwrap_err();
  assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
  assert!(error.contains("PRIVATE_RANGE_REPLACEMENT"));
+}
+
+#[test]
+fn queued_host_mlx_jobs_use_a_private_stream_without_a_public_delta_sender() {
+    with_stream_delta_sender(None,|| {
+        assert!(native_runtime_streaming(true,true));
+        assert!(!native_runtime_streaming(true,false));
+        assert!(!native_runtime_streaming(false,true));
+        assert!(!native_runtime_streaming(false,false));
+    });
+    let(tx,_rx)=mpsc::channel();with_stream_delta_sender(Some(tx),|| {
+        assert!(native_runtime_streaming(true,false));assert!(native_runtime_streaming(false,false));
+    });
+    let mut p=serde_json::json!({HOST_MANAGED_TOOLS:true,"parallel_tool_calls":true});
+    crate::model_profile::apply_mlx("mlx-community/Qwen3-Coder-Next-4bit",&mut p);
+    assert_eq!(p["chat_template_kwargs"]["opengpu_report_token_progress"],true);
+    assert!(p["chat_template_kwargs"]["opengpu_native_tool_guard"].is_null());
+}
+
+#[test]
+fn buffered_token_progress_is_monotonic_and_never_assistant_output() {
+    use serde_json::{json,Value};
+    let mut count=0;
+    for line in [": keepalive 10/100",": opengpu-model-tokens 0",": opengpu-model-tokens nope","data: {}"] {assert!(!native_buffered_token_progress(line,&mut count));}
+    assert!(native_buffered_token_progress(": opengpu-model-tokens 1",&mut count));
+    assert!(!native_buffered_token_progress(": opengpu-model-tokens 1",&mut count));
+    assert!(!native_buffered_token_progress(": opengpu-model-tokens 0",&mut count));
+    assert!(native_buffered_token_progress(": opengpu-model-tokens 7",&mut count));
+    let wire=format!(": opengpu-model-tokens 1\n\n: opengpu-model-tokens 7\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Done"},"finish_reason":"stop"}]}));
+    let(tx,rx)=mpsc::channel();let encoded=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,None)).unwrap();
+    let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    assert_eq!(result["message"]["content"],"Done");
+    for raw in rx.try_iter(){assert!(!raw.contains("opengpu-model-tokens"));}
+}
+
+#[test]
+fn complete_host_multi_edits_are_not_rejected_by_legacy_patch_size() {
+    use serde_json::{json,Value};
+    let p=json!({HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"<userRequest>Modernize the UI</userRequest>"}],"tools":[{"function":{"name":"multi_replace_string_in_file","parameters":{"type":"object","required":["replacements"],"properties":{"replacements":{"type":"array","items":{"type":"object","required":["filePath","oldString","newString"],"properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}}}}}}}}]});
+    for size in [4300,9000] {
+        let old="x".repeat(size);let new=format!("updated {old}");
+        let args=json!({"replacements":[{"filePath":"D:/p/index.html","oldString":old,"newString":new},{"filePath":"D:/p/styles.css","oldString":old,"newString":new}]}).to_string();
+        assert!(args.chars().count()>16384);
+        let call=json!({"index":0,"id":"multi-edit","type":"function","function":{"name":"multi_replace_string_in_file","arguments":args}});
+        let message=json!({"role":"assistant","content":null,"tool_calls":[call]});
+        assert!(validate_native_tool_message(&message,Some("tool_calls")).is_err());
+        let limit=native_host_argument_limit(Some(&p),&message,false);
+        validate_native_tool_message_with_limit(&message,Some("tool_calls"),limit).unwrap();
+        let (checked,_)=native_workflow_message(&p,&message).unwrap();
+        normalize_native_openai_tool_response_with_limit(&json!({"choices":[{"message":checked,"finish_reason":"tool_calls"}]}),limit).unwrap();
+        let wire=|reason:&str|format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"tool_calls":message["tool_calls"]},"finish_reason":reason}]}));
+        let(tx,rx)=mpsc::channel();
+        let encoded=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire("tool_calls")),&mut String::new(),false,Some(&p))).unwrap();
+        let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+        let mut stream=native_stream::NativeStream::default();for raw in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();}
+        assert_eq!(result["message"]["tool_calls"][0]["function"],message["tool_calls"][0]["function"]);
+        assert_eq!(stream.remainder(&result["message"]).unwrap(),json!({}));
+        let(tx,rx)=mpsc::channel();
+        assert!(with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire("length")),&mut String::new(),false,Some(&p))).is_err());
+        assert_eq!(rx.try_iter().count(),0);
+        let mut malformed=message.clone();malformed["tool_calls"][0]["function"]["arguments"]=json!("{\"replacements\":[");
+        assert!(validate_native_tool_message_with_limit(&malformed,Some("tool_calls"),limit).is_err());
+        let mut missing=message.clone();missing["tool_calls"][0]["function"]["arguments"]=json!(json!({"replacements":[{"filePath":"D:/p/index.html","oldString":"old"}]}).to_string());
+        assert!(native_workflow_message(&p,&missing).is_err());
+    }
 }
 
 #[test]
