@@ -3015,6 +3015,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
     if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     if host_managed_tools(payload) {
         // The IDE owns its filesystem, tool execution, approvals and recovery.
+        native_task_progress::guard(payload,message).map_err(|error|format!("native host action precondition failed: {error}"))?;
         native_host_recovery::guard(payload,message)?;
         native_host_recovery::reject_existing_create(payload,message)?;
         // Validate the registered wire contract without inventing host actions.
@@ -3467,6 +3468,9 @@ fn run_native_tool_attempts(
 ) -> Result<String, String> {
     if host_managed_tools(&payload) {
         native_host_recovery::prepare(&mut payload);
+        if let Some(progress)=native_task_progress::guidance(&payload) {
+            if let Some(messages)=payload["messages"].as_array_mut(){messages.push(progress);}
+        }
         let mut output = String::new();
         return match attempt(&payload, &mut output, false) {
             Err(error) if error.starts_with("native tool schema precondition failed:")
@@ -3567,6 +3571,33 @@ fn run_native_tool_attempts(
         }
         Err(error) => Err(error),
     }
+}
+
+#[test]
+fn host_managed_progress_rejects_restarted_reads_and_recovers_with_a_real_edit() {
+    use serde_json::json;
+    let mut payload=json!({HOST_MANAGED_TOOLS:true,"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Redesign the layout</userRequest>"}]});
+    let read=json!({"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/script.js","startLine":1,"endLine":100}).to_string()}}]});
+    for id in ["read1","read2"] {
+        let mut call=read.clone();call["tool_calls"][0]["id"]=json!(id);
+        payload["messages"].as_array_mut().unwrap().extend([call,json!({"role":"tool","tool_call_id":id,"content":"const unchanged=1;\n"})]);
+    }
+    let edit=json!({"role":"assistant","content":"", "tool_calls":[{"id":"edit","type":"function","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/p/index.html","oldString":"old heading","newString":"Blue heading"}).to_string()}}]});
+    let mut attempts=0;
+    let mut rejected_attempts=0;
+    let rejection=run_native_tool_attempts(payload.clone(),|body,_,_|{
+        rejected_attempts+=1;
+        native_workflow_message(body,&read).map(|_|String::new())
+    }).unwrap_err();
+    assert_eq!(rejected_attempts,2);assert!(rejection.contains("source range is already available"));
+    let result=run_native_tool_attempts(payload,|body,_,retry|{
+        attempts+=1;
+        assert!(body["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_observed_task_progress"));
+        let message=if retry {&edit}else{&read};
+        let (checked,_)=native_workflow_message(body,message)?;
+        normalize_native_openai_tool_response(&json!({"choices":[{"message":checked,"finish_reason":"tool_calls"}]}))
+    }).unwrap();
+    assert_eq!(attempts,2);assert!(result.contains("Blue heading"));
 }
 
 #[test]

@@ -83,7 +83,10 @@ fn progress(p:&Value)->Progress {
             "create_file"|"replace_string_in_file"|"insert_edit_into_file"|"multi_replace_string_in_file"=>{
                 // A host rejection can mean the user changed the file after
                 // our read. Allow fresh grounding even when no write applied.
-                state.reads.clear();
+                // Editing one file does not invalidate observed source in
+                // every other file. Unknown/bulk targets stay conservative.
+                if let Some(file)=a["filePath"].as_str(){state.reads.remove(&path(file));}
+                else {state.reads.clear();}
                 state.plan=None;
                 if ok(text) {state.writes+=1;state.check=None;state.failed.clear();}
             },
@@ -115,7 +118,7 @@ fn range_digest(read:&Read,start:u64,end:u64)->String {
 }
 
 pub fn guard(p:&Value,message:&Value)->Result<(),String> {
-    if !super::native_tool_workflow::is_file_turn(p) {return Ok(());}
+    if !super::native_tool_workflow::is_file_turn(p) && !super::host_managed_tools(p) {return Ok(());}
     let s=progress(p);
     for c in message["tool_calls"].as_array().into_iter().flatten() {
         let Ok(a)=serde_json::from_str::<Value>(c["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
@@ -157,7 +160,7 @@ pub fn guard(p:&Value,message:&Value)->Result<(),String> {
 pub fn planning_current(p:&Value)->bool {progress(p).plan.is_some()}
 
 pub fn guidance(p:&Value)->Option<Value> {
-    if !super::native_tool_workflow::is_file_turn(p) {return None;}
+    if !super::native_tool_workflow::is_file_turn(p) && !super::host_managed_tools(p) {return None;}
     let s=progress(p);
     if s.reads.is_empty()&&s.check.is_none()&&s.writes==0&&s.plan.is_none() {return None;}
     let reads=s.reads.iter().flat_map(|(file,rs)|rs.iter().map(move |r|json!({"path":file,"lines":[r.start,r.end],"eof":r.eof,"result_id":r.id,"observed_digest":r.digest}))).take(12).collect::<Vec<_>>();
@@ -168,6 +171,15 @@ pub fn guidance(p:&Value)->Option<Value> {
 mod tests {
  use super::*;
  fn p()->Value {json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Fix and test this project</userRequest>"}]})}
+ #[test] fn editing_html_does_not_reset_unchanged_javascript_read_allowance() {
+  let mut p=p();let read=call("read_file",json!({"filePath":"D:/project/script.js","startLine":1,"endLine":100}));
+  observe(&mut p,read.clone(),"const value=1;\n");observe(&mut p,read.clone(),"const value=1;\n");
+  observe(&mut p,call("replace_string_in_file",json!({"filePath":"D:/project/index.html","oldString":"old","newString":"new"})),"Applied edit");
+  assert!(guard(&p,&read).is_err());
+  let changed=call("read_file",json!({"filePath":"D:/project/index.html","startLine":1,"endLine":100}));
+  assert!(guard(&p,&changed).is_ok());
+  assert!(guidance(&p).unwrap()["content"].as_str().unwrap().contains("confirmed_writes"));
+ }
  #[test] fn manual_compaction_is_a_distinct_boundary_only_with_its_host_system_template() {
     let mut p=p();p["messages"].as_array_mut().unwrap().insert(0,json!({"role":"system","content":"Your task is to create a comprehensive, detailed summary of the entire conversation. This summary will be used to compact the conversation."}));
     p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"Summarize the conversation history so far, paying special attention to the most recent agent commands. Structure your summary using the enhanced format provided in the system message."}));
