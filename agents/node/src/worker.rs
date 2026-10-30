@@ -3174,8 +3174,11 @@ mod host_managed_tool_tests {
         let out=run_native_tool_attempts(p.clone(),|body,_,retry| {
             count+=1;
             if !retry {assert_eq!(body,&p);return Err("native tool schema precondition failed: read_file.filePath is required".into());}
-            assert_eq!(body["messages"].as_array().unwrap().len(),p["messages"].as_array().unwrap().len()+1);
-            assert_eq!(body["messages"].as_array().unwrap().last().unwrap()["name"],"opengpu_schema_repair");
+            let original=p["messages"].as_array().unwrap();let messages=body["messages"].as_array().unwrap();
+            assert_eq!(&messages[..original.len()],original.as_slice());
+            assert!(messages[original.len()..].iter().any(|m|m["name"]=="opengpu_schema_repair"));
+            assert!(messages[original.len()..].iter().all(|m|m["role"]=="system"));
+            assert_eq!(body["tools"],p["tools"]);assert_eq!(body["tool_choice"],p["tool_choice"]);
             Ok("valid native output".into())
         }).unwrap();
         assert_eq!(count,2);assert_eq!(out,"valid native output");
