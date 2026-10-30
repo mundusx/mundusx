@@ -3022,11 +3022,13 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
     if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     if host_managed_tools(payload) {
         // The IDE owns its filesystem, tool execution, approvals and recovery.
-        native_task_progress::guard(payload,message).map_err(|error|format!("native host action precondition failed: {error}"))?;
-        native_host_recovery::guard(payload,message)?;
-        native_host_recovery::reject_existing_create(payload,message)?;
+        // Complete the registered read range before guarding it, so omitted
+        // ranges have the same progress identity as explicit bounded reads.
+        let metadata = complete_native_read_ranges(payload, &native_tool_workflow::terminal_metadata(payload, message));
+        native_task_progress::guard(payload,&metadata).map_err(|error|format!("native host action precondition failed: {error}"))?;
+        native_host_recovery::guard(payload,&metadata)?;
+        native_host_recovery::reject_existing_create(payload,&metadata)?;
         // Validate the registered wire contract without inventing host actions.
-        let metadata = native_tool_workflow::terminal_metadata(payload, message);
         validate_native_tool_schema(payload, &metadata)?;
         let calls = metadata["tool_calls"].as_array();
         if let Some(name) = payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
@@ -3221,6 +3223,32 @@ fn terminal_schema_validation_preserves_host_commands_without_recipe_restriction
     for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","$body = @{name='Student'} | ConvertTo-Json; Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/students -ContentType application/json -Body $body","curl.exe -d name=Student http://localhost:3000/api/students","git init","npm test"] {
         let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));let (out,_)=native_workflow_message(&p,&input).unwrap();let args:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(args["command"],command);
     }
+}
+
+#[test]
+fn host_read_ranges_are_completed_before_progress_guards() {
+    use serde_json::{json,Value};
+    let p=json!({"__opengpu_host_managed_tools":true,"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"number"},"endLine":{"type":"number"}},"required":["filePath","startLine","endLine"]}}}],"messages":[{"role":"user","content":"<userRequest>Modernize the UI and layout</userRequest>"}]});
+    let make=|a:Value|json!({"role":"assistant","content":"Checking source.","tool_calls":[{"id":"read1","type":"function","function":{"name":"read_file","arguments":a.to_string()}}]});
+    let missing=make(json!({"filePath":"D:/project/styles.css"}));
+    let (completed,changed)=native_workflow_message(&p,&missing).unwrap();
+    assert!(changed);
+    let args:Value=serde_json::from_str(completed["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args,json!({"filePath":"D:/project/styles.css","startLine":1,"endLine":200}));
+    assert_eq!(completed["content"],missing["content"]);
+    let explicit=make(json!({"filePath":"D:/project/styles.css","startLine":42,"endLine":80}));
+    assert_eq!(native_workflow_message(&p,&explicit).unwrap(),(explicit,false));
+    for args in [json!({"startLine":1}),json!({"filePath":"D:/project/styles.css","startLine":"1"})] {
+        assert!(native_workflow_message(&p,&make(args)).is_err());
+    }
+    let mut ranged=p.clone();ranged["messages"][0]["content"]=json!("<userRequest>Read lines 40 to 80</userRequest>");
+    assert!(native_workflow_message(&ranged,&missing).is_err());
+    let mut observed=p.clone();
+    for _ in 0..2 {
+        observed["messages"].as_array_mut().unwrap().push(completed.clone());
+        observed["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"read1","content":"current CSS"}));
+    }
+    assert!(native_workflow_message(&observed,&missing).unwrap_err().contains("already available"));
 }
 
 #[test]
@@ -3587,7 +3615,7 @@ fn run_native_tool_attempts(
 fn auto_schema_recovery_can_return_final_instead_of_forcing_a_stale_read() {
     use serde_json::{json,Value};
     let p=json!({HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"<userRequest>Inspect this file</userRequest>"}],"tools":[{"function":{"name":"read_file","parameters":{"type":"object","required":["filePath","startLine","endLine"],"properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}}}}}]});
-    let bad=json!({"index":0,"id":"incomplete-read","type":"function","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/index.html"}).to_string()}});
+    let bad=json!({"index":0,"id":"incomplete-read","type":"function","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/index.html","startLine":"first"}).to_string()}});
     let first=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Checking current state.\n\n","tool_calls":[bad]},"finish_reason":"tool_calls"}]}));
     let answer="I cannot complete this inspection; no read was executed.";
     let second=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":answer},"finish_reason":"stop"}]}));
@@ -3595,6 +3623,21 @@ fn auto_schema_recovery_can_return_final_instead_of_forcing_a_stale_read() {
     let encoded=with_stream_delta_sender(Some(tx),||run_native_tool_attempts(p,|body,output,retry|{attempts+=1;assert!(body["tool_choice"].is_null());parse_native_openai_stream_with_context(io::Cursor::new(if retry{second.clone()}else{first.clone()}),output,retry,Some(body))})).unwrap();
     let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();let mut stream=native_stream::NativeStream::default();for raw in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();}
     assert_eq!(attempts,2);assert!(stream.message().get("tool_calls").is_none());assert!(result["message"]["content"].as_str().unwrap().ends_with(answer));assert_eq!(stream.remainder(&result["message"]).unwrap(),json!({}));
+}
+
+#[test]
+fn host_missing_read_ranges_stream_the_same_validated_arguments_as_final() {
+    use serde_json::{json,Value};
+    let p=json!({HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"<userRequest>Modernize the UI</userRequest>"}],"tools":[{"function":{"name":"read_file","parameters":{"type":"object","required":["filePath","startLine","endLine"],"properties":{"filePath":{"type":"string"},"startLine":{"type":"number"},"endLine":{"type":"number"}}}}}]});
+    let call=json!({"index":0,"id":"read-css","type":"function","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/styles.css"}).to_string()}});
+    let wire=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Checking CSS.","tool_calls":[call]},"finish_reason":"tool_calls"}]}));
+    let(tx,rx)=mpsc::channel();let mut attempts=0;
+    let encoded=with_stream_delta_sender(Some(tx),||run_native_tool_attempts(p,|body,output,retry|{attempts+=1;assert!(!retry);parse_native_openai_stream_with_context(io::Cursor::new(wire.clone()),output,retry,Some(body))})).unwrap();
+    let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    let mut stream=native_stream::NativeStream::default();for raw in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();}
+    let args:Value=serde_json::from_str(result["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(attempts,1);assert_eq!(args,json!({"filePath":"D:/p/styles.css","startLine":1,"endLine":200}));
+    assert_eq!(stream.remainder(&result["message"]).unwrap(),json!({}));
 }
 
 #[test]
