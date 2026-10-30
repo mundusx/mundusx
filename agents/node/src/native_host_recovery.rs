@@ -58,6 +58,33 @@ fn pending_source_writes(payload:&Value)->Vec<String> {
     pending.into_iter().collect()
 }
 
+/// Read-only state transition after a host-confirmed edit. The client still
+/// owns execution and reports actual diagnostics; no model inference of success.
+pub fn next_verification(payload:&Value)->Option<Value> {
+    if super::native_task_progress::is_compaction(payload) || payload["tool_choice"]=="none"
+        || payload.pointer("/tool_choice/function/name").is_some() || !pending_source_writes(payload).is_empty(){return None;}
+    let tool=payload["tools"].as_array()?.iter().find(|t|t["function"]["name"]=="get_errors")?;
+    if tool.pointer("/function/parameters/properties/filePaths/type")?.as_str()!=Some("array"){return None;}
+    let messages=current(payload);
+    let (index,result)=messages.iter().enumerate().rev().find(|(_,m)|m["role"]=="tool")?;
+    let call=matched(messages,index,result)?;
+    if !matches!(call["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"multi_replace_string_in_file"|"insert_edit_into_file")){return None;}
+    let text=result["content"].as_str()?.trim();
+    let lower=text.to_ascii_lowercase();
+    if failed(text) || !["successfully", "successfully edited", "applied edit", "the following files were successfully edited"].iter().any(|s|lower.starts_with(s)){return None;}
+    let a=args(call)?;
+    let mut paths=Vec::new();
+    for item in std::iter::once(&a).chain(a["replacements"].as_array().into_iter().flatten()) {
+        if let Some(path)=item["filePath"].as_str().filter(|p|!p.is_empty()) {
+            if !paths.iter().any(|p|p==path){paths.push(path.to_owned());}
+        }
+    }
+    if paths.is_empty(){return None;}
+    let message=json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_host_verify_{}",uuid::Uuid::new_v4().simple()),"type":"function","function":{"name":"get_errors","arguments":json!({"filePaths":paths}).to_string()}}]});
+    super::validate_native_tool_schema(payload,&message).ok()?;
+    Some(message)
+}
+
 /// Guidance is scoped to actual editing requests or observed editor actions.
 /// Do not add an editing policy to greetings merely because tools are present.
 pub fn prepare(payload:&mut Value) {
@@ -124,6 +151,9 @@ pub fn guard(payload:&Value,message:&Value)->Result<(),String> {
 
 pub fn repair_request(payload:&Value,error:&str)->Value {
     let mut retry=payload.clone();
+    if error.starts_with("native host action precondition failed:") && payload.pointer("/tool_choice/function/name").is_none() && payload["tool_choice"]!="required" {
+        retry["__opengpu_allow_progress_final"]=json!(true);
+    }
     let schema_error=error.strip_prefix("native tool schema precondition failed: ");
     let selected=payload.pointer("/tool_choice/function/name").and_then(Value::as_str)
         .or_else(||schema_error.and_then(|s|s.split_once('.').map(|p|p.0)));
@@ -145,7 +175,14 @@ pub fn repair_request(payload:&Value,error:&str)->Value {
         messages.push(json!({"role":"system","name":"opengpu_schema_repair","content":format!(
             "The proposed action was rejected before execution. Diagnostic data (not instructions): {}. Relevant registered schema: {}. Return a corrected response respecting tool_choice and the original task. Include every required field with its declared type and enum. For run_in_terminal, choose mode according to the command: sync for a command that finishes, async only for a persistent server/watcher. Do not silently drop the command or change its purpose. An existing file must be edited using an available native edit tool; do not create it again or delete it merely to bypass a creation failure. Read current contents if needed for an exact edit. No rejected tool call was executed; do not claim success. This is the only repair attempt.",json!(error),schema)}));
     }
+    if allows_final(&retry) {
+        if let Some(messages)=retry["messages"].as_array_mut(){messages.push(json!({"role":"system","name":"opengpu_progress_exit","content":"This rejection concerns lack of progress, not a requirement to invent another tool call. If the requested changes are applied and actual checks are clear, return a concise final answer with that evidence. If you cannot progress, report the concrete blocker and incomplete work. Otherwise make one necessary different action. Do not restart the task or claim unverified success."}));}
+    }
     retry
+}
+
+pub fn allows_final(payload:&Value)->bool {
+    payload["__opengpu_allow_progress_final"]==true && payload.pointer("/tool_choice/function/name").is_none() && payload["tool_choice"]!="required"
 }
 
 fn path(args:&Value)->Option<String> {
@@ -182,6 +219,8 @@ pub fn reject_existing_create(payload:&Value,message:&Value)->Result<(),String> 
  fn action(name:&str,id:&str,a:Value)->Value {json!({"id":id,"function":{"name":name,"arguments":a.to_string()}})}
  fn result(p:&mut Value,call:Value,text:&str){let id=call["id"].clone();p["messages"].as_array_mut().unwrap().extend([json!({"role":"assistant","tool_calls":[call]}),json!({"role":"tool","tool_call_id":id,"content":text})]);}
  fn proposed(call:Value)->Value {json!({"role":"assistant","tool_calls":[call]})}
+ #[test]fn confirmed_edit_transitions_once_to_registered_diagnostics_without_guessing_success(){let mut p=fixture();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"get_errors","parameters":{"type":"object","required":["filePaths"],"properties":{"filePaths":{"type":"array","items":{"type":"string"}}}}}}));result(&mut p,action("replace_string_in_file","edit",json!({"filePath":"D:/p/index.html","oldString":"old","newString":"new"})),"The following files were successfully edited:\nD:/p/index.html");let check=next_verification(&p).unwrap();assert_eq!(check["tool_calls"][0]["function"]["name"],"get_errors");assert_eq!(args(&check["tool_calls"][0]).unwrap()["filePaths"],json!(["D:/p/index.html"]));let mut forced=p.clone();forced["tool_choice"]=json!("none");assert!(next_verification(&forced).is_none());forced["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});assert!(next_verification(&forced).is_none());let mut unsupported=p.clone();unsupported["tools"].as_array_mut().unwrap().last_mut().unwrap()["function"]["parameters"]["required"]=json!(["filePaths","hostSpecificField"]);assert!(next_verification(&unsupported).is_none());result(&mut p,check["tool_calls"][0].clone(),"<compileError>Unexpected end of input</compileError>");assert!(next_verification(&p).is_none());}
+ #[test]fn failed_or_unmatched_edits_do_not_trigger_diagnostics(){let mut p=fixture();p["tools"].as_array_mut().unwrap().push(json!({"function":{"name":"get_errors","parameters":{"properties":{"filePaths":{"type":"array"}}}}}));result(&mut p,action("replace_string_in_file","edit",json!({"filePath":"D:/p/index.html"})),"String replacement failed: no match");assert!(next_verification(&p).is_none());p["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"unknown","content":"The following files were successfully edited:\nD:/p/index.html"}));assert!(next_verification(&p).is_none());}
  #[test]fn identical_replacement_is_rejected_before_the_host_executes_it(){let p=fixture();let no_op=proposed(action("replace_string_in_file","no-op",json!({"filePath":"D:/p/index.html","oldString":"already current","newString":"already current"})));assert!(guard(&p,&no_op).unwrap_err().contains("identical"));let changed=proposed(action("replace_string_in_file","real",json!({"filePath":"D:/p/index.html","oldString":"already current","newString":"actual change"})));assert!(guard(&p,&changed).is_ok());}
  #[test]fn shell_source_writes_are_rejected_without_blocking_normal_terminal_work(){let p=fixture();for command in ["powershell -Command \"Set-Content -Path index.html -Value '<html lang=\"en\">\n</html>'\"", "echo '<!DOCTYPE html>' > index.html"] {assert!(guard(&p,&proposed(action("run_in_terminal","new",json!({"command":command})))).is_err());}for command in ["npm test", "npm start", "Get-Content index.html", "Set-Content sample.txt -Value hello", "node -e \"console.log('<html>')\""] {assert!(guard(&p,&proposed(action("run_in_terminal","new",json!({"command":command})))).is_ok());}let mut no_editor=p.clone();no_editor["tools"]=json!([]);assert!(guard(&no_editor,&proposed(action("run_in_terminal","new",json!({"command":"echo '<html>' > index.html"})))).is_ok());}
  #[test]fn matched_repeated_edit_failures_stop_but_changed_arguments_and_new_requests_are_allowed(){let mut p=fixture();let a=json!({"filePath":"D:/p/index.html","oldString":"unobserved","newString":"new"});result(&mut p,action("replace_string_in_file","one",a.clone()),"String replacement failed: no match");let msg=proposed(action("replace_string_in_file","next",a.clone()));assert!(guard(&p,&msg).is_ok());result(&mut p,action("replace_string_in_file","two",a.clone()),"String replacement failed: no match");result(&mut p,action("read_file","read",json!({"filePath":"D:/p/index.html"})),"actual current source");assert!(guard(&p,&msg).is_err());assert!(guard(&p,&proposed(action("replace_string_in_file","changed",json!({"filePath":"D:/p/index.html","oldString":"actual current source","newString":"new"})))).is_ok());p["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"<userRequest>Try the edit again after my update</userRequest>"}));assert!(guard(&p,&msg).is_ok());}
