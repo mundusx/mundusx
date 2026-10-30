@@ -329,6 +329,29 @@ fn model_file_path(config: &Config, name: &str, option: &ModelOption) -> PathBuf
     model_cache_dir(config, name).join(source_filename(&option.source_url))
 }
 
+fn cached_mlx_snapshot(path: &Path) -> bool {
+    let valid_config = fs::read(path.join("config.json")).ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .is_some_and(|value| value.is_object());
+    if !valid_config { return false; }
+    let nonempty_file = |file: &Path| fs::metadata(file).is_ok_and(|m| m.is_file() && m.len() > 0);
+    let index = path.join("model.safetensors.index.json");
+    if index.exists() {
+        return fs::read(index).ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .and_then(|value| value.get("weight_map").and_then(|v| v.as_object()).cloned())
+            .is_some_and(|weights| !weights.is_empty() && weights.values().all(|value| {
+                value.as_str().is_some_and(|name| {
+                    let shard = Path::new(name);
+                    shard.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+                        && shard.extension().and_then(|v| v.to_str()) == Some("safetensors")
+                        && nonempty_file(&path.join(shard))
+                })
+            }));
+    }
+    nonempty_file(&path.join("model.safetensors"))
+}
+
 fn cached_model_path(config: &Config, name: &str) -> io::Result<Option<PathBuf>> {
     if let Some(option) = lookup_model_for_backend(name, config.backend_preference) {
         let path = model_file_path(config, name, &option);
@@ -346,7 +369,7 @@ fn cached_model_path(config: &Config, name: &str) -> io::Result<Option<PathBuf>>
             .source_path
             .as_ref()
             .map(PathBuf::from)
-            .filter(|path| path.is_file())
+            .filter(|path| path.is_file() || (model.format.as_deref() == Some("mlx") && cached_mlx_snapshot(path)))
         {
             return Ok(Some(path));
         }
@@ -1018,6 +1041,30 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(config.active_model, None);
 
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn activates_cached_mlx_snapshot_directory_and_rejects_missing_shards() {
+        let (mut config, temp_dir) = temp_config();
+        config.backend_preference = crate::types::Backend::M;
+        let name = "Local/Qualified-MLX";
+        add_model(&mut config, name).unwrap();
+        let snapshot = temp_dir.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("config.json"), b"{\"model_type\":\"qwen3_next\"}").unwrap();
+        fs::write(snapshot.join("model.safetensors.index.json"), b"{\"weight_map\":{\"a\":\"model-1.safetensors\",\"b\":\"model-2.safetensors\"}}").unwrap();
+        fs::write(snapshot.join("model-1.safetensors"), b"weights").unwrap();
+        let path = manifest_path(&config, name);
+        let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["format"] = "mlx".into();
+        record["source_path"] = snapshot.to_string_lossy().as_ref().into();
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(use_model(&mut config, name).is_err());
+        fs::write(snapshot.join("model-2.safetensors"), b"weights").unwrap();
+        assert!(use_model(&mut config, name).is_ok());
+        fs::remove_file(snapshot.join("config.json")).unwrap();
+        assert!(!cached_mlx_snapshot(&snapshot));
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
