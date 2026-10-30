@@ -85,8 +85,10 @@ fn progress(p:&Value)->Progress {
                 // our read. Allow fresh grounding even when no write applied.
                 // Editing one file does not invalidate observed source in
                 // every other file. Unknown/bulk targets stay conservative.
-                if let Some(file)=a["filePath"].as_str(){state.reads.remove(&path(file));}
-                else {state.reads.clear();}
+                let targets=std::iter::once(&a).chain(a["replacements"].as_array().into_iter().flatten())
+                    .filter_map(|item|item["filePath"].as_str()).map(path).collect::<std::collections::BTreeSet<_>>();
+                if targets.is_empty(){state.reads.clear();}
+                else {for file in targets{state.reads.remove(&file);}}
                 state.plan=None;
                 state.diagnostics=None;
                 if ok(text) {state.writes+=1;state.check=None;state.failed.clear();}
@@ -195,6 +197,14 @@ mod tests {
   let changed=call("read_file",json!({"filePath":"D:/project/index.html","startLine":1,"endLine":100}));
   assert!(guard(&p,&changed).is_ok());
   assert!(guidance(&p).unwrap()["content"].as_str().unwrap().contains("confirmed_writes"));
+ }
+ #[test] fn multi_file_editor_invalidates_only_its_observed_targets() {
+  let mut p=p();let js=call("read_file",json!({"filePath":"D:/project/script.js","startLine":1,"endLine":100}));
+  for _ in 0..2{observe(&mut p,js.clone(),"const unchanged=1;\n");}
+  let html=call("read_file",json!({"filePath":"D:/project/index.html","startLine":1,"endLine":100}));
+  for _ in 0..2{observe(&mut p,html.clone(),"<h1>Old</h1>\n");}
+  observe(&mut p,call("multi_replace_string_in_file",json!({"replacements":[{"filePath":"D:/project/index.html","oldString":"Old","newString":"Blue"},{"filePath":"D:/project/styles.css","oldString":"red","newString":"blue"}]})),"The following files were successfully edited");
+  assert!(guard(&p,&js).is_err());assert!(guard(&p,&html).is_ok());
  }
  #[test] fn manual_compaction_is_a_distinct_boundary_only_with_its_host_system_template() {
     let mut p=p();p["messages"].as_array_mut().unwrap().insert(0,json!({"role":"system","content":"Your task is to create a comprehensive, detailed summary of the entire conversation. This summary will be used to compact the conversation."}));
