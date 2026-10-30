@@ -3581,6 +3581,20 @@ fn run_native_tool_attempts(
 }
 
 #[test]
+fn auto_schema_recovery_can_return_final_instead_of_forcing_a_stale_read() {
+    use serde_json::{json,Value};
+    let p=json!({HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"<userRequest>Inspect this file</userRequest>"}],"tools":[{"function":{"name":"read_file","parameters":{"type":"object","required":["filePath","startLine","endLine"],"properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}}}}}]});
+    let bad=json!({"index":0,"id":"incomplete-read","type":"function","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/index.html"}).to_string()}});
+    let first=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Checking current state.\n\n","tool_calls":[bad]},"finish_reason":"tool_calls"}]}));
+    let answer="I cannot complete this inspection; no read was executed.";
+    let second=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":answer},"finish_reason":"stop"}]}));
+    let(tx,rx)=mpsc::channel();let mut attempts=0;
+    let encoded=with_stream_delta_sender(Some(tx),||run_native_tool_attempts(p,|body,output,retry|{attempts+=1;assert!(body["tool_choice"].is_null());parse_native_openai_stream_with_context(io::Cursor::new(if retry{second.clone()}else{first.clone()}),output,retry,Some(body))})).unwrap();
+    let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();let mut stream=native_stream::NativeStream::default();for raw in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();}
+    assert_eq!(attempts,2);assert!(stream.message().get("tool_calls").is_none());assert!(result["message"]["content"].as_str().unwrap().ends_with(answer));assert_eq!(stream.remainder(&result["message"]).unwrap(),json!({}));
+}
+
+#[test]
 fn progress_recovery_can_finish_without_inventing_another_tool_and_preserves_stream() {
     use serde_json::{json,Value};
     let payload=json!({HOST_MANAGED_TOOLS:true,"tools":[{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Redesign the layout</userRequest>"}]});
@@ -3689,7 +3703,7 @@ fn host_schema_repair_stops_after_one_retry_for_every_model() {
         let mut attempts=0;
         let result=run_native_tool_attempts(p,|body,_,retry|{
             attempts+=1;assert_eq!(body["model"],model);
-            if retry {assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");}
+            if retry {assert!(body["tool_choice"].is_null());assert!(native_host_recovery::allows_final(body));}
             Err("native tool schema precondition failed: run_in_terminal.mode is required".into())
         });
         assert_eq!(attempts,2);assert!(result.unwrap_err().starts_with("native tool recovery failed after one retry:"));
