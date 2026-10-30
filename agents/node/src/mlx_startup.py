@@ -202,7 +202,7 @@ def install_required_tool_opening(server, mx):
                 tuple(tokenizer.encode('<tool_call>', add_special_tokens=False)),
                 tuple(tuple(tokenizer.encode('<tool_call>\n<function=' + name + '>\n', add_special_tokens=False)) for name in names),
             )
-        args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard')}
+        args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard', 'opengpu_report_token_progress')}
         return original_tokenize(self, tokenizer, request, args)
 
     def processors(args):
@@ -256,7 +256,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "buffered_tool_token_progress": True, "version": 11}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "buffered_tool_token_progress": True, "version": 12}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -293,7 +293,8 @@ def install_generation_progress(server):
 
     def handle(self, *args, **kwargs):
         previous = getattr(local, 'handler', None)
-        guarded = (self.body.get('chat_template_kwargs') or {}).get('opengpu_native_tool_guard') is True
+        options = self.body.get('chat_template_kwargs') or {}
+        guarded = options.get('opengpu_report_token_progress') is True or options.get('opengpu_native_tool_guard') is True
         local.handler = self if self.stream and guarded else None
         try:
             return original_handle(self, *args, **kwargs)

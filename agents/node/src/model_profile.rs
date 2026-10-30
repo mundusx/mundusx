@@ -65,6 +65,10 @@ pub fn apply(model: &str, payload: &mut Value) {
 /// Keep this runtime-specific option away from vLLM/llama OpenAI endpoints.
 pub fn apply_mlx(model: &str, payload: &mut Value) {
     let host_managed = payload["__opengpu_host_managed_tools"] == true;
+    if host_managed {
+        if payload["chat_template_kwargs"].is_null() {payload["chat_template_kwargs"]=json!({});}
+        payload["chat_template_kwargs"]["opengpu_report_token_progress"]=json!(true);
+    }
     if is_qwen3_coder(model) && !host_managed { merge_leading_system_messages(payload); }
     let native_files = is_qwen3_coder(model) && payload["parallel_tool_calls"] != true
         && payload["tools"].as_array().is_some_and(|tools|

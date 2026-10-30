@@ -1354,7 +1354,7 @@ fn mlx_required_tools_ready(url: &str) -> bool {
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
             && value.get("stable_host_prefix_cache").and_then(|v| v.as_bool()) == Some(true)
             && value.get("buffered_tool_token_progress").and_then(|v| v.as_bool()) == Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 11))
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 12))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
@@ -2886,6 +2886,12 @@ fn host_managed_tools(payload: &serde_json::Value) -> bool {
     payload[HOST_MANAGED_TOOLS] == true
 }
 
+fn native_runtime_streaming(host_managed:bool,mlx:bool)->bool {
+    // Queued jobs can have public streaming disabled. Still consume the local
+    // MLX stream privately so actual generation can keep its watchdog alive.
+    live_delta_enabled() || (host_managed && mlx)
+}
+
 fn legacy_file_turn(payload: &serde_json::Value) -> bool {
     !host_managed_tools(payload) && native_tool_workflow::is_file_turn(payload)
 }
@@ -2917,7 +2923,8 @@ fn run_native_openai_tool_turn_with_mode(
     if !host_managed { native_line_edit::normalize_read_results(&mut payload); }
     payload["model"] = serde_json::Value::String(model.to_string());
     inherit_native_output_budget(&mut payload, request.max_tokens);
-    if configured_mlx_server_url().as_deref() == Some(url) {
+    let mlx_runtime=configured_mlx_server_url().as_deref() == Some(url);
+    if mlx_runtime {
         crate::model_profile::apply_mlx(model, &mut payload);
     } else {
         crate::model_profile::apply(model, &mut payload);
@@ -2927,7 +2934,7 @@ fn run_native_openai_tool_turn_with_mode(
         payload["chat_template_kwargs"]["opengpu_require_tool_call"]=serde_json::json!(false);
         payload["chat_template_kwargs"]["opengpu_native_tool_guard"]=serde_json::json!(false);
     }
-    let streaming = live_delta_enabled();
+    let streaming = native_runtime_streaming(host_managed,mlx_runtime);
     payload["stream"] = serde_json::Value::Bool(streaming);
     if streaming { payload["stream_options"] = serde_json::json!({"include_usage":true}); }
     if let Some(message)=native_port_stop::guard(&payload,&serde_json::json!({})) {
@@ -6024,12 +6031,15 @@ mod tests {
                         let payload:serde_json::Value=serde_json::from_str(&text).unwrap();
                         assert_eq!(payload["messages"][0]["content"],"Read student.js");
                         assert_eq!(payload["tools"][0]["function"]["name"],"read_file");
-                        request.respond(tiny_http::Response::from_string(r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":5,"prompt_tokens":10}}"#)).unwrap();
+                        assert_eq!(payload["stream"],true);
+                        assert_eq!(payload["chat_template_kwargs"]["opengpu_report_token_progress"],true);
+                        request.respond(tiny_http::Response::from_string(concat!(": opengpu-model-tokens 1\n\n",r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":5,"prompt_tokens":10}}"#,"\n\ndata: [DONE]\n\n"))).unwrap();
                     }
                 }
             });
             env::set_var("OPENGPU_MLX_SERVER_URL",&url);
             let mut request=speakai_request(Some("test-model"));request.mode=None;
+            request.stream=false;
             request.prompt=format!("{}{}",super::OPENAI_TOOL_TURN_PREFIX,serde_json::json!({"messages":[{"role":"user","content":"Read student.js"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]}));
             let result=super::run_llama_request(&request,Backend::M).unwrap();
             assert!(result.output.contains("read_file"));handle.join().unwrap();
@@ -8172,6 +8182,23 @@ fn rejected_line_compile_arguments_are_retained_for_private_recovery() {
  let error=native_workflow_message(&p,&bad).unwrap_err();
  assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
  assert!(error.contains("PRIVATE_RANGE_REPLACEMENT"));
+}
+
+#[test]
+fn queued_host_mlx_jobs_use_a_private_stream_without_a_public_delta_sender() {
+    with_stream_delta_sender(None,|| {
+        assert!(native_runtime_streaming(true,true));
+        assert!(!native_runtime_streaming(true,false));
+        assert!(!native_runtime_streaming(false,true));
+        assert!(!native_runtime_streaming(false,false));
+    });
+    let(tx,_rx)=mpsc::channel();with_stream_delta_sender(Some(tx),|| {
+        assert!(native_runtime_streaming(true,false));assert!(native_runtime_streaming(false,false));
+    });
+    let mut p=serde_json::json!({HOST_MANAGED_TOOLS:true,"parallel_tool_calls":true});
+    crate::model_profile::apply_mlx("mlx-community/Qwen3-Coder-Next-4bit",&mut p);
+    assert_eq!(p["chat_template_kwargs"]["opengpu_report_token_progress"],true);
+    assert!(p["chat_template_kwargs"]["opengpu_native_tool_guard"].is_null());
 }
 
 #[test]

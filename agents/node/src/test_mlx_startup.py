@@ -19,7 +19,7 @@ class GenerationProgressTests(unittest.TestCase):
                 return list(response)
         install_generation_progress(SimpleNamespace(APIHandler=Handler, ResponseGenerator=Generator))
         handler = Handler()
-        handler.body = {'chat_template_kwargs': {'opengpu_native_tool_guard': True}}
+        handler.body = {'chat_template_kwargs': {'opengpu_report_token_progress': True}}
         handler.stream = True
         handler.wfile = io.BytesIO()
         with patch('mlx_startup.time.monotonic', side_effect=[0, .2, 1.1]):
@@ -192,7 +192,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "buffered_tool_token_progress": True, "version": 11})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "buffered_tool_token_progress": True, "version": 12})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 
