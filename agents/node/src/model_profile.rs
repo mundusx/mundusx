@@ -73,8 +73,8 @@ pub fn apply_mlx(model: &str, payload: &mut Value) {
     if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
         // Exact source edits must be able to copy observed identifiers and literals.
         // The native runtime guard independently stops actual argument loops.
-        payload["repetition_penalty"] = json!(if host_managed {repetition_penalty(model)}
-            else if native_files || is_qwen3_coder_next(model) {1.0} else {1.1});
+        payload["repetition_penalty"] = json!(if native_files || is_qwen3_coder_next(model) {1.0}
+            else if host_managed {repetition_penalty(model)} else {1.1});
     }
     apply(model, payload);
     if native_files {
@@ -128,11 +128,13 @@ mod tests {
             "tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}]});
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut p);
         assert_eq!(p["max_tokens"],16384);assert_eq!(p["messages"],messages);
-        assert_eq!(p["repetition_penalty"],1.05);
+        assert_eq!(p["repetition_penalty"],1.0);
         assert_eq!(p["chat_template_kwargs"]["opengpu_native_tool_guard"],true);
         p["tool_choice"]=json!({"type":"function","function":{"name":"read_file"}});
         apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut p);
         assert_eq!(p["chat_template_kwargs"]["opengpu_require_tool_call"],true);
+        p["repetition_penalty"]=json!(1.15);apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut p);
+        assert_eq!(p["repetition_penalty"],1.15);
     }
     #[test]
     fn next_uses_its_own_defaults_and_preserves_actual_client_sampling() {
