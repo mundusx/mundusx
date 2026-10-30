@@ -167,7 +167,7 @@ pub fn repair_request(payload:&Value,error:&str)->Value {
         if error.starts_with("native host action precondition failed:") && selected.is_none() {
             if let Some(tools)=retry["tools"].as_array_mut() {
                 // Recovery must not fall back to a shell rewrite of source.
-                tools.retain(|t|matches!(t["function"]["name"].as_str(),Some("read_file"|"replace_string_in_file"|"multi_replace_string_in_file"|"insert_edit_into_file"|"get_errors"|"get_terminal_output"|"kill_terminal")));
+                tools.retain(|t|matches!(t["function"]["name"].as_str(),Some("read_file"|"list_dir"|"replace_string_in_file"|"multi_replace_string_in_file"|"insert_edit_into_file"|"get_errors"|"get_terminal_output"|"kill_terminal")));
             }
         }
     }
