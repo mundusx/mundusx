@@ -2884,7 +2884,7 @@ fn legacy_file_turn(payload: &serde_json::Value) -> bool {
 }
 
 fn native_runtime_payload(payload: &serde_json::Value) -> serde_json::Value {
-    let mut body = if host_managed_tools(payload) { native_line_edit::prepare_host(payload) }
+    let mut body = if host_managed_tools(payload) { payload.clone() }
         else { native_line_edit::prepare(&native_http_bridge::prepare(payload)) };
     if let Some(object) = body.as_object_mut() { object.remove(HOST_MANAGED_TOOLS);object.remove("__opengpu_allow_progress_final"); }
     if host_managed_tools(payload) {
@@ -3019,12 +3019,9 @@ fn native_host_argument_limit(payload:Option<&serde_json::Value>,message:&serde_
 }
 
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
-    let original_message=message;
     if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     if host_managed_tools(payload) {
         // The IDE owns its filesystem, tool execution, approvals and recovery.
-        let compiled=native_line_edit::compile(payload,message).map_err(|e|format!("native host action precondition failed: {e}"))?;
-        let message=&compiled;
         native_task_progress::guard(payload,message).map_err(|error|format!("native host action precondition failed: {error}"))?;
         native_host_recovery::guard(payload,message)?;
         native_host_recovery::reject_existing_create(payload,message)?;
@@ -3043,7 +3040,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
         if payload["tool_choice"]=="none" && calls.is_some_and(|calls|!calls.is_empty()) {
             return Err("native tool schema precondition failed: tool_choice none forbids tool calls".into());
         }
-        let changed = metadata != *message || compiled != *original_message;
+        let changed = metadata != *message;
         return Ok((metadata, changed));
     }
     (|| {
@@ -3581,19 +3578,6 @@ fn run_native_tool_attempts(
         }
         Err(error) => Err(error),
     }
-}
-
-#[test]
-fn host_observed_plan_stream_releases_only_original_registered_edit() {
-    use serde_json::{json,Value};
-    let p=json!({HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"<userRequest>Change heading color</userRequest>"},{"role":"assistant","tool_calls":[{"id":"read","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/index.html","startLine":1,"endLine":100}).to_string()}}]},{"role":"tool","tool_call_id":"read","content":"<body>\n<h1>Exchange rates</h1>\n</body>\n"}],"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}},"required":["filePath","oldString","newString"]}}}]});
-    let plan=json!({"index":0,"id":"plan","type":"function","function":{"name":native_line_edit::NAME,"arguments":json!({"filePath":"D:/p/index.html","startLine":2,"endLine":2,"newText":"<h1 class=\"text-sky-700\">Exchange rates</h1>"}).to_string()}});
-    let wire=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"tool_calls":[plan]},"finish_reason":"tool_calls"}]}));let(tx,rx)=mpsc::channel();
-    let encoded=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p))).unwrap();
-    let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
-    let mut stream=native_stream::NativeStream::default();for raw in rx.try_iter(){assert!(!raw.contains(native_line_edit::NAME));stream.push(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();}
-    assert_eq!(stream.message()["tool_calls"][0]["function"]["name"],"replace_string_in_file");assert_eq!(stream.remainder(&result["message"]).unwrap(),json!({}));
-    let a:Value=serde_json::from_str(result["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(a["oldString"],"<h1>Exchange rates</h1>\n");
 }
 
 #[test]
