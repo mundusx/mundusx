@@ -86,6 +86,12 @@ fn emit_stream_delta(delta: &str) {
     });
 }
 
+fn native_buffered_token_progress(line:&str,previous:&mut u64)->bool {
+    let Some(count)=line.strip_prefix(": opengpu-model-tokens ").and_then(|s|s.parse::<u64>().ok()) else{return false;};
+    if count<=*previous{return false;}
+    *previous=count;true
+}
+
 fn native_chunk_has_token_progress(chunk: &serde_json::Value) -> bool {
     let Some(delta)=chunk.pointer("/choices/0/delta") else { return false; };
     ["content","reasoning_content","reasoning"].iter().any(|key|
@@ -1347,7 +1353,8 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
             && value.get("stable_host_prefix_cache").and_then(|v| v.as_bool()) == Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 10))
+            && value.get("buffered_tool_token_progress").and_then(|v| v.as_bool()) == Some(true)
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 11))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {
@@ -3893,8 +3900,17 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     let mut done = false;
     let mut runtime_tool_error = None;
     let mut last_activity:Option<Instant>=None;
+    let mut generated_tokens=0u64;
     for line in reader.lines() {
         let line = line.map_err(|e| format!("native stream read failed: {e}"))?;
+        if native_buffered_token_progress(&line,&mut generated_tokens) {
+            if last_activity.is_none_or(|last|last.elapsed()>=Duration::from_secs(1)) {
+                let mut stderr=io::stderr().lock();
+                let _=writeln!(stderr,"{MODEL_ACTIVITY_MARKER}");let _=stderr.flush();
+                last_activity=Some(Instant::now());
+            }
+            continue;
+        }
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
@@ -8156,6 +8172,22 @@ fn rejected_line_compile_arguments_are_retained_for_private_recovery() {
  let error=native_workflow_message(&p,&bad).unwrap_err();
  assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
  assert!(error.contains("PRIVATE_RANGE_REPLACEMENT"));
+}
+
+#[test]
+fn buffered_token_progress_is_monotonic_and_never_assistant_output() {
+    use serde_json::{json,Value};
+    let mut count=0;
+    for line in [": keepalive 10/100",": opengpu-model-tokens 0",": opengpu-model-tokens nope","data: {}"] {assert!(!native_buffered_token_progress(line,&mut count));}
+    assert!(native_buffered_token_progress(": opengpu-model-tokens 1",&mut count));
+    assert!(!native_buffered_token_progress(": opengpu-model-tokens 1",&mut count));
+    assert!(!native_buffered_token_progress(": opengpu-model-tokens 0",&mut count));
+    assert!(native_buffered_token_progress(": opengpu-model-tokens 7",&mut count));
+    let wire=format!(": opengpu-model-tokens 1\n\n: opengpu-model-tokens 7\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Done"},"finish_reason":"stop"}]}));
+    let(tx,rx)=mpsc::channel();let encoded=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,None)).unwrap();
+    let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    assert_eq!(result["message"]["content"],"Done");
+    for raw in rx.try_iter(){assert!(!raw.contains("opengpu-model-tokens"));}
 }
 
 #[test]
