@@ -2886,7 +2886,7 @@ fn legacy_file_turn(payload: &serde_json::Value) -> bool {
 fn native_runtime_payload(payload: &serde_json::Value) -> serde_json::Value {
     let mut body = if host_managed_tools(payload) { payload.clone() }
         else { native_line_edit::prepare(&native_http_bridge::prepare(payload)) };
-    if let Some(object) = body.as_object_mut() { object.remove(HOST_MANAGED_TOOLS); }
+    if let Some(object) = body.as_object_mut() { object.remove(HOST_MANAGED_TOOLS);object.remove("__opengpu_allow_progress_final"); }
     if host_managed_tools(payload) {
         if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
             if let Some(tools)=body["tools"].as_array_mut() {
@@ -2926,6 +2926,13 @@ fn run_native_openai_tool_turn_with_mode(
     if let Some(message)=native_port_stop::guard(&payload,&serde_json::json!({})) {
         if streaming {emit_stream_delta(&serde_json::json!({"content":message["content"]}).to_string());}
         return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"stop"}]}));
+    }
+    if let Some(message)=host_managed.then(||native_host_recovery::next_verification(&payload)).flatten() {
+        if streaming {
+            let calls=message["tool_calls"].as_array().unwrap().iter().enumerate().map(|(index,call)|{let mut call=call.clone();call["index"]=serde_json::json!(index);call}).collect::<Vec<_>>();
+            emit_stream_delta(&serde_json::json!({"tool_calls":calls}).to_string());
+        }
+        return normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":message,"finish_reason":"tool_calls"}]}));
     }
     if let Some(message)=(!host_managed).then(||native_tool_workflow::literal_inspection_output(&payload)).flatten() {
         if streaming {emit_stream_delta(&serde_json::json!({"content":message["content"]}).to_string());}
@@ -2987,7 +2994,7 @@ fn run_native_openai_tool_turn_with_mode(
             value["choices"][0]["finish_reason"] = if message["tool_calls"].is_array() { "tool_calls" } else { "stop" }.into();
             value["choices"][0]["message"] = message;
         }
-        if retry && !changed
+        if retry && !changed && !native_host_recovery::allows_final(payload)
             && value["choices"][0]["message"]["tool_calls"]
                 .as_array()
                 .is_none_or(|calls| calls.is_empty())
@@ -3015,6 +3022,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
     if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     if host_managed_tools(payload) {
         // The IDE owns its filesystem, tool execution, approvals and recovery.
+        native_task_progress::guard(payload,message).map_err(|error|format!("native host action precondition failed: {error}"))?;
         native_host_recovery::guard(payload,message)?;
         native_host_recovery::reject_existing_create(payload,message)?;
         // Validate the registered wire contract without inventing host actions.
@@ -3166,8 +3174,11 @@ mod host_managed_tool_tests {
         let out=run_native_tool_attempts(p.clone(),|body,_,retry| {
             count+=1;
             if !retry {assert_eq!(body,&p);return Err("native tool schema precondition failed: read_file.filePath is required".into());}
-            assert_eq!(body["messages"].as_array().unwrap().len(),p["messages"].as_array().unwrap().len()+1);
-            assert_eq!(body["messages"].as_array().unwrap().last().unwrap()["name"],"opengpu_schema_repair");
+            let original=p["messages"].as_array().unwrap();let messages=body["messages"].as_array().unwrap();
+            assert_eq!(&messages[..original.len()],original.as_slice());
+            assert!(messages[original.len()..].iter().any(|m|m["name"]=="opengpu_schema_repair"));
+            assert!(messages[original.len()..].iter().all(|m|m["role"]=="system"));
+            assert_eq!(body["tools"],p["tools"]);assert_eq!(body["tool_choice"],p["tool_choice"]);
             Ok("valid native output".into())
         }).unwrap();
         assert_eq!(count,2);assert_eq!(out,"valid native output");
@@ -3467,6 +3478,9 @@ fn run_native_tool_attempts(
 ) -> Result<String, String> {
     if host_managed_tools(&payload) {
         native_host_recovery::prepare(&mut payload);
+        if let Some(progress)=native_task_progress::guidance(&payload) {
+            if let Some(messages)=payload["messages"].as_array_mut(){messages.push(progress);}
+        }
         let mut output = String::new();
         return match attempt(&payload, &mut output, false) {
             Err(error) if error.starts_with("native tool schema precondition failed:")
@@ -3570,6 +3584,84 @@ fn run_native_tool_attempts(
 }
 
 #[test]
+fn auto_schema_recovery_can_return_final_instead_of_forcing_a_stale_read() {
+    use serde_json::{json,Value};
+    let p=json!({HOST_MANAGED_TOOLS:true,"messages":[{"role":"user","content":"<userRequest>Inspect this file</userRequest>"}],"tools":[{"function":{"name":"read_file","parameters":{"type":"object","required":["filePath","startLine","endLine"],"properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}}}}}]});
+    let bad=json!({"index":0,"id":"incomplete-read","type":"function","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/index.html"}).to_string()}});
+    let first=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Checking current state.\n\n","tool_calls":[bad]},"finish_reason":"tool_calls"}]}));
+    let answer="I cannot complete this inspection; no read was executed.";
+    let second=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":answer},"finish_reason":"stop"}]}));
+    let(tx,rx)=mpsc::channel();let mut attempts=0;
+    let encoded=with_stream_delta_sender(Some(tx),||run_native_tool_attempts(p,|body,output,retry|{attempts+=1;assert!(body["tool_choice"].is_null());parse_native_openai_stream_with_context(io::Cursor::new(if retry{second.clone()}else{first.clone()}),output,retry,Some(body))})).unwrap();
+    let result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();let mut stream=native_stream::NativeStream::default();for raw in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();}
+    assert_eq!(attempts,2);assert!(stream.message().get("tool_calls").is_none());assert!(result["message"]["content"].as_str().unwrap().ends_with(answer));assert_eq!(stream.remainder(&result["message"]).unwrap(),json!({}));
+}
+
+#[test]
+fn progress_recovery_can_finish_without_inventing_another_tool_and_preserves_stream() {
+    use serde_json::{json,Value};
+    let payload=json!({HOST_MANAGED_TOOLS:true,"tools":[{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Redesign the layout</userRequest>"}]});
+    let bad=json!({"index":0,"id":"noop","type":"function","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/p/index.html","oldString":"same","newString":"same"}).to_string()}});
+    let first=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Checking progress.\n\n","tool_calls":[bad]},"finish_reason":"tool_calls"}]}));
+    let final_text="I cannot make further verified progress; the task is incomplete.";
+    let second=format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":final_text},"finish_reason":"stop"}]}));
+    let (tx,rx)=mpsc::channel();let mut attempts=0;
+    let encoded=with_stream_delta_sender(Some(tx),||run_native_tool_attempts(payload,|body,output,retry|{
+        attempts+=1;
+        assert!(!native_runtime_payload(body).as_object().unwrap().contains_key("__opengpu_allow_progress_final"));
+        parse_native_openai_stream_with_context(io::Cursor::new(if retry{second.clone()}else{first.clone()}),output,retry,Some(body))
+    })).unwrap();
+    let final_result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    let mut stream=native_stream::NativeStream::default();for delta in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&delta).unwrap()).unwrap();}
+    assert_eq!(attempts,2);assert!(stream.message().get("tool_calls").is_none());assert!(stream.message()["content"].as_str().unwrap().ends_with(final_text));assert_eq!(stream.remainder(&final_result["message"]).unwrap(),json!({}));
+    for choice in [json!("required"),json!({"type":"function","function":{"name":"replace_string_in_file"}})] {
+        let mut forced=json!({"__opengpu_allow_progress_final":true});forced["tool_choice"]=choice;assert!(!native_host_recovery::allows_final(&forced));
+    }
+}
+
+#[test]
+fn host_confirmed_edit_streams_registered_diagnostics_without_calling_model() {
+    use serde_json::{json,Value};
+    let payload=json!({"messages":[{"role":"user","content":"<userRequest>Redesign the layout</userRequest>"},{"role":"assistant","tool_calls":[{"id":"edited","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/p/index.html","oldString":"old","newString":"new"}).to_string()}}]},{"role":"tool","tool_call_id":"edited","content":"The following files were successfully edited:\nD:/p/index.html"}],"tools":[{"function":{"name":"get_errors","parameters":{"type":"object","required":["filePaths"],"properties":{"filePaths":{"type":"array","items":{"type":"string"}}}}}}]});
+    let request:WorkerLaunchRequest=serde_json::from_value(json!({"job_id":"test","node_id":"test","backend":"m","stream":true,"prompt":format!("{OPENAI_TOOL_TURN_PREFIX}{payload}")})).unwrap();
+    let (tx,rx)=mpsc::channel();
+    let encoded=with_stream_delta_sender(Some(tx),||run_native_openai_tool_turn_with_mode("http://127.0.0.1:1","mock",&request,true)).unwrap();
+    let final_result:Value=serde_json::from_str(encoded.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    let mut stream=native_stream::NativeStream::default();for delta in rx.try_iter(){stream.push(&serde_json::from_str::<Value>(&delta).unwrap()).unwrap();}
+    assert_eq!(stream.message()["tool_calls"],final_result["message"]["tool_calls"]);
+    assert_eq!(stream.message()["tool_calls"][0]["function"]["name"],"get_errors");
+    assert_eq!(stream.remainder(&final_result["message"]).unwrap(),json!({}));
+    assert!(final_result["usage"].is_null());
+}
+
+#[test]
+fn host_managed_progress_rejects_restarted_reads_and_recovers_with_a_real_edit() {
+    use serde_json::json;
+    let mut payload=json!({HOST_MANAGED_TOOLS:true,"tools":[{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}],"messages":[{"role":"user","content":"<userRequest>Redesign the layout</userRequest>"}]});
+    let read=json!({"role":"assistant","tool_calls":[{"id":"read1","function":{"name":"read_file","arguments":json!({"filePath":"D:/p/script.js","startLine":1,"endLine":100}).to_string()}}]});
+    for id in ["read1","read2"] {
+        let mut call=read.clone();call["tool_calls"][0]["id"]=json!(id);
+        payload["messages"].as_array_mut().unwrap().extend([call,json!({"role":"tool","tool_call_id":id,"content":"const unchanged=1;\n"})]);
+    }
+    let edit=json!({"role":"assistant","content":"", "tool_calls":[{"id":"edit","type":"function","function":{"name":"replace_string_in_file","arguments":json!({"filePath":"D:/p/index.html","oldString":"old heading","newString":"Blue heading"}).to_string()}}]});
+    let mut attempts=0;
+    let mut rejected_attempts=0;
+    let rejection=run_native_tool_attempts(payload.clone(),|body,_,_|{
+        rejected_attempts+=1;
+        native_workflow_message(body,&read).map(|_|String::new())
+    }).unwrap_err();
+    assert_eq!(rejected_attempts,2);assert!(rejection.contains("source range is already available"));
+    let result=run_native_tool_attempts(payload,|body,_,retry|{
+        attempts+=1;
+        assert!(body["messages"].as_array().unwrap().iter().any(|m|m["name"]=="mundusx_observed_task_progress"));
+        let message=if retry {&edit}else{&read};
+        let (checked,_)=native_workflow_message(body,message)?;
+        normalize_native_openai_tool_response(&json!({"choices":[{"message":checked,"finish_reason":"tool_calls"}]}))
+    }).unwrap();
+    assert_eq!(attempts,2);assert!(result.contains("Blue heading"));
+}
+
+#[test]
 fn host_schema_repair_preserves_streamed_prose_in_final_message() {
     use serde_json::{json, Value};
     for model in ["qwen3-coder", "nemotron", "another-provider"] {
@@ -3614,7 +3706,7 @@ fn host_schema_repair_stops_after_one_retry_for_every_model() {
         let mut attempts=0;
         let result=run_native_tool_attempts(p,|body,_,retry|{
             attempts+=1;assert_eq!(body["model"],model);
-            if retry {assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");}
+            if retry {assert!(body["tool_choice"].is_null());assert!(native_host_recovery::allows_final(body));}
             Err("native tool schema precondition failed: run_in_terminal.mode is required".into())
         });
         assert_eq!(attempts,2);assert!(result.unwrap_err().starts_with("native tool recovery failed after one retry:"));
@@ -3845,7 +3937,9 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
             reason=Some(if message["tool_calls"].is_array() {"tool_calls"} else {"stop"}.to_string());
         }
     }
-    if retry && !workflow_changed
+    let recovery_final=retry && payload.is_some_and(native_host_recovery::allows_final)
+        && message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty());
+    if retry && !workflow_changed && !recovery_final
         && message["tool_calls"]
             .as_array()
             .is_none_or(|calls| calls.is_empty())
@@ -3854,6 +3948,13 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     }
     let argument_limit=native_host_argument_limit(payload,&message,workflow_changed);
     validate_native_tool_message_with_limit(&message,reason.as_deref(),argument_limit)?;
+    if recovery_final {
+        if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
+            let suffix=if output.is_empty() || output.ends_with('\n'){content.to_owned()}else{format!("\n\n{content}")};
+            output.push_str(&suffix);
+            emit_stream_delta(&serde_json::json!({"content":suffix}).to_string());
+        }
+    }
     if payload.is_some_and(|p|legacy_file_turn(p)||native_port_stop::applies(p)) {
         if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
             emit_stream_delta(&serde_json::json!({"content":content}).to_string());
