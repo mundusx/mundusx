@@ -3015,6 +3015,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
     if let Some(guarded)=native_port_stop::guard(payload,message) {return Ok((guarded,true));}
     if host_managed_tools(payload) {
         // The IDE owns its filesystem, tool execution, approvals and recovery.
+        native_host_recovery::guard(payload,message)?;
         native_host_recovery::reject_existing_create(payload,message)?;
         // Validate the registered wire contract without inventing host actions.
         let metadata = native_tool_workflow::terminal_metadata(payload, message);
@@ -3465,6 +3466,7 @@ fn run_native_tool_attempts(
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
     if host_managed_tools(&payload) {
+        native_host_recovery::prepare(&mut payload);
         let mut output = String::new();
         return match attempt(&payload, &mut output, false) {
             Err(error) if error.starts_with("native tool schema precondition failed:")
