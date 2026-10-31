@@ -1950,6 +1950,12 @@ fn start_assignment_monitor(
     stop
 }
 
+fn monitored_assignment<'a>(config:&AgentConfig,job:&'a JobRecord)->Option<&'a String> {
+    // A terminal assignment must stop local work regardless of whether its
+    // public response uses streaming. External clusters have separate control.
+    if config.contributed_cluster.is_some() {None} else {job.assigned_at.as_ref()}
+}
+
 fn execute_claimed_job(
     config: AgentConfig,
     identity: DeviceIdentity,
@@ -1958,11 +1964,9 @@ fn execute_claimed_job(
     _permit: local_api::SlotPermit,
 ) {
     let cancelled=Arc::new(AtomicBool::new(false));
-    let monitor = if job.stream && config.contributed_cluster.is_none() {
-        job.assigned_at.as_ref().map(|assignment| {
+    let monitor = monitored_assignment(&config,&job).map(|assignment| {
             start_assignment_monitor(config.clone(),identity.clone(),job.job_id.clone(),assignment.clone(),cancelled.clone())
-        })
-    } else { None };
+        });
     let request = WorkerLaunchRequest {
         operation: job.operation,
         job_id: job.job_id.clone(),
@@ -3631,6 +3635,13 @@ mod tests {
             "compatibility_reason": "test compatibility"
         });
         fs::write(manifest_dir.join("tiny-cuda.json"), manifest.to_string()).expect("manifest");
+    }
+
+    #[test]
+    fn local_assignment_monitor_is_independent_of_public_streaming() {
+        let config=AgentConfig::default();let mut job=test_job();
+        for stream in [false,true] {job.stream=stream;assert_eq!(monitored_assignment(&config,&job).map(String::as_str),Some("2"));}
+        job.assigned_at=None;assert!(monitored_assignment(&config,&job).is_none());
     }
 
     fn test_job() -> JobRecord {
