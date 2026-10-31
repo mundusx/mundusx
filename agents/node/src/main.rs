@@ -1703,10 +1703,10 @@ fn job_status_label(status: contracts::JobStatus) -> &'static str {
     }
 }
 
-fn control_plane_completion_message(record: &JobRecord, completion: &JobCompletion) -> String {
+fn control_plane_completion_message(record: &JobRecord, _completion: &JobCompletion) -> String {
     format!(
         "controlPlaneComplete: accepted {} {}",
-        job_status_label(completion.status),
+        job_status_label(record.status),
         record.job_id
     )
 }
@@ -1926,6 +1926,14 @@ fn stop_busy_heartbeat_supervisor(stop_tx: mpsc::Sender<()>, handle: thread::Joi
     let _ = handle.join();
 }
 
+fn terminal_assignment_message(value:&serde_json::Value,job_id:&str)->Option<String> {
+    // Legacy desktops consume the completion marker. Mirror only an actual
+    // signed terminal assignment response, never an inferred cancellation.
+    if value["active"]!=false {return None;}
+    let status=value["terminal_status"].as_str()?;
+    matches!(status,"failed"|"completed").then(||format!("controlPlaneComplete: accepted {status} {job_id}"))
+}
+
 fn start_assignment_monitor(
     config:AgentConfig,identity:DeviceIdentity,job_id:String,assignment_id:String,cancelled:Arc<AtomicBool>,
 )->mpsc::Sender<()> {
@@ -1940,6 +1948,10 @@ fn start_assignment_monitor(
             match signed_post_json_body_with_agent::<_,serde_json::Value>(&agent,&config.control_plane_url,
                 "/v1/jobs/assignment",&config.device_id,&identity,&payload) {
                 Ok(value) if value["active"].as_bool()==Some(false) => {
+                    if let Some(message)=terminal_assignment_message(&value,&job_id) {
+                        println!("controlPlaneTerminal: verified assignment state {job_id}");
+                        println!("{message}");
+                    }
                     cancelled.store(true,Ordering::Release);break;
                 }
                 Err(error) if error.starts_with("HTTP 404") || error.starts_with("HTTP 405") => break,
@@ -3756,7 +3768,7 @@ mod tests {
 
     #[test]
     fn control_plane_completion_message_includes_reported_status() {
-        let job = test_job();
+        let mut job = test_job();job.status=contracts::JobStatus::Failed;
         let completion = JobCompletion {
             token_usage: Vec::new(),
             job_id: "job-1".to_string(),
@@ -3775,6 +3787,16 @@ mod tests {
             control_plane_completion_message(&job, &completion),
             "controlPlaneComplete: accepted failed job-1"
         );
+        let mut stale=completion;stale.status=contracts::JobStatus::Completed;
+        assert_eq!(control_plane_completion_message(&job,&stale),"controlPlaneComplete: accepted failed job-1");
+    }
+
+    #[test]
+    fn legacy_activity_marks_only_verified_terminal_assignments() {
+        use serde_json::json;
+        assert_eq!(terminal_assignment_message(&json!({"active":false,"terminal_status":"failed"}),"job-1").as_deref(),Some("controlPlaneComplete: accepted failed job-1"));
+        assert_eq!(terminal_assignment_message(&json!({"active":false,"terminal_status":"completed"}),"job-1").as_deref(),Some("controlPlaneComplete: accepted completed job-1"));
+        for value in [json!({"active":false}),json!({"active":true,"terminal_status":"failed"}),json!({"active":false,"terminal_status":"queued"}),json!({"active":false,"terminal_status":"unknown"})] {assert!(terminal_assignment_message(&value,"job-1").is_none());}
     }
 
     #[test]
