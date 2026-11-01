@@ -2309,7 +2309,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             config.active_model.as_deref(),
             resolved_backend(&config),
             runtime_parallel_slots,
-            mlx_context::prompt_cache_bytes(detect_memory_mb(), config.contribution_percent),
+            mlx_context::runtime_prompt_cache_bytes(&config.effective_model_dir(), config.active_model.as_deref(), detect_memory_mb(), config.contribution_percent),
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -2573,7 +2573,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             match worker::start_persistent_runtime(
                 &latest_config.effective_model_dir(), latest_config.active_model.as_deref(),
                 resolved_backend(&latest_config), worker_readiness(&latest_config).0.parallel_slots,
-                mlx_context::prompt_cache_bytes(detect_memory_mb(), latest_config.contribution_percent),
+                mlx_context::runtime_prompt_cache_bytes(&latest_config.effective_model_dir(), latest_config.active_model.as_deref(), detect_memory_mb(), latest_config.contribution_percent),
             ) {
                 Ok(runtime) => {
                     persistent_runtime = runtime;

@@ -13,6 +13,27 @@ pub fn prompt_cache_bytes(physical_mb:u32, cap:u8)->u64 {
     if budget >= 32 * GIB { 4 * GIB } else { 0 }
 }
 
+fn cache_bytes_for_weights(physical_mb: u32, cap: u8, weights: u64) -> u64 {
+    let base = prompt_cache_bytes(physical_mb, cap);
+    if base == 0 { return 0; }
+    let budget = u64::from(physical_mb) * (1 << 20) * u64::from(cap.min(100)) / 100;
+    let workspace = (4 * GIB).max(weights / 4);
+    // Only enlarge retention when there is ample room for both active KV and
+    // retained snapshots. In particular, never give a 42 GiB model an 8 GiB
+    // retention allowance inside a 51 GiB contribution budget.
+    if budget.saturating_sub(weights).saturating_sub(workspace) >= 24 * GIB {
+        8 * GIB
+    } else { base }
+}
+
+pub fn runtime_prompt_cache_bytes(model_dir: &Path, name: Option<&str>, physical_mb: u32, cap: u8) -> u64 {
+    let weights = name.and_then(|name| cached_directory(&ModelCapability {
+        name: name.into(), ..Default::default()
+    }, model_dir)).and_then(|path| weight_bytes(&path));
+    weights.map(|bytes| cache_bytes_for_weights(physical_mb, cap, bytes))
+        .unwrap_or_else(|| prompt_cache_bytes(physical_mb, cap))
+}
+
 pub fn context_tokens(
     model: &ModelCapability,
     model_dir: &Path,
@@ -189,7 +210,7 @@ fn limit(
     // fixed 4 GiB workspace reserve for Next, separately from its full weights,
     // fixed recurrent state, retained prefix cache and active KV allocations.
     let workspace=if hybrid {4*GIB} else {(4*GIB).max(weights/4)};
-    let reserve = workspace + prompt_cache_bytes(physical_mb, cap);
+    let reserve = workspace + cache_bytes_for_weights(physical_mb, cap, weights);
     let remaining = budget.checked_sub(weights)?.checked_sub(reserve)?
         .checked_sub(fixed_per_slot.checked_mul(u64::from(slots.max(1)))?)?;
     let memory_limit = remaining / per_token.checked_mul(u64::from(slots.max(1)))?;
@@ -224,7 +245,9 @@ mod tests {
     #[test]
     fn large_mac_can_fit_an_agent_turn_without_ignoring_parallel_cache_memory() {
         let tokens = limit(&qwen(), 16 * GIB, 65536, 70, 3, None).unwrap();
-        assert!(tokens >= 65536);
+        // Reserving 8 GiB rather than 4 GiB for retained prefixes reduces
+        // the per-slot active KV allowance for this three-slot deployment.
+        assert!(tokens >= 49152);
         assert!(tokens < limit(&qwen(), 16 * GIB, 65536, 70, 1, None).unwrap());
         assert!(limit(&qwen(), 16 * GIB, 32768, 70, 3, None).unwrap() < 78443);
         // The real two-slot 64 GiB / 80% deployment still admits large agent turns.
@@ -236,6 +259,13 @@ mod tests {
         assert_eq!(prompt_cache_bytes(32768, 80), 0);
         assert_eq!(prompt_cache_bytes(65536, 30), 0);
         assert_eq!(prompt_cache_bytes(65536, 80), 4 * GIB);
+    }
+    #[test]
+    fn retained_cache_can_fit_large_agent_prefixes_without_overcommitting_next() {
+        assert_eq!(cache_bytes_for_weights(65536,80,16*GIB),8*GIB);
+        assert_eq!(cache_bytes_for_weights(65536,80,42*GIB),4*GIB);
+        assert_eq!(cache_bytes_for_weights(32768,80,16*GIB),0);
+        assert_eq!(cache_bytes_for_weights(65536,30,16*GIB),0);
     }
     #[test]
     fn override_is_clamped_to_model_and_memory_limits() {

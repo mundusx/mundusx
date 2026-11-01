@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import threading
 import re
+import logging
 
 PREFIX = "MUNDUSX_LOAD_PROGRESS:"
 BATCH_BYTES = 64 * 1024 * 1024
@@ -130,9 +131,17 @@ def stable_host_prefix(tokenizer, request, template_args, tokenized):
         return tokenized
     try:
         options = dict(template_args)
-        options.update(tools=[], tokenize=True)
+        # The tools are rendered into the system prefix by Qwen's template.
+        # Omitting them changes its tokens and can collapse the cache boundary
+        # to only the short introduction before the tool catalog.
+        options.update(tools=getattr(request, 'tools', []), tokenize=True)
+        leading_system = []
+        for message in request.messages:
+            if message.get('role') != 'system':
+                break
+            leading_system.append(message)
         baseline = tokenizer.apply_chat_template(
-            [request.messages[0], {'role': 'user', 'content': ''}],
+            leading_system + [{'role': 'user', 'content': ''}],
             add_generation_prompt=False, **options)
         boundary = 0
         for actual, expected in zip(prompt, baseline):
@@ -145,6 +154,11 @@ def stable_host_prefix(tokenizer, request, template_args, tokenized):
     if boundary < 256 or boundary >= len(prompt):
         return tokenized
     boundaries = {boundary: 'system'}
+    # Hybrid recurrent caches cannot trim a completed assistant state. Save an
+    # exact pre-generation checkpoint as well, so tool-result follow-ups can
+    # reuse their unchanged conversation prefix. Leave one token for decoding.
+    if len(prompt) - boundary > 1:
+        boundaries[len(prompt) - 1] = 'user'
     position = 0
     for segment, kind in zip(segments, segment_types):
         position += len(segment)
@@ -255,7 +269,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 10}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "prefill_checkpoint_cache": True, "version": 11}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -332,6 +346,20 @@ def bounded_prompt_cache(cache_class, max_bytes):
         def __init__(self, max_size=2, **kwargs):
             kwargs["max_bytes"] = min(kwargs.get("max_bytes", max_bytes), max_bytes)
             super().__init__(max_size=max_size, **kwargs)
+
+        def fetch_nearest_cache(self, model, tokens):
+            cache, rest = super().fetch_nearest_cache(model, tokens)
+            logging.info('Prompt cache lookup: input_tokens=%d cached_tokens=%d uncached_tokens=%d retained_bytes=%d',
+                         len(tokens), len(tokens) - len(rest), len(rest), self.nbytes)
+            return cache, rest
+
+        def insert_cache(self, model, tokens, prompt_cache, *, cache_type='assistant'):
+            entry_bytes = sum(part.nbytes for part in prompt_cache)
+            super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+            logging.info('Prompt cache checkpoint: tokens=%d type=%s entry_bytes=%d retained_bytes=%d budget_bytes=%d',
+                         len(tokens), cache_type, entry_bytes, self.nbytes, self.max_bytes)
+            if entry_bytes > self.max_bytes:
+                logging.warning('Prompt cache checkpoint exceeds byte budget; reduce context or provision sufficient memory')
 
     return BoundedPromptCache
 

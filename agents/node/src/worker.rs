@@ -51,6 +51,7 @@ thread_local! {
 }
 
 fn record_runtime_usage(usage: &serde_json::Value) {
+    native_call_timing::usage(usage);
     let Some(completion) = usage.get("completion_tokens").and_then(serde_json::Value::as_u64) else { return; };
     let prompt = usage.get("prompt_tokens").and_then(serde_json::Value::as_u64);
     RUNTIME_TOKEN_USAGE.with(|slot| slot.borrow_mut().push(serde_json::json!({
@@ -1347,7 +1348,7 @@ fn mlx_required_tools_ready(url: &str) -> bool {
         .is_some_and(|value| value.get("required_tool_opening").and_then(|v| v.as_bool()) == Some(true)
             && value.get("native_tool_guard").and_then(|v|v.as_bool())==Some(true)
             && value.get("stable_host_prefix_cache").and_then(|v| v.as_bool()) == Some(true)
-            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 10))
+            && value.get("version").and_then(|v| v.as_u64()).is_some_and(|version| version >= 11))
 }
 
 fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool {

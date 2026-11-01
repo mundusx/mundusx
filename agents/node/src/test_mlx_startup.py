@@ -47,6 +47,25 @@ class StableHostCacheTests(unittest.TestCase):
         self.assertEqual(calls[0][1], {'enable_thinking':False,'tools':[],
                                      'tokenize':True,'add_generation_prompt':False})
 
+    def test_tools_are_part_of_the_exact_stable_prefix(self):
+        def parser(): pass
+        parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
+        tools = [{'type':'function','function':{'name':'read_file'}}]
+        prefix = list(range(400))
+        def template(messages, **options):
+            self.assertEqual(options['tools'], tools)
+            self.assertEqual(len(messages), 3)
+            return prefix + [900]
+        tokenizer = SimpleNamespace(has_chat_template=True,tool_parser=parser,apply_chat_template=template)
+        request = SimpleNamespace(request_type='chat',tools=tools,messages=[
+            {'role':'system','content':'host'}, {'role':'system','content':'workspace'},
+            {'role':'tool','content':'observed result'}])
+        prompt=prefix+[800,801,802,803]
+        result=stable_host_prefix(tokenizer,request,{},(prompt,[prompt],['assistant'],'normal',None))
+        self.assertEqual(sum(result[1],[]),prompt)
+        self.assertEqual(result[1],[prefix,[800,801,802],[803]])
+        self.assertEqual(result[2],['system','user','assistant'])
+
     def test_unsupported_and_small_prefixes_keep_original_segmentation(self):
         def parser(): pass
         parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
@@ -120,7 +139,7 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 10})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "prefill_checkpoint_cache": True, "version": 11})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
 

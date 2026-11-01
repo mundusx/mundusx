@@ -7,7 +7,10 @@ use std::{
     io::Write,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-thread_local! { static CURRENT: RefCell<Option<(Instant, Option<u64>)>> = const { RefCell::new(None) }; }
+thread_local! {
+    static CURRENT: RefCell<Option<(Instant, Option<u64>)>> = const { RefCell::new(None) };
+    static COUNTS: RefCell<Value> = const { RefCell::new(Value::Null) };
+}
 pub struct CallTiming {
     job: String,
     retry: bool,
@@ -17,6 +20,7 @@ impl CallTiming {
     pub fn start(job: &str, retry: bool) -> Self {
         let started = Instant::now();
         CURRENT.with(|slot| *slot.borrow_mut() = Some((started, None)));
+        COUNTS.with(|slot| *slot.borrow_mut() = Value::Null);
         Self {
             job: job.into(),
             retry,
@@ -25,12 +29,23 @@ impl CallTiming {
     }
     pub fn finish(self, success: bool) {
         let first = CURRENT.with(|slot| slot.borrow_mut().take().and_then(|(_, first)| first));
+        let counts = COUNTS.with(|slot| slot.replace(Value::Null));
         let row = json!({"event":"native_model_call","job_id":self.job,"retry":self.retry,
             "timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             "model_call_ms":self.started.elapsed().as_millis() as u64,"first_model_token_ms":first,
-            "success":success,"queue_wait_ms":null,"host_tool_ms":null,"host_verification_ms":null});
-        if !cfg!(test) { let _ = persist(&crate::storage::config_dir(), &row); }
+            "success":success,"prompt_tokens":counts["prompt_tokens"],"cached_prompt_tokens":counts["cached_prompt_tokens"],
+            "completion_tokens":counts["completion_tokens"],"queue_wait_ms":null,"host_tool_ms":null,"host_verification_ms":null});
+        if !cfg!(test) {
+            let _ = persist(&crate::storage::config_dir(), &row);
+        }
     }
+}
+pub fn usage(value: &Value) {
+    COUNTS.with(|slot| *slot.borrow_mut() = json!({
+        "prompt_tokens":value["prompt_tokens"].as_u64(),
+        "cached_prompt_tokens":value.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64),
+        "completion_tokens":value["completion_tokens"].as_u64(),
+    }));
 }
 pub fn token_progress() {
     CURRENT.with(|slot| {
@@ -65,6 +80,20 @@ fn persist(home: &std::path::Path, row: &Value) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usage_keeps_counts_only_and_missing_cache_usage_stays_unknown() {
+        usage(&json!({"prompt_tokens":100,"completion_tokens":2,
+            "prompt_tokens_details":{"cached_tokens":90},"private_prompt":"CANARY"}));
+        COUNTS.with(|slot| {
+            assert_eq!(slot.borrow()["cached_prompt_tokens"],90);
+            assert!(!slot.borrow().to_string().contains("CANARY"));
+        });
+        usage(&json!({"prompt_tokens":100}));
+        COUNTS.with(|slot| assert!(slot.borrow()["cached_prompt_tokens"].is_null()));
+        let timing=CallTiming::start("test",false);
+        COUNTS.with(|slot| assert!(slot.borrow().is_null()));
+        timing.finish(true);
+    }
     #[test]
     fn first_progress_is_recorded_once_and_missing_remains_unknown() {
         CURRENT.with(|s| *s.borrow_mut() = Some((Instant::now(), None)));
