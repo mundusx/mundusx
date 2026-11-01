@@ -2,6 +2,10 @@
 mod desktop_activity;
 #[path = "download_progress.rs"]
 mod download_progress;
+#[path = "native_call_timing.rs"]
+mod native_call_timing;
+#[path = "native_process_scope.rs"]
+mod native_process_scope;
 #[path = "native_stream.rs"]
 mod native_stream;
 #[path = "native_tool_workflow.rs"]
@@ -2936,6 +2940,8 @@ fn run_native_openai_tool_turn_with_mode(
         }
     }
     run_native_tool_attempts(payload, |payload, output, retry| {
+        let timing = native_call_timing::CallTiming::start(&request.job_id, retry);
+        let result = (|| {
         let response = ureq::post(&format!(
             "{}/v1/chat/completions",
             url.trim_end_matches('/')
@@ -2987,6 +2993,9 @@ fn run_native_openai_tool_turn_with_mode(
             return Err("native tool recovery returned no tool call".into());
         }
         normalize_native_openai_tool_response_with_limit(&value,native_host_argument_limit(Some(payload),&value["choices"][0]["message"],changed))
+        })();
+        timing.finish(result.is_ok());
+        result
     })
 }
 
@@ -3009,6 +3018,7 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
         // Validate the registered wire contract without inventing host actions.
         let metadata = native_tool_workflow::terminal_metadata(payload, message);
         validate_native_tool_schema(payload, &metadata)?;
+        native_process_scope::validate(&metadata)?;
         let calls = metadata["tool_calls"].as_array();
         if let Some(name) = payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
             if calls.is_none_or(|calls| calls.is_empty() || calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
@@ -3047,6 +3057,22 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
 mod host_managed_tool_tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn broad_shutdown_never_releases_tools_and_safe_pid_recovery_runs_once() {
+        let mut p=payload();
+        p["tools"].as_array_mut().unwrap().push(json!({"type":"function","function":{"name":"run_in_terminal","parameters":{"type":"object","required":["command"],"properties":{"command":{"type":"string"}}}}}));
+        let wire=|command:&str| format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"stop","type":"function","function":{"name":"run_in_terminal","arguments":json!({"command":command}).to_string()}}]},"finish_reason":"tool_calls"}]}));
+        let (tx,rx)=mpsc::channel();let mut attempts=0;
+        with_stream_delta_sender(Some(tx),||run_native_tool_attempts(p,|body,out,retry| {
+            attempts+=1;
+            let command=if retry {"Stop-Process -Id 1234"}else {"Get-Process | Where-Object {$_.ProcessName -like '*node*'} | Stop-Process -Force"};
+            parse_native_openai_stream_with_context(io::Cursor::new(wire(command)),out,retry,Some(body))
+        })).unwrap();
+        assert_eq!(attempts,2);
+        let released=rx.try_iter().collect::<Vec<_>>().join("");
+        assert!(!released.contains("*node*"));assert!(released.contains("Stop-Process -Id 1234"));
+    }
 
     #[test]
     fn truncation_takes_precedence_over_markup_error_without_retry_or_tool_release() {
@@ -3701,6 +3727,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
         }
         let chunk: serde_json::Value =
             serde_json::from_str(data).map_err(|e| format!("invalid native stream JSON: {e}"))?;
+        if native_chunk_has_token_progress(&chunk) { native_call_timing::token_progress(); }
         if native_chunk_has_token_progress(&chunk)
             && last_activity.is_none_or(|last|last.elapsed()>=Duration::from_secs(1)) {
             // Private parent-child liveness only. Never expose buffered tool
