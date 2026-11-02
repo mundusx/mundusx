@@ -1033,7 +1033,7 @@ pub fn active_model_capability(
             estimated_vram_mb: record.estimated_vram_mb,
             compatibility: record.compatibility.clone(),
             compatibility_reason: record.compatibility_reason.clone(),
-            active: record.active,
+            active: model_name.map(|name| record.name == name).unwrap_or(record.active),
             languages: record.languages.clone(),
             specialties: record.specialties.clone(),
             supports_structured_output: record.supports_structured_output,
@@ -1049,7 +1049,7 @@ pub fn active_model_capability(
             fallback = Some(capability);
         }
     }
-    fallback
+    if model_name.is_some() { None } else { fallback }
 }
 
 pub fn available_model_capabilities(model_dir: &Path) -> Vec<ModelCapability> {
@@ -3477,10 +3477,46 @@ fn native_terminal_runtime_feedback(payload:&serde_json::Value)->Option<&'static
     None
 }
 
+fn greeting_without_tools(payload: &serde_json::Value) -> serde_json::Value {
+    let last = payload["messages"].as_array().and_then(|m| m.last());
+    let Some(last) = last.filter(|m| m["role"] == "user") else { return payload.clone(); };
+    if payload.get("tool_choice").is_some_and(|v| !v.is_null() && !matches!(v.as_str(), Some("auto" | "none"))) {
+        return payload.clone();
+    }
+    let Some(raw) = last["content"].as_str() else { return payload.clone(); };
+    let text = if raw.contains("<userRequest>") {
+        if raw.matches("<userRequest>").count()!=1 { return payload.clone(); }
+        raw.split_once("<userRequest>").and_then(|(_,s)|s.split_once("</userRequest>").map(|(t,_)|t)).unwrap_or("")
+    } else { raw };
+    let text=text.trim().trim_end_matches(['!', '.', '?']).trim().to_ascii_lowercase();
+    if !matches!(text.as_str(), "hello" | "hi" | "hey" | "good morning" | "good afternoon" | "good evening") {
+        return payload.clone();
+    }
+    // Still generate a real model response with all instructions/history intact.
+    // A greeting neither needs tool schemas nor authorizes workspace actions.
+    let mut result=payload.clone();result["tools"]=serde_json::json!([]);result["tool_choice"]=serde_json::json!("none");result
+}
+
+#[cfg(test)]
+mod greeting_scope_tests {
+    use super::*;
+    #[test]
+    fn greeting_omits_tools_but_preserves_instructions_and_explicit_choices() {
+        let p=serde_json::json!({"messages":[{"role":"system","content":"Keep all instructions"},{"role":"user","content":"<context>editor context</context><userRequest>hello!</userRequest>"}],"tools":[{"type":"function","function":{"name":"run_in_terminal"}}]});
+        let q=greeting_without_tools(&p);assert_eq!(q["messages"],p["messages"]);assert_eq!(q["tool_choice"],"none");assert!(q["tools"].as_array().unwrap().is_empty());assert_eq!(p["tools"].as_array().unwrap().len(),1);
+        for text in ["hello, start the server", "explain hello", "<userRequest>hello</userRequest><userRequest>stop server</userRequest>"] {
+            let mut other=p.clone();other["messages"][1]["content"]=serde_json::json!(text);assert_eq!(greeting_without_tools(&other),other);
+        }
+        let mut required=p.clone();required["tool_choice"]=serde_json::json!("required");assert_eq!(greeting_without_tools(&required),required);
+        let mut continuation=p.clone();continuation["messages"].as_array_mut().unwrap().push(serde_json::json!({"role":"tool","content":"result"}));assert_eq!(greeting_without_tools(&continuation),continuation);
+    }
+}
+
 fn run_native_tool_attempts(
     mut payload: serde_json::Value,
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
+    payload = greeting_without_tools(&payload);
     if host_managed_tools(&payload) {
         let mut output = String::new();
         return match attempt(&payload, &mut output, false) {

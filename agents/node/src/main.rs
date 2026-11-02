@@ -752,8 +752,22 @@ fn build_scheduler_capabilities(
         }
         installed
     };
+    // A persistent MLX contributor serves its selected model. Advertising cold
+    // downloaded models lets an automatic alias trigger an unrequested model
+    // replacement and discard the warm prompt cache.
+    if cluster.is_none() && backend == Backend::M {
+        if let Some(selected) = config.active_model.as_deref() {
+            models.retain(|entry| entry.name == selected);
+        }
+    }
     for entry in &mut models {
-        entry.warm |= entry.active && health.persistent_runtime_warm;
+        // Installed manifests describe inventory, not the current user's selection.
+        if cluster.is_none() {
+            if let Some(selected) = config.active_model.as_deref() {
+                entry.active = entry.name == selected;
+            }
+        }
+        entry.warm = entry.active && health.persistent_runtime_warm;
         if cluster.is_none() && backend == Backend::M {
             if let Some(context) = mlx_context::context_tokens(
                 entry,
@@ -3812,6 +3826,35 @@ mod tests {
         assert!(capability.usable_memory_mb.is_some());
         assert!(capability.available_memory_mb.is_some());
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn saved_model_selection_overrides_stale_manifest_active_flags() {
+        let mut config = test_config();
+        config.contribution_percent=80;
+        let temp = std::env::temp_dir().join(format!("opengpu-selection-{}", uuid::Uuid::new_v4()));
+        config.model_dir = Some(temp.display().to_string());
+        write_active_model_manifest(&config, "accepted");
+        let dir=temp.join(".opengpu");
+        let mut record:serde_json::Value=serde_json::from_str(&fs::read_to_string(dir.join("tiny-cuda.json")).unwrap()).unwrap();
+        record["name"]=serde_json::json!("other-installed");
+        fs::write(dir.join("other.json"),record.to_string()).unwrap();
+        record["name"]=serde_json::json!("tiny-cuda");record["active"]=serde_json::json!(false);
+        fs::write(dir.join("tiny-cuda.json"),record.to_string()).unwrap();
+        let mut health=test_health(Backend::Cuda);health.persistent_runtime_warm=true;
+        let capability=build_capabilities(&config,&health,true);
+        assert!(capability.active_model.as_ref().unwrap().active);
+        let profile=build_scheduler_capabilities(&config,&health,&capability,32768,100);
+        assert!(profile.models.iter().find(|m|m.name=="tiny-cuda").unwrap().active);
+        assert!(profile.models.iter().find(|m|m.name=="tiny-cuda").unwrap().warm);
+        assert!(!profile.models.iter().find(|m|m.name=="other-installed").unwrap().active);
+        assert!(!profile.models.iter().find(|m|m.name=="other-installed").unwrap().warm);
+        config.backend_preference=Backend::M;
+        let mlx_profile=build_scheduler_capabilities(&config,&health,&capability,32768,100);
+        assert_eq!(mlx_profile.models.len(),1);
+        assert_eq!(mlx_profile.models[0].name,"tiny-cuda");
+        assert!(worker::active_model_capability(&temp,Some("missing-selection")).is_none());
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

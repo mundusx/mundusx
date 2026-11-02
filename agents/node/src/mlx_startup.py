@@ -349,8 +349,17 @@ def bounded_prompt_cache(cache_class, max_bytes):
 
         def fetch_nearest_cache(self, model, tokens):
             cache, rest = super().fetch_nearest_cache(model, tokens)
-            logging.info('Prompt cache lookup: input_tokens=%d cached_tokens=%d uncached_tokens=%d retained_bytes=%d',
-                         len(tokens), len(tokens) - len(rest), len(rest), self.nbytes)
+            previous = getattr(self, '_previous_lookup', None)
+            shared = 0
+            same_model = previous is not None and previous[0] == model
+            if same_model:
+                for left, right in zip(previous[1], tokens):
+                    if left != right:
+                        break
+                    shared += 1
+            self._previous_lookup = (model, list(tokens))
+            logging.info('Prompt cache lookup: input_tokens=%d cached_tokens=%d uncached_tokens=%d retained_bytes=%d previous_model_matches=%s previous_shared_prefix_tokens=%d',
+                         len(tokens), len(tokens) - len(rest), len(rest), self.nbytes, same_model, shared)
             return cache, rest
 
         def insert_cache(self, model, tokens, prompt_cache, *, cache_type='assistant'):
