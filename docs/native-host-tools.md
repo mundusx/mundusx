@@ -67,3 +67,10 @@ A proposed system-message split was rejected after live testing produced unsolic
 Validation on 2026-11-02: 357 serial native Mac Rust tests and 22 native Python tests passed. Actual VS Code cold hello completed in 13s, and hello in a separate fresh chat completed in 6s. Model processing was 9.106s cold and 1.228s warm (9,702 cached tokens); both used Qwen3-Coder-30B-A3B. These are measured examples, not a latency guarantee. Cold prompts and ordinary tool-rich coding requests still incur prefill. The fix is installed on the qualified Mac; downloadable installers have not been republished.
 
 The subsequent read-only package.json smoke test completed in 19s but returned raw read_file markup as text rather than invoking the host tool. No mutation/terminal call occurred in that check. Therefore this release qualifies greeting scope and model-selection behavior, not the full 30B coding workflow.
+
+
+## Network Activity termination (worker 0.2.60)
+
+Network jobs now write bounded desktop metadata at execution start and completion. Assignment cancellation writes cancelled before releasing the slot; an unwound activity guard writes interrupted rather than leaving a running row. No prompt, output or raw error is persisted. The maintained desktop reads this feed and legacy jobCancelled terminal markers from both node-agent.log and contributor-worker.log on every refresh.
+
+All 358 serial native Mac Rust tests passed, including cancellation/interruption privacy checks. Installed with OpenGPU Mac preview24 on 2026-11-02; the old cancelled chat is visible as cancelled and the Activity API reports zero active tasks. A first live disconnect probe completed before cancellation; automatic approval review blocked an additional combined cancellation probe without a detailed reason. No claim of a fresh end-to-end cancelled inference test is made.

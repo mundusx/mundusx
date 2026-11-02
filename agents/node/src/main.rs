@@ -2019,6 +2019,7 @@ fn execute_claimed_job(
     // Admission was already checked from the latest health snapshot before the
     // job was claimed. Re-running the full health probe here delays the first
     // response token even though the node is already admitted and ready.
+    let activity = (!cfg!(test) || std::env::var_os("OPENGPU_HOME").is_some()).then(||worker::desktop_activity::JobActivity::start(&storage::config_dir(), &request));
     let worker_result = launch_admitted_worker_process_with_control(&config, request, json, delta_sender,Some(cancelled.clone()));
     if let Some(stop)=monitor { let _=stop.send(()); }
     println!("jobTiming: worker {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
@@ -2027,9 +2028,11 @@ fn execute_claimed_job(
     }
     println!("jobTiming: relay {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
     if cancelled.load(Ordering::Acquire) {
+        if let Some(activity)=activity { activity.cancel(); }
         println!("jobCancelled: {} released its execution slot",job.job_id);
         return;
     }
+    if let Some(activity)=activity { activity.finish(&worker_result); }
     match worker_result {
         Ok(response) => {
             let completion = build_completion_from_worker_response(

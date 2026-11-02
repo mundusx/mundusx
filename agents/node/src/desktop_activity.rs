@@ -34,6 +34,13 @@ impl JobActivity {
         let _ = persist(home, &activity.row);
         activity
     }
+    pub fn cancel(mut self) {
+        self.row["status"] = json!("cancelled");
+        self.row["updated_at"] = json!(now());
+        self.row["duration_ms"] = json!(self.started.elapsed().as_millis() as u64);
+        self.row["summary"] = json!("Execution was cancelled or its assignment was revoked.");
+        let _ = persist(&self.home, &self.row);
+    }
     pub fn finish(mut self, result: &Result<WorkerLaunchResponse, String>) {
         let completed = result.as_ref().is_ok_and(|v| v.status == "completed");
         self.row["status"] = json!(if completed { "completed" } else { "failed" });
@@ -44,6 +51,16 @@ impl JobActivity {
                 json!("Worker execution failed. Check the local diagnostic log for details.");
         }
         let _ = persist(&self.home, &self.row);
+    }
+}
+impl Drop for JobActivity {
+    fn drop(&mut self) {
+        if self.row["status"] == "running" {
+            self.row["status"] = json!("interrupted");
+            self.row["updated_at"] = json!(now());
+            self.row["summary"] = json!("Execution ended without a recorded terminal outcome.");
+            let _ = persist(&self.home, &self.row);
+        }
     }
 }
 fn persist(home: &Path, row: &Value) -> std::io::Result<()> {
@@ -103,6 +120,18 @@ mod tests {
         assert!(last.contains("failed"));
         assert!(last.contains("duration_ms"));
         assert!(!last.contains("PRIVATE-"));
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn cancellation_and_unwinding_never_leave_running_rows_or_expose_request_data() {
+        let home=std::env::temp_dir().join(format!("opengpu-cancel-{}",uuid::Uuid::new_v4()));
+        let request:WorkerLaunchRequest=serde_json::from_value(json!({"job_id":"cancel-job","node_id":"node","backend":"m","prompt":"PRIVATE-CANARY"})).unwrap();
+        JobActivity::start(&home,&request).cancel();
+        let a:Vec<Value>=serde_json::from_slice(&fs::read(home.join("desktop-jobs.json")).unwrap()).unwrap();
+        assert_eq!(a[0]["status"],"cancelled");
+        drop(JobActivity::start(&home,&request));
+        let raw=fs::read_to_string(home.join("desktop-jobs.json")).unwrap();
+        let a:Vec<Value>=serde_json::from_str(&raw).unwrap();assert_eq!(a[1]["status"],"interrupted");assert!(!raw.contains("PRIVATE-CANARY"));
         fs::remove_dir_all(home).unwrap();
     }
     #[test]

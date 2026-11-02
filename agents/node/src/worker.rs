@@ -1,5 +1,5 @@
 #[path = "desktop_activity.rs"]
-mod desktop_activity;
+pub(crate) mod desktop_activity;
 #[path = "download_progress.rs"]
 mod download_progress;
 #[path = "native_call_timing.rs"]
