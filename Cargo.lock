@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "opengpu-node-agent"
-version = "0.2.61"
+version = "0.2.62"
 dependencies = [
  "clap",
  "dirs",
