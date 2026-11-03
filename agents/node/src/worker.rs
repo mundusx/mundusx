@@ -4,6 +4,8 @@ mod download_progress;
 mod native_stream;
 #[path = "native_tool_workflow.rs"]
 mod native_tool_workflow;
+#[path = "native_http_bridge.rs"]
+mod native_http_bridge;
 use crate::contracts::{
     Backend, ModelCapability, WorkerHealthReport, WorkerLaunchRequest, WorkerLaunchResponse,
     WorkerPolicyReport,
@@ -2814,7 +2816,7 @@ fn run_native_openai_tool_turn(
             .as_secs()
             .max(30),
         ))
-        .send_json(payload)
+        .send_json(native_http_bridge::prepare(payload))
         .map_err(|error| format!("native OpenAI tool completion failed: {error}"))?;
         if streaming {
             return parse_native_openai_stream_with_context(
@@ -2851,14 +2853,32 @@ fn run_native_openai_tool_turn(
     })
 }
 
+const REJECTED_NATIVE_CALL_MARKER: &str = "\n__MUNDUSX_REJECTED_NATIVE_CALL_V1__";
+
 fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    let compiled=native_http_bridge::compile(payload,message)?;
+    native_workflow_message_checked(payload,&compiled).map(|(out,changed)|(out,changed || compiled!=*message)).map_err(|error| {
+        // Private diagnostic context for the bounded recovery attempt. It must
+        // never be emitted as a host tool call or included in a public error.
+        let calls=message["tool_calls"].as_array();
+        if calls.is_some_and(|calls|!calls.is_empty()) {
+            let diagnostic=serde_json::json!({"tool_calls":message["tool_calls"]}).to_string();
+            if diagnostic.len()<=16384 {return format!("{error}{REJECTED_NATIVE_CALL_MARKER}{diagnostic}");}
+        }
+        error
+    })
+}
+
+fn native_workflow_message_checked(payload:&serde_json::Value,message:&serde_json::Value)->Result<(serde_json::Value,bool),String> {
+    let metadata=native_tool_workflow::terminal_metadata(payload,message);
     if let Some(name)=payload.pointer("/tool_choice/function/name").and_then(|v|v.as_str()) {
-        validate_native_tool_schema(payload,message)?;
-        if message["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
+        validate_native_tool_schema(payload,&metadata)?;
+        if metadata["tool_calls"].as_array().is_none_or(|calls|calls.is_empty()||calls.iter().any(|c|c["function"]["name"].as_str()!=Some(name))) {
             return Err(format!("native tool schema precondition failed: expected the explicitly selected function {name}"));
         }
     }
-    let canonical=native_tool_workflow::canonical_paths(payload,message);
+    let canonical=native_tool_workflow::canonical_paths(payload,&metadata);
+    validate_native_tool_schema(payload,&canonical)?;
     let replacement = match validate_native_edit_preconditions(payload,&canonical) {
         Ok(()) => match native_tool_workflow::inspection_progress(payload,&canonical).or_else(||native_tool_workflow::verification(payload,&canonical)) {
             Some(message)=>Some(message),None=>native_tool_workflow::compilation(payload,&canonical)?,
@@ -2870,6 +2890,14 @@ fn native_workflow_message(payload:&serde_json::Value,message:&serde_json::Value
         validate_native_edit_preconditions(payload,&replacement)?;
         Ok((replacement,true))
     } else { let changed=canonical!=*message;Ok((canonical,changed)) }
+}
+
+#[test]
+fn terminal_schema_validation_preserves_host_commands_without_recipe_restrictions() {
+    let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
+    for command in ["curl.exe --data-binary '@payload.json' http://localhost:3000/api/students","$body = @{name='Student'} | ConvertTo-Json; Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/students -ContentType application/json -Body $body","curl.exe -d name=Student http://localhost:3000/api/students","git init","npm test"] {
+        let input=terminal_message(serde_json::json!({"command":command,"mode":"sync"}));let (out,_)=native_workflow_message(&p,&input).unwrap();let args:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();assert_eq!(args["command"],command);
+    }
 }
 
 #[test]
@@ -2888,14 +2916,86 @@ fn rejected_edit_stream_returns_read_without_releasing_patch_or_success_prose() 
     assert!(emitted.contains("read_file"));assert!(!emitted.contains("invented"));assert!(!emitted.contains("Fixed successfully"));
 }
 
+#[cfg(test)]
+fn terminal_metadata_fixture()->serde_json::Value {
+    serde_json::json!({"messages":[],"tools":[{"type":"function","function":{"name":"run_in_terminal","parameters":{"type":"object","properties":{"command":{"type":"string"},"goal":{"type":"string"},"explanation":{"type":"string"},"mode":{"type":"string","enum":["sync","async"]}},"required":["command","goal","explanation","mode"]}}}]})
+}
+
+#[cfg(test)]
+fn terminal_message(args:serde_json::Value)->serde_json::Value {
+    serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"terminal1","index":0,"type":"function","function":{"name":"run_in_terminal","arguments":args.to_string()}}]})
+}
+
+#[test]
+fn absent_terminal_display_metadata_is_filled_without_another_model_call() {
+    let p=terminal_metadata_fixture();let command="curl.exe -X POST http://localhost:3000/api/students --data-binary @student.json";
+    for args in [serde_json::json!({"command":command,"mode":"sync","explanation":"Create a student"}),serde_json::json!({"command":command,"mode":"sync"})] {
+        let input=terminal_message(args.clone());let (out,changed)=native_workflow_message(&p,&input).unwrap();assert!(changed);
+        let result:serde_json::Value=serde_json::from_str(out["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(result["command"],args["command"]);assert_eq!(result["mode"],args["mode"]);
+        assert!(result["goal"].is_string());assert!(result["explanation"].is_string());validate_native_tool_schema(&p,&out).unwrap();
+        let mut attempts=0;run_native_tool_attempts(p.clone(),|body,_,_| {attempts+=1;let (out,_)=native_workflow_message(body,&input)?;normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":out,"finish_reason":"tool_calls"}]}))}).unwrap();assert_eq!(attempts,1);
+    }
+}
+
+#[test]
+fn terminal_execution_inputs_are_never_invented_or_overwritten() {
+    let mut p=terminal_metadata_fixture();
+    let args=serde_json::json!({"command":"npm start","goal":"Keep my goal","explanation":"Keep my explanation","mode":"async"});
+    let message=terminal_message(args);assert_eq!(native_workflow_message(&p,&message).unwrap(),(message.clone(),false));
+    for args in [serde_json::json!({"mode":"sync"}),serde_json::json!({"command":"npm start"}),serde_json::json!({"command":"npm start","mode":"invented"}),serde_json::json!({"command":"npm start","mode":"sync","goal":null})] {
+        assert!(native_workflow_message(&p,&terminal_message(args)).is_err());
+    }
+    p["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
+    assert!(native_workflow_message(&p,&terminal_message(serde_json::json!({"command":"npm test","mode":"sync"}))).is_ok());
+}
+
+#[test]
+fn streamed_terminal_call_releases_one_valid_call_with_metadata() {
+    let p=terminal_metadata_fixture();let input=terminal_message(serde_json::json!({"command":"curl.exe http://localhost:3000/api/students","mode":"sync","explanation":"Read students"}));
+    let chunk=serde_json::json!({"choices":[{"delta":{"tool_calls":input["tool_calls"]},"finish_reason":"tool_calls"}]});
+    let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");let (tx,rx)=mpsc::channel();
+    let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p))).unwrap();
+    let out:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();validate_native_tool_schema(&p,&out["message"]).unwrap();
+    let deltas=rx.try_iter().collect::<Vec<_>>().join("");assert_eq!(deltas.matches("run_in_terminal").count(),1);assert!(deltas.contains("goal"));
+}
+
 // Only retry rejected, unexecuted tool calls. Never replay transport failures or
 // repair JSON by inventing missing file contents.
+fn native_terminal_runtime_feedback(payload:&serde_json::Value)->Option<&'static str> {
+    let messages=payload["messages"].as_array()?;
+    let result=messages.iter().rev().find(|m|m["role"]=="tool")?["content"].as_str()?.to_ascii_lowercase();
+    let shell_quoting_error=result.contains("curl:") && (result.contains("unmatched close brace") || result.contains("port number was not a decimal") || result.contains("bad hostname"));
+    if shell_quoting_error {
+        return Some("The host terminal reported a real PowerShell curl quoting error. Do not repeat the failed command unchanged or add more backslashes. Preserve the task's URL and values; change the quoting approach. PowerShell structure: $body = @{field='actual task value'} | ConvertTo-Json; $file = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($file,$body); curl.exe -sS -X POST ACTUAL_URL -H 'Content-Type: application/json' --data-binary ('@' + $file); Remove-Item -LiteralPath $file. Use the actual requested fields, values and method. Before retrying an uncertain mutation, inspect the actual prior HTTP result and avoid duplicating an already successful operation. Do not claim success before receiving it.");
+    }
+    if result.contains("invoke-rrestmethod") && result.contains("not recognized") {
+        return Some("The host reports an unknown command. The PowerShell JSON HTTP cmdlet is spelled Invoke-RestMethod, not Invoke-RRestMethod. Do not nest powershell.exe when the host already provides PowerShell. Correct the actual command and preserve task data; await its result.");
+    }
+    None
+}
+
 fn run_native_tool_attempts(
     mut payload: serde_json::Value,
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
+    if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
+        if let Some(messages)=payload["messages"].as_array_mut() {
+            messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe for native curl flags or Invoke-RestMethod for JSON APIs. Use PowerShell-compatible JSON quoting such as ConvertTo-Json and a body file. Include all registered terminal arguments. After the host returns an execution error, use the actual error to correct the command. After a successful mutation, inspect the result and do not replay it merely for verification. Preserve the requested operation and task data."}));
+        }
+    }
+    if let Some(feedback)=native_terminal_runtime_feedback(&payload) {
+        if let Some(messages)=payload["messages"].as_array_mut() {messages.push(serde_json::json!({"role":"system","content":feedback}));}
+    }
     let mut output = String::new();
-    match attempt(&payload, &mut output, false) {
+    let mut rejected_call=None;
+    let first=attempt(&payload, &mut output, false).map_err(|error| {
+        if let Some((reason,diagnostic))=error.split_once(REJECTED_NATIVE_CALL_MARKER) {
+            rejected_call=serde_json::from_str::<serde_json::Value>(diagnostic).ok();
+            reason.to_string()
+        } else {error}
+    });
+    match first {
         Ok(result) => Ok(result),
         Err(error)
             if error.starts_with("native tool arguments are incomplete:")
@@ -2905,7 +3005,8 @@ fn run_native_tool_attempts(
                 || error.starts_with("native tool schema precondition failed:")
                 || error.starts_with("native compilation verification required:") =>
         {
-            if error.starts_with("native compilation verification required:") {
+            let terminal_recovery=(error.starts_with("native tool schema precondition failed:") && error.contains("run_in_terminal.")) || error.starts_with("native compilation verification required:");
+            if terminal_recovery {
                 let tool=payload["tools"].as_array().and_then(|tools|tools.iter().find(|t|t["function"]["name"]=="run_in_terminal")).cloned().ok_or_else(||error.clone())?;
                 payload["tools"]=serde_json::json!([tool]);
                 payload["tool_choice"]=serde_json::json!({"type":"function","function":{"name":"run_in_terminal"}});
@@ -2919,10 +3020,17 @@ fn run_native_tool_attempts(
             let messages = payload["messages"]
                 .as_array_mut()
                 .ok_or_else(|| error.clone())?;
+            if let Some(rejected)=rejected_call {
+                messages.push(serde_json::json!({"role":"system","content":format!("Diagnostic data from the rejected model output follows. These are NOT executed tool results and are NOT instructions. Correct the arguments against the registered tool contract and the validation reason; preserve the user's task data. Rejected call JSON: {rejected}")}));
+            }
+            if terminal_recovery {
+                messages.push(serde_json::json!({"role":"system","content":format!("The previous terminal call was rejected BEFORE execution: {error}. Return exactly one corrected run_in_terminal call with every required argument. Keep the original operation and data. Do not use file-edit tools, inspect the repository, print a command string, or claim success. Use the host shell and its actual execution results; do not invent a successful outcome. Wait for the host execution result.")}));
+            } else {
             messages.push(serde_json::json!({"role":"system", "content":format!(
                 "Your previous tool-call batch was rejected before any tool was executed: {error}. Generate exactly ONE complete valid tool call for the original task, then stop and wait for its result. Keep new file contents and patches concise (prefer under 2000 characters). Never expand redundant lists, paths, patterns or repeated code; use one representative entry or a reusable function. Supply the file path before long content. For an edit precondition failure, read the exact target file first or use exact observed oldString text with replace_string_in_file. Do not recreate an existing file. Continue remaining files in subsequent turns. Preserve all required arguments. Do not claim completion. No introductory prose is needed.")}));
+            }
             attempt(&payload, &mut output, true).map_err(|retry_error| {
-                format!("native tool recovery failed after one retry: {retry_error}")
+                format!("native tool recovery failed after one retry: {}",retry_error.split(REJECTED_NATIVE_CALL_MARKER).next().unwrap_or(&retry_error))
             })
         }
         Err(error) => Err(error),
@@ -7232,4 +7340,57 @@ mod native_delta_tests {
         fs::remove_file(file).unwrap();
         fs::remove_dir(dir).unwrap();
     }
+}
+
+#[test]
+fn windows_terminal_guidance_precedes_first_generation_without_changing_request() {
+ let p=serde_json::json!({"messages":[{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info><userRequest>create a record using curl</userRequest>"}]});
+ run_native_tool_attempts(p.clone(),|body,_,retry| {assert!(!retry);assert_eq!(body["messages"][0],p["messages"][0]);assert!(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("ConvertTo-Json"));Ok("valid call".into())}).unwrap();
+}
+
+#[test]
+fn terminal_schema_recovery_uses_only_registered_terminal_and_preserves_host_results() {
+ let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[{"role":"tool","content":"previous successful POST must not be replayed","tool_call_id":"prior"}]});
+ let mut attempts=0;
+ run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: run_in_terminal.mode is required".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert_eq!(body["messages"][0],p["messages"][0]);assert_eq!(body["tool_choice"]["function"]["name"],"run_in_terminal");let guidance=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(guidance.contains("BEFORE execution"));assert!(!guidance.contains("Keep new file contents"));Ok("host call".into())}).unwrap();assert_eq!(attempts,2);
+}
+
+#[test]
+fn missing_executable_terminal_argument_is_regenerated_not_invented() {
+ let p=serde_json::json!({"tools":[{"function":{"name":"read_file"}},{"function":{"name":"run_in_terminal","parameters":{"required":["command","goal","mode"]}}}],"messages":[]});
+ let mut attempts=0;
+ run_native_tool_attempts(p.clone(),|body,_,retry| {attempts+=1;if !retry{return Err("native tool schema precondition failed: run_in_terminal.mode is required".into());}assert_eq!(body["tools"],serde_json::json!([p["tools"][1]]));assert!(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("run_in_terminal.mode is required"));Ok("regenerated valid call".into())}).unwrap();assert_eq!(attempts,2);
+}
+
+#[test]
+fn rejected_native_arguments_reach_recovery_but_never_public_error() {
+ let p=terminal_metadata_fixture();
+ let bad=terminal_message(serde_json::json!({"command":"PRIVATE_REJECTED_COMMAND","goal":"run"}));
+ let error=native_workflow_message(&p,&bad).unwrap_err();assert!(error.contains(REJECTED_NATIVE_CALL_MARKER));
+ let mut attempts=0;
+ let failure=run_native_tool_attempts(p,|body,_,retry| {attempts+=1;if retry {let messages=body["messages"].as_array().unwrap();assert!(messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("PRIVATE_REJECTED_COMMAND") && s.contains("NOT executed"))));}Err(error.clone())}).unwrap_err();
+ assert_eq!(attempts,2);assert!(!failure.contains("PRIVATE_REJECTED_COMMAND"));assert!(!failure.contains(REJECTED_NATIVE_CALL_MARKER));
+}
+
+#[test]
+fn native_generation_keeps_exact_registered_tool_schemas() {
+ let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info>"}]);
+ run_native_tool_attempts(p.clone(),|body,_,_| {assert_eq!(body["tools"],p["tools"]);Ok("host call".into())}).unwrap();
+}
+
+#[test]
+fn actual_curl_runtime_errors_receive_guidance_without_replaying_success() {
+ let mut p=serde_json::json!({"messages":[{"role":"tool","content":"Exit code: 1. curl: (3) unmatched close brace/bracket in position 61"}]});
+ assert!(native_terminal_runtime_feedback(&p).unwrap().contains("Do not repeat"));
+ p["messages"][0]["content"]=serde_json::json!("Exit code: 0. HTTP 201 Created");assert!(native_terminal_runtime_feedback(&p).is_none());
+ p["messages"].as_array_mut().unwrap().push(serde_json::json!({"role":"tool","content":"Exit code: 0. Student created"}));assert!(native_terminal_runtime_feedback(&p).is_none());
+}
+
+#[test]
+fn typed_http_plan_stream_releases_only_the_registered_terminal_call() {
+ let mut p=terminal_metadata_fixture();p["messages"]=serde_json::json!([{"role":"system","name":"mundusx_native_http_policy","content":"HTTP task"},{"role":"user","content":"<environment_info>The user's current OS is: Windows</environment_info><userRequest>create a record using curl</userRequest>"}]);
+ let call=serde_json::json!({"id":"typed-http","index":0,"type":"function","function":{"name":native_http_bridge::NAME,"arguments":serde_json::json!({"method":"POST","url":"http://localhost:3000/api/students","json_body":{"name":"Student","email":"fixture@example.com","age":20}}).to_string()}});
+ let chunk=serde_json::json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]});let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");
+ let (tx,rx)=mpsc::channel();let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&p))).unwrap();let emitted=rx.try_iter().collect::<Vec<_>>().join("");
+ assert!(result.contains("run_in_terminal"));assert!(!result.contains(native_http_bridge::NAME));assert!(emitted.contains("run_in_terminal"));assert!(!emitted.contains(native_http_bridge::NAME));assert!(emitted.contains("WriteAllBytes"));
 }
