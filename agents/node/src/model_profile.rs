@@ -48,10 +48,25 @@ pub fn apply(model: &str, payload: &mut Value) {
 /// Keep this runtime-specific option away from vLLM/llama OpenAI endpoints.
 pub fn apply_mlx(model: &str, payload: &mut Value) {
     if is_qwen3_coder(model) { merge_leading_system_messages(payload); }
+    let native_files = is_qwen3_coder(model) && payload["parallel_tool_calls"] != true
+        && payload["tools"].as_array().is_some_and(|tools|
+            ["read_file", "list_dir", "replace_string_in_file"].iter().all(|name|
+                tools.iter().any(|tool|tool["function"]["name"].as_str()==Some(name))));
     if is_qwen3_coder(model) && payload.get("repetition_penalty").is_none_or(Value::is_null) {
-        payload["repetition_penalty"] = json!(1.1);
+        // Exact source edits must be able to copy observed identifiers and literals.
+        // The native runtime guard independently stops actual argument loops.
+        payload["repetition_penalty"] = json!(if native_files {1.0} else {1.1});
     }
     apply(model, payload);
+    if native_files {
+        // A host may increase the conversation's answer budget to 8k or more.
+        // Serial file operations must remain small enough to finish or fail
+        // promptly. A 4k ceiling also permits legitimate exact-match route
+        // extraction patches, whose old text counts against the output budget.
+        payload["max_tokens"]=json!(payload["max_tokens"].as_u64().unwrap_or(4096).min(4096));
+        if payload["chat_template_kwargs"].is_null() {payload["chat_template_kwargs"]=json!({});}
+        payload["chat_template_kwargs"]["opengpu_native_tool_guard"]=json!(true);
+    }
     if is_qwen3_coder(model) && payload.get("repetition_context_size").is_none_or(Value::is_null) {
         payload["repetition_context_size"] = json!(512);
     }
@@ -84,6 +99,30 @@ fn merge_leading_system_messages(payload: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_guard_is_limited_to_serial_vscode_coder_tools() {
+        let tools=json!([{"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},{"function":{"name":"replace_string_in_file"}}]);
+        let mut payload=json!({"tools":tools,"temperature":0.1});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut payload);
+        assert_eq!(payload["chat_template_kwargs"]["opengpu_native_tool_guard"],true);
+        assert_eq!(payload["temperature"],0.1);
+        assert_eq!(payload["repetition_penalty"],1.0);
+        let mut explicit=json!({"tools":tools,"repetition_penalty":1.2});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut explicit);
+        assert_eq!(explicit["repetition_penalty"],1.2);
+        assert_eq!(payload["max_tokens"],4096);
+        let mut large=json!({"tools":tools,"max_tokens":8192});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut large);
+        assert_eq!(large["max_tokens"],4096);
+        let mut small=json!({"tools":tools,"max_tokens":128});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut small);
+        assert_eq!(small["max_tokens"],128);
+        let mut parallel=json!({"tools":tools,"parallel_tool_calls":true});
+        apply_mlx("Qwen3-Coder-30B-A3B-Instruct-4bit",&mut parallel);
+        assert!(parallel["chat_template_kwargs"].get("opengpu_native_tool_guard").is_none());
+        let mut other=json!({"tools":tools});apply_mlx("other",&mut other);
+        assert!(other["chat_template_kwargs"].is_null());
+    }
     #[test]
     fn mlx_preserves_instruction_order_and_keeps_dynamic_tools_after_stable_system_prefix() {
         let mut body = json!({"messages":[{"role":"system","name":"policy","content":"policy"},{"role":"system","content":"host"},{"role":"system","content":"harness"},{"role":"user","content":"request"},{"role":"system","content":"later"}],"tools":[{"type":"function","function":{"name":"read"}}]});

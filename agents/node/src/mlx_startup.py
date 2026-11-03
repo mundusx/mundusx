@@ -46,12 +46,51 @@ class RegisteredToolOpening:
         return sorted({sequence[len(generated)] for sequence in candidates})
 
 
+def repetitive_tool_tail(text):
+    """Reject long low-entropy argument loops, not ordinary repeated syntax."""
+    if '<tool_call>' not in text or text.rfind('<tool_call>') < text.rfind('</tool_call>'):
+        return False
+    lines=[line.strip() for line in text[text.rfind('<tool_call>'):].splitlines() if line.strip()][-24:]
+    growing=0
+    for previous,current in zip(lines,lines[1:]):
+        growing=growing+1 if len(previous)>=8 and current.startswith(previous) and 0<len(current)-len(previous)<=16 else 0
+        if growing>=6:
+            return True
+    tail = re.sub(r'\s+', '', text[text.rfind('<tool_call>'):])[-1024:]
+    if len(tail) < 192:
+        return False
+    return any(tail.endswith(tail[-width:] * max(4, 192 // width)) for width in range(1, 257))
+
+
+class NativeToolGuard:
+    """Stop only at a complete call or a rejected repetitive argument tail."""
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.start = None
+        self.end = tuple(tokenizer.encode('</tool_call>', add_special_tokens=False))
+
+    def stop(self, history):
+        if self.start is None:
+            self.start = len(history)
+        generated = history[self.start:]
+        if self.end and tuple(generated[-len(self.end):]) == self.end:
+            return True
+        if len(generated) >= 64 and len(generated) % 16 == 0:
+            return repetitive_tool_tail(self.tokenizer.decode(generated))
+        return False
+
+
 def install_required_tool_opening(server, mx):
     original_tokenize = server.ResponseGenerator._tokenize
     original_processors = server._make_logits_processors
 
     def tokenize(self, tokenizer, request, args):
         options = args.chat_template_kwargs or {}
+        guarded = options.get('opengpu_native_tool_guard') is True
+        if guarded:
+            if not tokenizer.tool_parser.__module__.endswith('qwen3_coder') or not tokenizer.eos_token_ids:
+                raise ValueError('Native tool guard needs Qwen3-Coder with EOS tokens')
+            args._opengpu_native_guard = (tokenizer, min(tokenizer.eos_token_ids))
         required = options.get("opengpu_require_tool_call") is True
         if required:
             if request.request_type != "chat" or not request.tools or not tokenizer.has_tool_calling:
@@ -62,7 +101,7 @@ def install_required_tool_opening(server, mx):
             if any(not isinstance(name, str) or not name for name in names):
                 raise ValueError("Required tool opening needs registered function names")
             args._opengpu_required_openings = tuple(tuple(tokenizer.encode("<tool_call>\n<function=" + name + ">\n", add_special_tokens=False)) for name in names)
-        args.chat_template_kwargs = {key: value for key, value in options.items() if key != "opengpu_require_tool_call"}
+        args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard')}
         return original_tokenize(self, tokenizer, request, args)
 
     def processors(args):
@@ -84,6 +123,15 @@ def install_required_tool_opening(server, mx):
                 return mx.where(allowed, logits, mx.full_like(logits, -float("inf")))
 
             result.append(force_opening)
+        guarded = getattr(args, '_opengpu_native_guard', None)
+        if guarded:
+            tokenizer, eos = guarded
+            guard = NativeToolGuard(tokenizer)
+            def stop_invalid_or_complete(history, logits):
+                if not guard.stop(history.tolist()):
+                    return logits
+                return mx.where(mx.arange(logits.shape[-1]) == eos, logits, mx.full_like(logits, -float('inf')))
+            result.append(stop_invalid_or_complete)
         return result
 
     server.ResponseGenerator._tokenize = tokenize
@@ -97,7 +145,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "version": 3}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "version": 7}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -128,13 +176,41 @@ def complete_qwen_call_parser(parser):
 
 def install_complete_qwen_parser(server):
     original_init = server.ToolCallFormatter.__init__
+    local = threading.local()
 
     def initialize(self, tool_parser, tools, streaming=False):
         if getattr(tool_parser, "__module__", "").endswith("qwen3_coder"):
-            tool_parser = complete_qwen_call_parser(tool_parser)
+            strict = complete_qwen_call_parser(tool_parser)
+            def checked(text, tools=None):
+                try:
+                    return strict(text, tools)
+                except (ValueError, json.JSONDecodeError):
+                    if getattr(local, 'active', False):
+                        local.error = 'repetitive tool argument' if repetitive_tool_tail('<tool_call>' + text) else 'incomplete or ambiguous tool markup'
+                    raise
+            tool_parser = checked
         original_init(self, tool_parser, tools, streaming)
 
     server.ToolCallFormatter.__init__ = initialize
+    if not hasattr(server, 'APIHandler'):
+        return
+    original_handle = server.APIHandler.handle_completion
+    original_response = server.APIHandler.generate_response
+    def handle(self, *args, **kwargs):
+        local.active = (self.body.get('chat_template_kwargs') or {}).get('opengpu_native_tool_guard') is True
+        local.error = None
+        try:
+            return original_handle(self, *args, **kwargs)
+        finally:
+            local.active = False
+            local.error = None
+    def response(self, *args, **kwargs):
+        value = original_response(self, *args, **kwargs)
+        if getattr(local, 'active', False) and getattr(local, 'error', None):
+            value['choices'][0]['opengpu_tool_error'] = local.error
+        return value
+    server.APIHandler.handle_completion = handle
+    server.APIHandler.generate_response = response
 
 
 def bounded_prompt_cache(cache_class, max_bytes):
