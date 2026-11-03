@@ -204,26 +204,29 @@ fn validate_native_edit_preconditions(payload:&serde_json::Value,message:&serde_
             return Err("native edit precondition failed: mutation target is outside the explicit files in the current userRequest; editor focus does not authorize a different target".into());
         }
         if !changed.insert(key.clone()) {return Err("native edit precondition failed: multiple mutations of the same path require separate observed turns".into());}
-        let observed=messages[start..].iter().rev().find_map(|result| {
-            if result["role"]!="tool" {return None;}
-            let id=result["tool_call_id"].as_str()?;
-            let read=messages[start..].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|
-                c["id"].as_str()==Some(id) && c["function"]["name"]=="read_file")?;
-            let read_args:serde_json::Value=serde_json::from_str(read["function"]["arguments"].as_str()?).ok()?;
-            if read_args["filePath"].as_str().and_then(observed_file_key).as_ref()!=Some(&key) {return None;}
-            let text=result["content"].as_str()?;
-            if text.trim_start().to_ascii_lowercase().starts_with("error") {return Some(None);}
-            Some(Some(text))
-        }).flatten();
+        let mut observations=Vec::new();let mut existed=false;
+        for result in messages[start..].iter().rev() {
+            if result["role"]!="tool" {continue;}
+            let Some(id)=result["tool_call_id"].as_str() else {continue;};
+            let Some(call)=messages[start..].iter().filter_map(|m|m["tool_calls"].as_array()).flatten().find(|c|c["id"].as_str()==Some(id)) else {continue;};
+            let Ok(a)=serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap_or("")) else {continue;};
+            if a["filePath"].as_str().and_then(observed_file_key).as_ref()!=Some(&key) {continue;}
+            if matches!(call["function"]["name"].as_str(),Some("create_file"|"replace_string_in_file"|"insert_edit_into_file")) {existed=true;break;}
+            if call["function"]["name"]!="read_file" {continue;}
+            let Some(text)=result["content"].as_str() else {continue;};
+            if text.trim_start().to_ascii_lowercase().starts_with("error") {break;}
+            existed=true;observations.push(text);
+        }
         if name=="create_file" {
-            if observed.is_some() {return Err("native edit precondition failed: target was already read; do not recreate it".into());}
+            if existed {return Err("native edit precondition failed: target was already read; do not recreate it".into());}
         } else {
             let old=args["oldString"].as_str().filter(|s|!s.is_empty())
                 .ok_or("native edit precondition failed: oldString must be nonempty")?;
             if args["newString"].as_str().is_some_and(|new|new.replace("\r\n","\n")==old.replace("\r\n","\n")) {
                 return Err("native edit precondition failed: oldString and newString are identical; the edit changes nothing. Propose an actual correction using observed source, or report that verification remains incomplete".into());
             }
-            if !observed.is_some_and(|text|text.replace("\r\n","\n").contains(&old.replace("\r\n","\n"))) {
+            let observed=observations.iter().find(|text|text.replace("\r\n","\n").contains(&old.replace("\r\n","\n")));
+            if observed.is_none() {
                 return Err("native edit precondition failed: read the exact target and use its observed oldString before replacing it".into());
             }
             if observed.is_some_and(|text|text.replace("\r\n","\n").matches(&old.replace("\r\n","\n")).count()>1) {
@@ -2776,6 +2779,25 @@ mod edit_precondition_tests {
         assert!(validate_native_edit_preconditions(&p,&call).unwrap_err().contains("ambiguous"));
     }
     #[test]
+    fn nonoverlapping_reads_retain_evidence_until_a_known_write() {
+        let check = validate_native_edit_preconditions;
+        let path="D:/sample/routes/studentRoutes.js";
+        let read=|id:&str|serde_json::json!({"role":"assistant","tool_calls":[{"id":id,"function":{"name":"read_file","arguments":serde_json::json!({"filePath":path,"startLine":119,"endLine":119}).to_string()}}]});
+        let result=|id:&str,text:&str|serde_json::json!({"role":"tool","tool_call_id":id,"content":text});
+        let mut p=payload();
+        p["messages"].as_array_mut().unwrap().extend([read("tail"),result("tail","module.exports = router;")]);
+        assert!(check(&p,&edit(path)).is_ok());
+        let mut changed=edit(path);changed["tool_calls"][0]["id"]=serde_json::json!("write");
+        p["messages"].as_array_mut().unwrap().extend([changed,result("write","Successfully edited"),read("after"),result("after","module.exports = router;")]);
+        assert!(check(&p,&edit(path)).unwrap_err().contains("observed oldString"));
+        let mut failed=payload();failed["messages"].as_array_mut().unwrap().extend([read("failed"),result("failed","Error: file not found")]);
+        assert!(check(&failed,&edit(path)).is_err());
+        let mut created=payload();created["messages"].as_array_mut().unwrap().truncate(1);
+        let mut create=edit(path);create["tool_calls"][0]["function"]["name"]=serde_json::json!("create_file");create["tool_calls"][0]["id"]=serde_json::json!("create");
+        created["messages"].as_array_mut().unwrap().extend([create.clone(),result("create","Created file")]);
+        assert!(check(&created,&create).unwrap_err().contains("do not recreate"));
+    }
+    #[test]
     fn unobserved_stale_and_recreated_targets_are_rejected() {
         let mut ambiguous=payload();let text=ambiguous["messages"][2]["content"].as_str().unwrap().to_owned();
         ambiguous["messages"][2]["content"]=serde_json::json!(format!("{text}\n{text}"));
@@ -2990,7 +3012,10 @@ fn rejected_edit_stream_returns_read_without_releasing_patch_or_success_prose() 
     let wire=format!("data: {chunk}\n\ndata: [DONE]\n\n");
     let (tx,rx)=mpsc::channel();
     let result=with_stream_delta_sender(Some(tx),||parse_native_openai_stream_with_context(io::Cursor::new(wire),&mut String::new(),false,Some(&payload))).unwrap();
-    assert!(result.contains("read_file"));assert!(!result.contains("replace_string_in_file"));
+    let repaired:serde_json::Value=serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+    assert_eq!(repaired["message"]["tool_calls"].as_array().unwrap().len(),1);
+    assert_eq!(repaired["message"]["tool_calls"][0]["function"]["name"],"read_file");
+    assert!(repaired["message"]["content"].as_str().unwrap().contains("NOT executed"));
     let emitted=rx.try_iter().collect::<Vec<_>>().join("");
     assert!(emitted.contains("read_file"));assert!(!emitted.contains("invented"));assert!(!emitted.contains("Fixed successfully"));
 }
