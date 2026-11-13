@@ -6,6 +6,7 @@ mod media_runtime;
 mod vllm_model_profile;
 mod media_worker;
 mod workload_picker;
+mod ownership;
 mod auth_token;
 mod control_planes;
 #[path = "../../../packages/settings-drain.rs"]
@@ -126,7 +127,18 @@ enum MediaCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum OwnerCommands {
+    /// Show this registered contributor's verified account link
+    Status { #[arg(long)] json:bool },
+    /// Preview the account bound to a private link code, without consuming it
+    Inspect { #[arg(long)] code_stdin:bool, #[arg(long)] json:bool },
+    /// Link this existing device after verifying the account shown
+    Link { #[arg(long)] code_stdin:bool, #[arg(long)] yes:bool, #[arg(long)] json:bool },
+}
+#[derive(Subcommand, Debug)]
 enum Commands {
+    /// Link this contributor to your Nodara Chat account using its existing key
+    Owner { #[command(subcommand)] command:OwnerCommands },
     /// Manage the persistent list of saved control-plane endpoints
     ControlPlane {
         #[command(subcommand)]
@@ -7274,6 +7286,15 @@ fn main() {
     theme::configure(cli.theme);
 
     match cli.command {
+        Commands::Owner {command}=>{
+            let result=match command{
+                OwnerCommands::Status{json}=>ownership::run("status",false,false,json),
+                OwnerCommands::Inspect{code_stdin,json}=>ownership::run("inspect",code_stdin,false,json),
+                OwnerCommands::Link{code_stdin,yes,json}=>ownership::run("link",code_stdin,yes,json),
+            };
+            if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}
+        }
+
         Commands::Install {
             public,
             private,

@@ -26,6 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Link or inspect contributor ownership (forwarded to OpenGPU)
+    Owner { #[arg(required=true,trailing_var_arg=true)] arguments:Vec<String> },
     /// Run a task with the local MundusX agent
     Run {
         prompt: String,
@@ -585,6 +587,7 @@ fn main() {
         Commands::Model { arguments } => forward_model(&arguments),
         Commands::Agent { command } => manage_agent(command),
         Commands::Contributor { arguments } => forward_opengpu(&arguments),
+        Commands::Owner {arguments}=>{let mut args=vec!["owner".to_string()];args.extend(arguments);forward_opengpu(&args)},
         Commands::Connect {
             url,
             token,
