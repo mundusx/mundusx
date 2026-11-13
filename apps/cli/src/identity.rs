@@ -96,6 +96,16 @@ impl DeviceIdentity {
         VerifyingKey::from_bytes(&public_bytes).map_err(invalid_identity)
     }
 
+    pub fn sign_existing_hex(&self, message: &str) -> std::io::Result<String> {
+        #[cfg(target_os = "macos")]
+        {
+            let path = resolved_identity_path();
+            return macos_identity::sign_existing_message(path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid identity path"))?, message.as_bytes());
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.sign_hex(message)
+    }
+
     pub fn sign_hex(&self, message: &str) -> std::io::Result<String> {
         #[cfg(target_os = "macos")]
         {

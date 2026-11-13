@@ -23,11 +23,11 @@ fn send(action:&str,code:Option<&str>)->Result<Value,String>{
  let body=serde_json::to_string(&body).map_err(|_|"Cannot prepare ownership request")?;
  let stamp=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"System clock is invalid")?.as_secs().to_string();
  let message=format!("POST\n{path}\n{stamp}\n{body}");
- let signature=identity.sign_hex(&message).map_err(|_|"Cannot sign with the existing device key. Unlock secure storage and retry.")?;
+ let signature=identity.sign_existing_hex(&message).map_err(|_|"Cannot sign with the existing device key. Unlock secure storage and retry.")?;
  let endpoint=crate::control_plane_endpoint(&config.control_plane_url,&path)?;
  let response=ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(15)).build().post(&endpoint)
  .set("Content-Type","application/json").set("X-MundusX-Node-Id",&config.device_id).set("X-MundusX-Timestamp",&stamp).set("X-MundusX-Signature",&signature).send_string(&body)
- .map_err(|error|match error{ureq::Error::Status(409,_)=>"Link code is expired, used, or cannot claim this contributor. Generate a new code and verify the node ID.".to_string(),ureq::Error::Status(403,_)=>"Device signature was rejected. Check the existing identity and system clock.".to_string(),_=>"The control plane could not confirm ownership. Check the connection and run owner status before retrying.".to_string()})?;
+ .map_err(|error|match error{ureq::Error::Status(409,_)=>"Link code is expired, used, or cannot claim this contributor. Generate a new code and verify the node ID.".to_string(),ureq::Error::Status(403,_)=>"Device signature was rejected. Check the existing identity and system clock.".to_string(),ureq::Error::Status(status,_)=>format!("The control plane could not confirm ownership (HTTP {status}). Check the connection and run owner status before retrying."),ureq::Error::Transport(error)=>format!("The ownership connection failed ({:?}). Check the control plane URL and TLS trust.",error.kind())})?;
  let value:Value=response.into_json().map_err(|_|"Invalid ownership response")?;
  if value.get("node_id").and_then(Value::as_str)!=Some(config.device_id.as_str()){return Err("Ownership response does not match this contributor".into())}
  Ok(value)
