@@ -122,6 +122,35 @@ pub fn sign_message(storage_dir: &Path, message: &[u8]) -> io::Result<String> {
     Ok(hex::encode(signature.to_bytes()))
 }
 
+/// Sign with the existing identity only; never create or replace a Keychain secret.
+pub fn sign_existing_message(storage_dir: &Path, message: &[u8]) -> io::Result<String> {
+    let stored = load_stored_identity(storage_dir)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Existing device identity is missing"))?;
+    let nonce = hex::decode(&stored.nonce_hex).map_err(invalid_identity)?;
+    let encrypted = hex::decode(&stored.encrypted_private_key_hex).map_err(invalid_identity)?;
+    if nonce.len() != 12 || encrypted.len() != 32 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid existing device identity"));
+    }
+    let mut candidates = Vec::new();
+    if let Some(secret) = load_machine_secret_from_keychain()? { candidates.push(secret); }
+    candidates.push(fallback_machine_secret_key()?);
+    for mut secret in candidates {
+        let signature = sign_existing_candidate(&stored.public_key_hex, &encrypted, &nonce, &secret, message);
+        secret.fill(0);
+        if let Some(signature) = signature { return Ok(signature); }
+    }
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, "Unlock existing device secure storage"))
+}
+
+fn sign_existing_candidate(public_key: &str, encrypted: &[u8], nonce: &[u8], secret: &[u8; 32], message: &[u8]) -> Option<String> {
+    let mut private = xor_crypt(encrypted, secret, nonce);
+    let mut bytes: [u8; 32] = private.as_slice().try_into().ok()?;
+    private.fill(0);
+    let signing = SigningKey::from_bytes(&bytes);
+    bytes.fill(0);
+    if hex::encode(signing.verifying_key().to_bytes()) != public_key { return None; }
+    Some(hex::encode(signing.sign(message).to_bytes()))
+}
+
 pub fn verify_message(
     _storage_dir: &Path,
     public_key_hex: &str,
@@ -351,6 +380,18 @@ fn invalid_identity(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_signature_requires_matching_device_key() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let public = hex::encode(key.verifying_key().to_bytes());
+        let secret = [9; 32]; let nonce = [3; 12]; let message = b"ownership proof";
+        let encrypted = xor_crypt(&key.to_bytes(), &secret, &nonce);
+        assert!(sign_existing_candidate(&public, &encrypted, &nonce, &[8; 32], message).is_none());
+        let signature = sign_existing_candidate(&public, &encrypted, &nonce, &secret, message).unwrap();
+        assert!(verify_message(Path::new("."), &public, message, &signature).unwrap());
+        assert!(!verify_message(Path::new("."), &public, b"tampered", &signature).unwrap());
+    }
 
     #[test]
     fn fallback_machine_secret_key_is_deterministic_per_machine_id() {

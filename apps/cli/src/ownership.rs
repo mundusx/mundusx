@@ -23,7 +23,7 @@ fn send(action:&str,code:Option<&str>)->Result<Value,String>{
  let body=serde_json::to_string(&body).map_err(|_|"Cannot prepare ownership request")?;
  let stamp=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"System clock is invalid")?.as_secs().to_string();
  let message=format!("POST\n{path}\n{stamp}\n{body}");
- let signature=identity.sign_hex(&message).map_err(|_|"Cannot sign with the existing device key. Unlock secure storage and retry.")?;
+ let signature=identity.sign_existing_hex(&message).map_err(|_|"Cannot sign with the existing device key. Unlock secure storage and retry.")?;
  let endpoint=crate::control_plane_endpoint(&config.control_plane_url,&path)?;
  let response=ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(15)).build().post(&endpoint)
  .set("Content-Type","application/json").set("X-MundusX-Node-Id",&config.device_id).set("X-MundusX-Timestamp",&stamp).set("X-MundusX-Signature",&signature).send_string(&body)
