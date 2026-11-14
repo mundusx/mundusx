@@ -3047,16 +3047,8 @@ fn policy_reason(
         return Some("no active model is selected".to_string());
     }
 
-    if power.on_battery {
-        if config.contribution_percent > 20 {
-            return Some("battery power requires contribution percent <= 20".to_string());
-        }
-
-        if let Some(percent) = power.battery_percent {
-            if percent <= 20 {
-                return Some("battery level is too low to start work safely".to_string());
-            }
-        }
+    if power.on_battery && !power.battery_percent.is_some_and(|percent| (15..=100).contains(&percent)) {
+        return Some("battery contribution requires at least 15% charge".into());
     }
 
     None
@@ -8194,6 +8186,15 @@ mod tests {
             contribution_percent: 80,
             active_model: Some("Qwen/Qwen2.5-1.5B-Instruct".to_string()),
             ..Config::default()
+        }
+    }
+
+    #[test]
+    fn battery_policy_allows_full_cap_at_fifteen_percent_and_above() {
+        let config = ready_config();
+        for (charge, allowed) in [(Some(100), true), (Some(15), true), (Some(14), false), (Some(0), false), (None, false), (Some(101), false)] {
+            let power = PowerState { source: "Battery Power".into(), on_battery: true, battery_percent: charge };
+            assert_eq!(super::policy_reason(&config, &power, config.active_model.as_deref(), true).is_none(), allowed);
         }
     }
 

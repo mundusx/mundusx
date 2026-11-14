@@ -4118,9 +4118,9 @@ fn contributed_cluster_health(
 
 fn battery_contribution_reason(charge: Option<u8>) -> Option<String> {
     match charge {
-        Some(percent) if percent > 28 && percent <= 100 => None,
-        Some(percent) => Some(format!("battery contribution requires charge above 28% (reported {percent}%)")),
-        None => Some("battery charge is unknown; requires charge above 28%".into()),
+        Some(percent) if percent >= 15 && percent <= 100 => None,
+        Some(percent) => Some(format!("battery contribution requires at least 15% charge (reported {percent}%)")),
+        None => Some("battery charge is unknown; requires at least 15% charge".into()),
     }
 }
 
@@ -4150,7 +4150,7 @@ pub fn probe_worker_policy(
         if let Some(battery_reason) = battery_contribution_reason(health.battery_percent) {
             allowed = false;
             reason = Some(battery_reason);
-            notes.push("plug in the laptop or charge its battery above 28%".into());
+            notes.push("plug in the laptop or charge its battery to at least 15%".into());
         }
     }
 
@@ -5214,7 +5214,7 @@ mod tests {
             health.healthy = false;
             assert!(!super::probe_worker_policy(&health, 80).allowed);
             health.healthy = true;
-            health.battery_percent = Some(28);
+            health.battery_percent = Some(14);
             assert!(!super::probe_worker_policy(&health, 80).allowed);
             health.on_battery = false;
             assert!(super::probe_worker_policy(&health, 80).allowed);
@@ -5222,9 +5222,9 @@ mod tests {
     }
 
     #[test]
-    fn battery_contribution_requires_charge_above_28_percent() {
-        for (charge, allowed) in [(Some(100), true), (Some(29), true), (Some(28), false),
-            (Some(27), false), (Some(0), false), (None, false), (Some(101), false)] {
+    fn battery_contribution_requires_at_least_15_percent() {
+        for (charge, allowed) in [(Some(100), true), (Some(16), true), (Some(15), true), (Some(14), false),
+            (Some(1), false), (Some(0), false), (None, false), (Some(101), false)] {
             assert_eq!(super::battery_contribution_reason(charge).is_none(), allowed,
                 "charge={charge:?}");
         }
