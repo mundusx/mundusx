@@ -363,6 +363,8 @@ fn default_parallel_slots() -> u8 {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_parameters: Option<u64>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -444,6 +446,8 @@ impl NodeRole {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeCapabilityProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_free_vram_mb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<crate::contribution_contract::ExecutionCapabilities>,
     #[serde(default = "default_capability_schema_version")]
     pub schema_version: u32,
@@ -488,6 +492,7 @@ pub struct NodeCapabilityProfile {
 impl Default for NodeCapabilityProfile {
     fn default() -> Self {
         Self {
+            measured_free_vram_mb: None,
             execution: None,
             schema_version: 4,
             models: Vec::new(),

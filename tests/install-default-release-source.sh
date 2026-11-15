@@ -53,8 +53,8 @@ output="$(
   bash "$repo_root/install.sh" --install-only 2>&1
 )"
 
-expected_source="source: https://github.com/mundusx/releases/releases/download/opengpu-prod"
-expected_asset="https://github.com/mundusx/releases/releases/download/opengpu-prod/opengpu-"
+expected_source="source: https://github.com/mundusx/mundusx/releases/download/cli-linux-v0.2.61"
+expected_asset="https://github.com/mundusx/mundusx/releases/download/cli-linux-v0.2.61/opengpu-"
 
 printf '%s\n' "$output" | grep -F "$expected_source" >/dev/null
 grep -F "$expected_asset" "$TEST_CURL_LOG" >/dev/null

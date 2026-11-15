@@ -1,6 +1,6 @@
 param(
   [string]$InstallDir = "$env:USERPROFILE\.opengpu\bin",
-  [string]$ReleaseBaseUrl = "https://github.com/mundusx/releases/releases/download/opengpu-prod",
+  [string]$ReleaseBaseUrl = "https://github.com/mundusx/mundusx/releases/download/cli-windows-v0.2.61",
   [string]$GitHubToken = "",
   [switch]$AllowUnsignedLocalPreview,
   [switch]$InstallCudaRuntime,
@@ -1044,3 +1044,6 @@ if (-not $SkipContributorSetup) {
 }
 
 
+
+Write-Output "Coding requires an approved 14B+ model, sufficient free memory/context, and verified tools for agent mode. Smaller models can still serve text chat."
+Write-Output "Capacity is reported by the contributor and admitted by the control plane; installing does not guarantee coding availability."
