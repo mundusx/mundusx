@@ -366,7 +366,7 @@ fn set_executable(_path: &Path) -> Result<(), String> {
 mod tests {
     use super::{
         parse_release_assets, release_assets_from_base, release_prefix, release_target,
-        verify_checksum, PRODUCTION_RELEASE_BASE_URL,
+        verify_checksum, RELEASES_BASE_URL,
     };
     use sha2::{Digest, Sha256};
 
