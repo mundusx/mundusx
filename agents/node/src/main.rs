@@ -692,6 +692,20 @@ fn apply_served_model_context(models: &mut [contracts::ModelCapability], model: 
     }
 }
 
+fn measured_free_vram_mb() -> Option<u32> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output().ok()?;
+    if !output.status.success() { return None; }
+    // Conservative for multi-GPU runtimes: do not assume memory can be pooled.
+    parse_free_vram_mb(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn parse_free_vram_mb(output: &str) -> Option<u32> {
+    output.lines().map(|line| line.trim().parse::<u32>())
+        .collect::<Result<Vec<_>, _>>().ok()?.into_iter().min()
+}
+
 fn build_scheduler_capabilities(
     config: &AgentConfig,
     health: &WorkerHealthReport,
@@ -753,6 +767,7 @@ fn build_scheduler_capabilities(
         installed
     };
     for entry in &mut models {
+        entry.total_parameters = cluster.filter(|c| c.model.as_deref() == Some(entry.name.as_str())).and_then(|c| c.model_params);
         entry.warm |= entry.active && health.persistent_runtime_warm;
         if cluster.is_none() && backend == Backend::M {
             if let Some(context) = mlx_context::context_tokens(
@@ -793,6 +808,7 @@ fn build_scheduler_capabilities(
         }
     }
     let context_tokens = models.iter().filter_map(|entry| entry.context_tokens).max();
+    let measured_free_vram_mb = measured_free_vram_mb();
     let available_vram_mb = capabilities
         .usable_vram_mb
         .or(capabilities.physical_vram_mb)
@@ -845,6 +861,7 @@ fn build_scheduler_capabilities(
     let supports_embeddings = models.iter().any(|model| model.supports_embeddings);
 
     NodeCapabilityProfile {
+        measured_free_vram_mb,
         execution: Some(contribution_contract::ExecutionCapabilities {
             contract_version: 1,
             operations: {
@@ -3972,5 +3989,14 @@ mod tests {
         drop(first);
         acquire_agent_run_lock_at(&path).expect("lock after owner exits");
         let _ = fs::remove_dir_all(temp);
+    }
+}
+
+#[cfg(test)]
+mod coding_capacity_tests {
+    #[test]
+    fn measured_gpu_memory_is_conservative_and_unknown_is_not_capacity() {
+        assert_eq!(super::parse_free_vram_mb("24000\n8000\n"), Some(8000));
+        for value in ["", "N/A", "24000\nN/A"] { assert_eq!(super::parse_free_vram_mb(value), None); }
     }
 }

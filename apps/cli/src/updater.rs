@@ -5,9 +5,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const RELEASES_API_URL: &str = "https://api.github.com/repos/mundusx/releases/releases?per_page=50";
-const PRODUCTION_RELEASE_BASE_URL: &str =
-    "https://github.com/mundusx/releases/releases/download/opengpu-prod";
+const RELEASES_API_URL: &str = "https://api.github.com/repos/mundusx/mundusx/releases?per_page=50";
+const RELEASES_BASE_URL: &str = "https://github.com/mundusx/mundusx/releases/download";
 
 struct StagedBinary {
     path: PathBuf,
@@ -135,8 +134,8 @@ fn resolve_release_assets(target: &str, release_prefix: &str) -> Result<ReleaseA
                 "updateNotice: release discovery failed ({error}); using the verified production channel"
             );
             Ok(release_assets_from_base(
-                PRODUCTION_RELEASE_BASE_URL,
-                "opengpu-prod",
+                &format!("{RELEASES_BASE_URL}/{release_prefix}0.2.61"),
+                &format!("{release_prefix}0.2.61"),
                 &cli_name,
                 &agent_name,
                 &connector_name,
@@ -394,21 +393,21 @@ mod tests {
     #[test]
     fn production_fallback_uses_stable_architecture_specific_assets() {
         let assets = release_assets_from_base(
-            PRODUCTION_RELEASE_BASE_URL,
-            "opengpu-prod",
+            &format!("{RELEASES_BASE_URL}/cli-linux-v0.2.61"),
+            "cli-linux-v0.2.61",
             "opengpu-x86_64-unknown-linux-gnu",
             "opengpu-node-agent-x86_64-unknown-linux-gnu",
             "mundusx-x86_64-unknown-linux-gnu",
             "mundusx-agent-server-x86_64-unknown-linux-gnu",
         );
-        assert_eq!(assets.tag, "opengpu-prod");
+        assert_eq!(assets.tag, "cli-linux-v0.2.61");
         assert_eq!(
             assets.cli_url,
-            "https://github.com/mundusx/releases/releases/download/opengpu-prod/opengpu-x86_64-unknown-linux-gnu"
+            "https://github.com/mundusx/mundusx/releases/download/cli-linux-v0.2.61/opengpu-x86_64-unknown-linux-gnu"
         );
         assert_eq!(
             assets.agent_checksum_url,
-            "https://github.com/mundusx/releases/releases/download/opengpu-prod/opengpu-node-agent-x86_64-unknown-linux-gnu.sha256"
+            "https://github.com/mundusx/mundusx/releases/download/cli-linux-v0.2.61/opengpu-node-agent-x86_64-unknown-linux-gnu.sha256"
         );
     }
 

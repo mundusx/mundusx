@@ -284,7 +284,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("-NoExit"));
         assert!(INSTALL_SCRIPT.contains("llama-server.exe"));
         assert!(INSTALL_SCRIPT
-            .contains("https://github.com/mundusx/releases/releases/download/opengpu-prod"));
+            .contains("https://github.com/mundusx/mundusx/releases/download/cli-windows-v0.2.61"));
         assert!(!INSTALL_SCRIPT.contains("github.com/mundusx/mundusx/releases/latest"));
     }
 
