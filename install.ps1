@@ -1,6 +1,6 @@
 param(
   [string]$InstallDir = "$env:USERPROFILE\.opengpu\bin",
-  [string]$ReleaseBaseUrl = "https://github.com/mundusx/mundusx/releases/download/cli-windows-v0.2.61",
+  [string]$ReleaseBaseUrl = "https://github.com/mundusx/mundusx/releases/download/cli-windows-v0.2.62",
   [string]$GitHubToken = "",
   [switch]$AllowUnsignedLocalPreview,
   [switch]$InstallCudaRuntime,
