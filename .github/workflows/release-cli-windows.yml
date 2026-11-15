@@ -98,13 +98,17 @@ jobs:
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: .\scripts\package-windows-llama-runtime.ps1 -Tag b9856 -CudaVersion 12.4 -OutputPath $env:RUNTIME_BINARY_NAME
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          .\scripts\package-windows-llama-runtime.ps1 -Tag b9856 -CudaVersion 12.4 -OutputPath $env:RUNTIME_BINARY_NAME
 
       - name: Package pinned llama.cpp Vulkan runtime
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: .\\scripts\\package-windows-vulkan-runtime.ps1 -Tag b9856 -OutputPath $env:VULKAN_RUNTIME_BINARY_NAME
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          .\\scripts\\package-windows-vulkan-runtime.ps1 -Tag b9856 -OutputPath $env:VULKAN_RUNTIME_BINARY_NAME
 
       - name: Prepare binaries
         shell: bash
