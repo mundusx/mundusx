@@ -34,7 +34,7 @@ jobs:
             agent_server_executable_name: mundusx-agent-server
             agent_binary_name: opengpu-node-agent-x86_64-unknown-linux-gnu
             agent_executable_name: opengpu-node-agent
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: opengpu-aarch64-apple-darwin
             executable_name: opengpu

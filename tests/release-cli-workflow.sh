@@ -36,7 +36,7 @@ assert_legacy_contains 'chmod +x "$upload_dir/${{ matrix.agent_name }}"'
 
 assert_contains "$macos_workflow" "name: Release CLI macOS"
 assert_contains "$macos_workflow" "cli-macos-v*"
-assert_contains "$macos_workflow" "runs-on: macos-14"
+assert_contains "$macos_workflow" "runs-on: macos-latest"
 assert_contains "$macos_workflow" "TARGET: aarch64-apple-darwin"
 assert_contains "$macos_workflow" "BINARY_NAME: opengpu-aarch64-apple-darwin"
 assert_contains "$macos_workflow" "AGENT_BINARY_NAME: opengpu-node-agent-aarch64-apple-darwin"
