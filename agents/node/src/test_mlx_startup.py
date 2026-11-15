@@ -1,7 +1,46 @@
 import unittest
 import importlib.util
-from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
+from mlx_startup import evaluate_weights, bounded_prompt_cache, RequiredToolPrefix, RegisteredToolOpening, AutomaticToolOpening, install_required_tool_opening, install_capabilities_endpoint, complete_qwen_call_parser, install_complete_qwen_parser, repetitive_tool_tail, NativeToolGuard
 from types import SimpleNamespace
+from mlx_startup import stable_host_prefix
+
+
+class StableHostCacheTests(unittest.TestCase):
+    def test_system_and_tool_endings_keep_exact_tokens_and_thinking_tail(self):
+        def parser(): pass
+        parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
+        prefix = list(range(300))
+        calls = []
+        def template(messages, **kwargs):
+            calls.append((messages, kwargs))
+            return prefix + [900, 901]
+        tokenizer = SimpleNamespace(has_chat_template=True, tool_parser=parser,
+                                    apply_chat_template=template)
+        for role in ['user', 'system', 'tool']:
+            request = SimpleNamespace(request_type='chat', messages=[
+                {'role':'system','content':'stable host'}, {'role':role,'content':'observation'}])
+            prompt = prefix + [800, 801, 802]
+            original = (prompt, [prompt[:-1], prompt[-1:]], ['system','assistant'], 'reasoning')
+            result = stable_host_prefix(tokenizer, request, {'enable_thinking':False}, original)
+            self.assertIs(result[0], prompt)
+            self.assertEqual(result[1], [prefix, [800,801], [802]])
+            self.assertEqual(result[2], ['system','user','assistant'])
+            self.assertEqual(result[3], 'reasoning')
+            self.assertEqual(sum(result[1], []), prompt)
+            self.assertEqual(original[1], [prompt[:-1], prompt[-1:]])
+        self.assertEqual(calls[0][1], {'enable_thinking':False,'tools':[],
+                                     'tokenize':True,'add_generation_prompt':False})
+
+    def test_unsupported_and_small_prefixes_keep_original_segmentation(self):
+        def parser(): pass
+        parser.__module__ = 'mlx_lm.tool_parsers.qwen3_coder'
+        tokenizer = SimpleNamespace(has_chat_template=True,tool_parser=parser,
+            apply_chat_template=lambda *a,**k: [1,2])
+        request = SimpleNamespace(request_type='chat',messages=[{'role':'system','content':'s'}])
+        original = ([1,3], [[1,3]], ['assistant'], 'normal')
+        self.assertIs(stable_host_prefix(tokenizer,request,{},original), original)
+        request.request_type='completion'
+        self.assertIs(stable_host_prefix(tokenizer,request,{},original), original)
 
 
 class Array:
@@ -65,9 +104,23 @@ class ProgressTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler.status, 200)
         import json
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "version": 7})
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 9})
         handler.path = "/v1/models"
         self.assertEqual(handler.do_GET(), "original route")
+
+    def test_automatic_names_allow_prose_and_leave_argument_values_unconstrained(self):
+        a=AutomaticToolOpening([1,2], [[1,2,3,4], [1,2,3,5]])
+        b=AutomaticToolOpening([1,2], [[1,2,3,9]])
+        self.assertIsNone(a.next_tokens([100,101]))
+        self.assertIsNone(b.next_tokens([200]))
+        self.assertIsNone(a.next_tokens([100,101,77,1]))
+        self.assertEqual(a.next_tokens([100,101,77,1,2]),[3])
+        self.assertEqual(a.next_tokens([100,101,77,1,2,3]),[4,5])
+        self.assertIsNone(a.next_tokens([100,101,77,1,2,3,5]))
+        self.assertIsNone(a.next_tokens([100,101,77,1,2,3,5,999,888]))
+        self.assertIsNone(b.next_tokens([200,66]))
+        self.assertEqual(b.next_tokens([200,66,1,2,3]),[9])
+        with self.assertRaises(ValueError):AutomaticToolOpening([],[[1]])
 
     def test_registered_name_choice_branches_and_isolates_requests(self):
         first = RegisteredToolOpening([[1, 2, 3], [1, 4, 3]])
@@ -127,6 +180,29 @@ class ProgressTests(unittest.TestCase):
             first.next_token(99)
         with self.assertRaises(ValueError):
             RequiredToolPrefix([])
+
+    @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
+    def test_automatic_opening_hook_preserves_free_text_and_masks_only_registered_name(self):
+        import mlx.core as mx
+        class Generator:
+            def _tokenize(self, tokenizer, request, args): return "prompt"
+        def parser(*_): pass
+        parser.__module__="mlx_lm.tool_parsers.qwen3_coder"
+        tokenizer=SimpleNamespace(has_tool_calling=True,tool_parser=parser,eos_token_ids={7},encode=lambda text,**kw: [1] if text=='<tool_call>' else ([1,2,3] if text.startswith('<tool_call>') else [6]),decode=lambda ids: '')
+        server=SimpleNamespace(ResponseGenerator=Generator,_make_logits_processors=lambda _: [])
+        install_required_tool_opening(server,mx)
+        request=SimpleNamespace(request_type='chat',tools=[{'function':{'name':'registered'}}])
+        args=SimpleNamespace(chat_template_kwargs={'opengpu_native_tool_guard':True})
+        self.assertEqual(Generator()._tokenize(tokenizer,request,args),'prompt')
+        processors=server._make_logits_processors(args);self.assertEqual(len(processors),2)
+        logits=mx.arange(8).astype(mx.float32);guard=processors[0]
+        self.assertIs(guard(mx.array([100,101]),logits),logits)
+        self.assertIs(guard(mx.array([100,101,55]),logits),logits)
+        masked=guard(mx.array([100,101,55,1]),logits)
+        self.assertEqual(mx.argmax(masked).item(),2);self.assertEqual(mx.sum(mx.isfinite(masked)).item(),1)
+        self.assertEqual(mx.argmax(guard(mx.array([100,101,55,1,2]),logits)).item(),3)
+        self.assertIs(guard(mx.array([100,101,55,1,2,3]),logits),logits)
+        self.assertIs(guard(mx.array([100,101,55,1,2,3,44]),logits),logits)
 
     @unittest.skipUnless(importlib.util.find_spec("mlx"), "native MLX checked on macOS release runner")
     def test_required_opening_masks_only_prefix_tokens_and_leaves_chat_unchanged(self):

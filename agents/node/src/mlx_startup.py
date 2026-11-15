@@ -46,6 +46,37 @@ class RegisteredToolOpening:
         return sorted({sequence[len(generated)] for sequence in candidates})
 
 
+class AutomaticToolOpening:
+    """Free prose until a tool marker; then only a registered function name."""
+    def __init__(self, marker, sequences):
+        if not marker:
+            raise ValueError("Tool marker must not be empty")
+        self.marker = tuple(marker)
+        self.prefix = RegisteredToolOpening(sequences)
+        self.start = None
+        self.scanned = 0
+        self.finished = False
+
+    def next_tokens(self, history):
+        if self.start is None:
+            self.start = len(history)
+        if self.finished:
+            return None
+        if self.prefix.start is None:
+            generated = history[self.start:]
+            for index in range(max(0, self.scanned - len(self.marker) + 1), len(generated) - len(self.marker) + 1):
+                if tuple(generated[index:index + len(self.marker)]) == self.marker:
+                    self.prefix.start = self.start + index
+                    break
+            self.scanned = len(generated)
+            if self.prefix.start is None:
+                return None
+        tokens = self.prefix.next_tokens(history)
+        if tokens is None:
+            self.finished = True
+        return tokens
+
+
 def repetitive_tool_tail(text):
     """Reject long low-entropy argument loops, not ordinary repeated syntax."""
     if '<tool_call>' not in text or text.rfind('<tool_call>') < text.rfind('</tool_call>'):
@@ -80,6 +111,63 @@ class NativeToolGuard:
         return False
 
 
+def stable_host_prefix(tokenizer, request, template_args, tokenized):
+    """Add a cache boundary without changing a single rendered prompt token.
+
+    Recurrent caches cannot trim a previous longer prompt. Retain the stable
+    host instructions separately from changing tool catalogs and observations,
+    including requests whose final message is a system or tool message.
+    """
+    prompt, segments, segment_types, initial_state = tokenized
+    if (request.request_type != 'chat' or not request.messages
+            or request.messages[0].get('role') != 'system'
+            or not getattr(tokenizer, 'has_chat_template', False)
+            or not getattr(getattr(tokenizer, 'tool_parser', None), '__module__', '').endswith('qwen3_coder')):
+        return tokenized
+    try:
+        options = dict(template_args)
+        options.update(tools=[], tokenize=True)
+        baseline = tokenizer.apply_chat_template(
+            [request.messages[0], {'role': 'user', 'content': ''}],
+            add_generation_prompt=False, **options)
+        boundary = 0
+        for actual, expected in zip(prompt, baseline):
+            if actual != expected:
+                break
+            boundary += 1
+    except (TypeError, ValueError, AttributeError):
+        return tokenized
+    # Tiny prefixes do not justify an extra recurrent-state cache entry.
+    if boundary < 256 or boundary >= len(prompt):
+        return tokenized
+    boundaries = {boundary: 'system'}
+    position = 0
+    for segment, kind in zip(segments, segment_types):
+        position += len(segment)
+        if position > boundary:
+            boundaries[position] = 'user' if kind == 'system' else kind
+    if position != len(prompt):
+        return tokenized
+    result, kinds, start = [], [], 0
+    for end, kind in sorted(boundaries.items()):
+        result.append(prompt[start:end])
+        kinds.append(kind)
+        start = end
+    return prompt, result, kinds, initial_state
+
+
+def install_stable_host_cache(server):
+    original = server.ResponseGenerator._tokenize
+
+    def tokenize(self, tokenizer, request, args):
+        tokenized = original(self, tokenizer, request, args)
+        template_args = dict(self.model_provider.cli_args.chat_template_args)
+        template_args.update(args.chat_template_kwargs or {})
+        return stable_host_prefix(tokenizer, request, template_args, tokenized)
+
+    server.ResponseGenerator._tokenize = tokenize
+
+
 def install_required_tool_opening(server, mx):
     original_tokenize = server.ResponseGenerator._tokenize
     original_processors = server._make_logits_processors
@@ -101,6 +189,14 @@ def install_required_tool_opening(server, mx):
             if any(not isinstance(name, str) or not name for name in names):
                 raise ValueError("Required tool opening needs registered function names")
             args._opengpu_required_openings = tuple(tuple(tokenizer.encode("<tool_call>\n<function=" + name + ">\n", add_special_tokens=False)) for name in names)
+        elif guarded and request.tools:
+            names = [tool.get("function", {}).get("name") for tool in request.tools]
+            if any(not isinstance(name, str) or not name for name in names):
+                raise ValueError("Automatic tool opening needs registered function names")
+            args._opengpu_auto_openings = (
+                tuple(tokenizer.encode('<tool_call>', add_special_tokens=False)),
+                tuple(tuple(tokenizer.encode('<tool_call>\n<function=' + name + '>\n', add_special_tokens=False)) for name in names),
+            )
         args.chat_template_kwargs = {key: value for key, value in options.items() if key not in ('opengpu_require_tool_call', 'opengpu_native_tool_guard')}
         return original_tokenize(self, tokenizer, request, args)
 
@@ -123,6 +219,16 @@ def install_required_tool_opening(server, mx):
                 return mx.where(allowed, logits, mx.full_like(logits, -float("inf")))
 
             result.append(force_opening)
+        automatic = getattr(args, '_opengpu_auto_openings', None)
+        if automatic:
+            prefix = AutomaticToolOpening(*automatic)
+            def guard_opening(history, logits):
+                tokens = prefix.next_tokens(history.tolist())
+                if tokens is None:
+                    return logits
+                allowed = mx.any(mx.arange(logits.shape[-1])[:, None] == mx.array(tokens)[None, :], axis=1)
+                return mx.where(allowed, logits, mx.full_like(logits, -float('inf')))
+            result.append(guard_opening)
         guarded = getattr(args, '_opengpu_native_guard', None)
         if guarded:
             tokenizer, eos = guarded
@@ -145,7 +251,7 @@ def install_capabilities_endpoint(server):
     def get(self):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
-        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "version": 7}).encode("utf-8")
+        payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "registered_auto_tool_opening": True, "stable_host_prefix_cache": True, "version": 9}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -305,6 +411,7 @@ def main():
     utils.load = measured_load
     import mlx_lm.server as server
     install_required_tool_opening(server, mx)
+    install_stable_host_cache(server)
     install_complete_qwen_parser(server)
     install_capabilities_endpoint(server)
     server.main()
