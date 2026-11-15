@@ -27,7 +27,7 @@ env:
 jobs:
   release:
     name: Build and publish macOS Apple Silicon CLI
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
