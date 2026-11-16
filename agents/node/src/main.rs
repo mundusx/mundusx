@@ -1710,7 +1710,24 @@ fn control_plane_completion_message(record: &JobRecord, completion: &JobCompleti
     )
 }
 
-fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, completion: &JobCompletion) -> bool {
+fn completion_payload(job: &JobRecord, completion: &JobCompletion) -> serde_json::Value {
+    let mut payload=serde_json::to_value(completion).expect("completion JSON");
+    let context=(|| {
+        let nodes=job.graph["nodes"].as_array()?;
+        let node=if job.graph_execution_enabled {
+            let id=job.active_graph_node_id.as_deref()?;
+            nodes.iter().find(|n|n["id"].as_str()==Some(id) && n["assigned_node_id"].as_str()==Some(completion.node_id.as_str()))?
+        } else { nodes.first()? };
+        let attempt=node["attempt_count"].as_u64().filter(|n|*n>0 && *n<=i32::MAX as u64)?;
+        let assignment=if job.graph_execution_enabled {node["assigned_at"].as_str()?} else {job.assigned_at.as_deref()?};
+        if assignment.is_empty() {return None;}
+        Some(serde_json::json!({"graph_node_id":if job.graph_execution_enabled {node["id"].as_str()?} else {""},"attempt":attempt,"assignment_id":assignment}))
+    })();
+    if let Some(context)=context {payload["usage_context"]=context;}
+    payload
+}
+fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, job: &JobRecord, completion: &JobCompletion) -> bool {
+    let payload=completion_payload(job,completion);
     let agent =
         http::request_agent_with_timeouts(COMPLETION_CONNECT_TIMEOUT, COMPLETION_IO_TIMEOUT);
     for attempt in 1..=COMPLETION_DELIVERY_ATTEMPTS {
@@ -1720,7 +1737,7 @@ fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, completion: &Jo
             "/v1/jobs/complete",
             &config.device_id,
             identity,
-            completion,
+            &payload,
         ) {
             Ok(record) => {
                 println!("{}", control_plane_completion_message(&record, completion));
@@ -2027,7 +2044,7 @@ fn execute_claimed_job(
                 response,
                 started_at.elapsed().as_millis() as u64,
             );
-            let accepted = complete_job(&config, &identity, &completion);
+            let accepted = complete_job(&config, &identity, &job, &completion);
             activity.finish(if accepted { job_status_label(completion.status) } else { "interrupted" });
             println!("jobTiming: complete {} elapsed_ms={}", completion.job_id, started_at.elapsed().as_millis());
         }
@@ -2038,7 +2055,7 @@ fn execute_claimed_job(
                 error,
                 started_at.elapsed().as_millis() as u64,
             );
-            let accepted = complete_job(&config, &identity, &completion);
+            let accepted = complete_job(&config, &identity, &job, &completion);
             activity.finish(if accepted { job_status_label(completion.status) } else { "interrupted" });
         }
     }
@@ -3632,6 +3649,7 @@ mod tests {
 
     fn test_job() -> JobRecord {
         JobRecord {
+            graph:serde_json::Value::Null, graph_execution_enabled:false,active_graph_node_id:None,
             operation: crate::contribution_contract::Operation::Llm,
             job_id: "job-1".to_string(),
             request_id: "request-1".to_string(),
@@ -3657,6 +3675,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completion_signs_the_exact_claimed_assignment_context() {
+        let mut job=test_job();job.assigned_at=Some("1700".into());
+        job.graph=serde_json::json!({"nodes":[{"id":"step","attempt_count":2,"assigned_at":"1800","assigned_node_id":"node-test"}]});
+        let response=WorkerLaunchResponse {worker_id:"worker".into(),token_usage:Vec::new(),job_id:job.job_id.clone(),status:"completed".into(),output:"ok".into(),error:None,backend:Backend::Cuda,node_id:"node-test".into(),model:None,runtime_mode:None};
+        let completion=build_completion_from_worker_response(response,1);
+        let payload=completion_payload(&job,&completion);
+        assert_eq!(payload["usage_context"],serde_json::json!({"graph_node_id":"","attempt":2,"assignment_id":"1700"}));
+        job.graph_execution_enabled=true;job.active_graph_node_id=Some("step".into());
+        assert_eq!(completion_payload(&job,&completion)["usage_context"],serde_json::json!({"graph_node_id":"step","attempt":2,"assignment_id":"1800"}));
+        job.active_graph_node_id=Some("other".into());assert!(completion_payload(&job,&completion).get("usage_context").is_none());
+    }
     #[test]
     fn admission_status_blocks_startup_when_control_plane_denies_jobs() {
         let status = NodeAdmissionStatus {

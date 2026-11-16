@@ -196,6 +196,12 @@ pub struct JobRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobRecord {
+    #[serde(default)]
+    pub graph: serde_json::Value,
+    #[serde(default)]
+    pub graph_execution_enabled: bool,
+    #[serde(default)]
+    pub active_graph_node_id: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "crate::contribution_contract::Operation::is_llm"
