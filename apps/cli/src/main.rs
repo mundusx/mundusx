@@ -7,6 +7,7 @@ mod vllm_model_profile;
 mod media_worker;
 mod workload_picker;
 mod ownership;
+mod desktop_credits;
 mod auth_token;
 mod control_planes;
 #[path = "../../../packages/settings-drain.rs"]
@@ -136,7 +137,12 @@ enum OwnerCommands {
     Link { #[arg(long)] code_stdin:bool, #[arg(long)] yes:bool, #[arg(long)] json:bool },
 }
 #[derive(Subcommand, Debug)]
+enum DesktopCommands { Credits }
+
+#[derive(Subcommand, Debug)]
 enum Commands {
+    /// Private device-scoped desktop adapters
+    Desktop { #[command(subcommand)] command: DesktopCommands },
     /// Link this contributor to your Nodara Chat account using its existing key
     Owner { #[command(subcommand)] command:OwnerCommands },
     /// Manage the persistent list of saved control-plane endpoints
@@ -7278,6 +7284,9 @@ fn main() {
     theme::configure(cli.theme);
 
     match cli.command {
+        Commands::Desktop { command: DesktopCommands::Credits } => {
+            if let Err(error)=desktop_credits::run() {eprintln!("{error}");std::process::exit(1);}
+        }
         Commands::Owner {command}=>{
             let result=match command{
                 OwnerCommands::Status{json}=>ownership::run("status",false,false,json),
@@ -10355,4 +10364,9 @@ mod tests {
 
         assert_eq!(hint, "run `opengpu start` to bring the node online");
     }
+}
+
+#[test] fn desktop_credits_command_is_noninteractive() {
+    assert!(matches!(Cli::try_parse_from(["opengpu","desktop","credits"]).unwrap().command,
+        Commands::Desktop {command:DesktopCommands::Credits}));
 }
