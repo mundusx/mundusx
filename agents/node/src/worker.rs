@@ -2877,6 +2877,41 @@ mod edit_precondition_tests {
         let _ = with_stream_delta_sender(Some(tx), || parse_native_openai_stream_with_context(io::Cursor::new(wire), &mut String::new(), false, Some(&p)));
         assert!(rx.try_iter().all(|d| !d.contains("All done and verified!")));
     }
+    fn assert_relay_matches_final(deltas: Vec<String>, result: &str) {
+        let mut relay = native_stream::NativeStream::default();
+        for delta in deltas { relay.push(&serde_json::from_str(&delta).unwrap()).unwrap(); }
+        let final_result: serde_json::Value = serde_json::from_str(result.strip_prefix(OPENAI_TOOL_RESULT_PREFIX).unwrap()).unwrap();
+        assert_eq!(relay.remainder(&final_result["message"]).unwrap(), serde_json::json!({}));
+    }
+    #[test]
+    fn canonical_tool_handoff_retains_indices_and_streamed_prefix() {
+        let mut p = payload();
+        p["tools"][0]["function"]["parameters"] = serde_json::json!({"type":"object","required":["filePath","startLine","endLine"],"properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}}});
+        let wire = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":"Inspecting first."}}]}),
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read2","type":"function","function":{"name":"read_file","arguments":"{\"filePath\":\"D:/sample/main.rs\"}"}}]},"finish_reason":"tool_calls"}]}));
+        let (tx, rx) = mpsc::channel();
+        let result = with_stream_delta_sender(Some(tx), || parse_native_openai_stream_with_context(io::Cursor::new(wire), &mut String::new(), false, Some(&p))).unwrap();
+        assert_relay_matches_final(rx.try_iter().collect(), &result);
+    }
+    #[test]
+    fn recovered_tool_handoff_preserves_prefix_without_repeated_intro() {
+        let p = payload();
+        let first = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":"I will inspect."}}]}),
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"bad","type":"function","function":{"name":"read_file","arguments":"{"}}]},"finish_reason":"length"}]}));
+        let second = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":"Correcting the read."}}]}),
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"good","type":"function","function":{"name":"read_file","arguments":"{\"filePath\":\"D:/sample/main.rs\"}"}}]},"finish_reason":"tool_calls"}]}));
+        let (tx, rx) = mpsc::channel(); let mut output = String::new();
+        let result = with_stream_delta_sender(Some(tx), || {
+            assert!(parse_native_openai_stream_with_context(io::Cursor::new(first), &mut output, false, Some(&p)).is_err());
+            parse_native_openai_stream_with_context(io::Cursor::new(second), &mut output, true, Some(&p))
+        }).unwrap();
+        assert!(output.contains("I will inspect."));
+        assert!(!output.contains("Correcting the read."));
+        assert_relay_matches_final(rx.try_iter().collect(), &result);
+    }
     #[test]
     fn rejected_batch_releases_no_tool_fragments() {
         let mut assembled=edit("D:/sample/models/Student.js");assembled["tool_calls"][0]["index"]=serde_json::json!(0);
@@ -3133,6 +3168,11 @@ fn run_native_tool_attempts(
     mut payload: serde_json::Value,
     mut attempt: impl FnMut(&serde_json::Value, &mut String, bool) -> Result<String, String>,
 ) -> Result<String, String> {
+    if native_tool_workflow::is_file_turn(&payload) {
+        if let Some(messages) = payload["messages"].as_array_mut() {
+            messages.push(serde_json::json!({"role":"system","content":"Respond to the most recent user request. Earlier tasks are conversation context, not permission to resume them after the user changes the subject. For a conversational question, answer it directly and stop; do not inspect, create, edit or run workspace files unless needed for that current request. Preserve the host's identity and permissions."}));
+        }
+    }
     if payload["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["content"].as_str().is_some_and(|t|t.contains("<environment_info>") && t.contains("The user's current OS is: Windows")))) {
         if let Some(messages)=payload["messages"].as_array_mut() {
             messages.push(serde_json::json!({"role":"system","content":"Windows PowerShell terminal calls: use curl.exe for native curl flags or Invoke-RestMethod for JSON APIs. Use PowerShell-compatible JSON quoting such as ConvertTo-Json and a body file. Include all registered terminal arguments. After the host returns an execution error, use the actual error to correct the command. After a successful mutation, inspect the result and do not replay it merely for verification. Preserve the requested operation and task data."}));
@@ -3193,6 +3233,29 @@ fn run_native_tool_attempts(
         }
         Err(error) => Err(error),
     }
+}
+
+#[test]
+fn editor_policy_focuses_current_request_without_rewriting_host_identity() {
+    let messages = serde_json::json!([
+        {"role":"system","content":"You are GitHub Copilot."},
+        {"role":"user","content":"<userRequest>Create factorial in Java</userRequest>"},
+        {"role":"assistant","content":"I can help with factorial."},
+        {"role":"user","content":"<userRequest>whats ur name</userRequest>"}
+    ]);
+    let payload = serde_json::json!({"messages":messages,"tools":[
+        {"function":{"name":"read_file"}},{"function":{"name":"list_dir"}},
+        {"function":{"name":"replace_string_in_file"}}
+    ]});
+    run_native_tool_attempts(payload, |sent, _, retry| {
+        assert!(!retry);
+        assert_eq!(&sent["messages"].as_array().unwrap()[..4], messages.as_array().unwrap());
+        let policy = sent["messages"][4]["content"].as_str().unwrap();
+        assert!(policy.contains("most recent user request"));
+        assert!(policy.contains("answer it directly and stop"));
+        assert!(policy.contains("Preserve the host's identity"));
+        Ok("done".into())
+    }).unwrap();
 }
 
 #[test]
@@ -3328,7 +3391,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     let mut usage = serde_json::Value::Null;
     let mut pending_tools = Vec::new();
     let mut pending_content = String::new();
-    let mut streamed_content = String::new();
+    let mut streamed_content = output.clone();
     let mut sent_content = false;
     let mut last_content_sent = Instant::now();
     let mut reason = None;
@@ -3388,7 +3451,6 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
             // Prose still streams immediately; recovery must not duplicate it.
             if !retry && !buffer_content {
                 if let Some(content) = delta["content"].as_str().filter(|s| !s.is_empty()) {
-                    output.push_str(content);
                     pending_content.push_str(content);
                     // One signed HTTP relay per token can outlast generation.
                     // Release the first fragment immediately, then coalesce prose
@@ -3397,6 +3459,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
                         || last_content_sent.elapsed() >= Duration::from_millis(250) {
                         emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
                         streamed_content.push_str(&pending_content);
+                        output.push_str(&pending_content);
                         pending_content.clear();
                         sent_content = true;
                         last_content_sent = Instant::now();
@@ -3412,8 +3475,10 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     if !pending_content.is_empty() && !buffer_content {
         emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
         streamed_content.push_str(&pending_content);
+        output.push_str(&pending_content);
     }
     let mut message = assembled.message();
+    let original_content = message["content"].clone();
     validate_native_tool_message(&message, reason.as_deref())?;
     let mut workflow_changed=false;
     if let Some(payload)=payload {
@@ -3422,7 +3487,12 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
         workflow_changed=changed;
         if changed {
             pending_tools.clear();
-            if message["tool_calls"].is_array() { pending_tools.push(serde_json::json!({"tool_calls":message["tool_calls"]})); }
+            if let Some(calls) = message["tool_calls"].as_array() {
+                let calls: Vec<_> = calls.iter().enumerate().map(|(index, call)| {
+                    let mut call = call.clone(); call["index"] = serde_json::json!(index); call
+                }).collect();
+                pending_tools.push(serde_json::json!({"tool_calls":calls}));
+            }
             reason=Some(if message["tool_calls"].is_array() {"tool_calls"} else {"stop"}.to_string());
         }
     }
@@ -3433,14 +3503,26 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     {
         return Err("native tool recovery returned no tool call".into());
     }
-    if buffer_content {
-        if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
-            let content = content.strip_prefix(&streamed_content).unwrap_or(content);
-            if !content.is_empty() {
-                emit_stream_delta(&serde_json::json!({"content":content}).to_string());
-            }
-        }
-    } else { message["content"] = output.clone().into(); }
+    // A recovery may change the planned prose after an earlier attempt has
+    // emitted text. Keep that exact public prefix in the terminal message so
+    // downstream reconciliation neither repeats nor retracts delivered text.
+    let content = if retry && message["content"] == original_content {
+        // A bounded tool retry must not repeat its introductory paragraph.
+        streamed_content.as_str()
+    } else { message["content"].as_str().unwrap_or_default() };
+    let final_content = if content.starts_with(&streamed_content) {
+        content.to_owned()
+    } else if content.is_empty() {
+        streamed_content.clone()
+    } else {
+        format!("{streamed_content}\n\n{content}")
+    };
+    let remaining = &final_content[streamed_content.len()..];
+    if !remaining.is_empty() {
+        emit_stream_delta(&serde_json::json!({"content":remaining}).to_string());
+    }
+    *output = final_content.clone();
+    message["content"] = final_content.into();
     // Preserve the provider's fragment sizes instead of creating one oversized
     // relay event for a large file. Every fragment is validated before release.
     for delta in pending_tools {
