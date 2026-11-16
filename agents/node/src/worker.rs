@@ -2828,6 +2828,56 @@ mod edit_precondition_tests {
         assert!(normalize_native_openai_tool_response(&serde_json::json!({"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]})).unwrap_err().contains("without content"));
     }
     #[test]
+    fn editor_prose_streams_before_terminal_without_duplicates() {
+        struct ObservedReader {
+            cursor: io::Cursor<Vec<u8>>,
+            receiver: mpsc::Receiver<String>,
+            lines: usize,
+            observed: Vec<String>,
+        }
+        impl io::Read for ObservedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { io::Read::read(&mut self.cursor, buf) }
+        }
+        impl BufRead for ObservedReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> { self.cursor.fill_buf() }
+            fn consume(&mut self, n: usize) { self.cursor.consume(n); }
+            fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
+                if self.lines == 1 {
+                    self.observed.push(self.receiver.try_recv().expect("prose must arrive before reading terminal event"));
+                }
+                self.lines += 1;
+                self.cursor.read_line(buf)
+            }
+        }
+        let wire = format!("data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":"Hello "}}]}),
+            serde_json::json!({"choices":[{"delta":{"content":"world"}}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
+        let (tx, rx) = mpsc::channel();
+        let mut reader = ObservedReader { cursor: io::Cursor::new(wire.into_bytes()), receiver: rx, lines: 0, observed: vec![] };
+        let mut output = String::new();
+        let result = with_stream_delta_sender(Some(tx), || parse_native_openai_stream_with_context(&mut reader, &mut output, false, Some(&payload())));
+        assert!(result.is_ok());
+        reader.observed.extend(reader.receiver.try_iter());
+        let streamed: String = reader.observed.iter().map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap()["content"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(streamed, "Hello world");
+        assert_eq!(output, streamed);
+    }
+    #[test]
+    fn prior_unverified_edits_still_withhold_completion_claims() {
+        let mut p = payload();
+        assert!(!native_prose_needs_validation(&p));
+        p["messages"].as_array_mut().unwrap().push(edit("D:/sample/routes/studentRoutes.js"));
+        p["messages"].as_array_mut().unwrap().push(serde_json::json!({"role":"tool","tool_call_id":"edit1","content":"Successfully replaced string"}));
+        assert!(native_prose_needs_validation(&p));
+        let wire = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":"All done and verified!"}}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
+        let (tx, rx) = mpsc::channel();
+        let _ = with_stream_delta_sender(Some(tx), || parse_native_openai_stream_with_context(io::Cursor::new(wire), &mut String::new(), false, Some(&p)));
+        assert!(rx.try_iter().all(|d| !d.contains("All done and verified!")));
+    }
+    #[test]
     fn rejected_batch_releases_no_tool_fragments() {
         let mut assembled=edit("D:/sample/models/Student.js");assembled["tool_calls"][0]["index"]=serde_json::json!(0);
         let wire=format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",serde_json::json!({"choices":[{"delta":assembled}]}),serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
@@ -3260,13 +3310,25 @@ fn parse_native_openai_stream_with_output<R: BufRead>(
     parse_native_openai_stream_with_context(reader,output,retry,None)
 }
 
+// A file-tool catalog alone does not require withholding explanatory prose.
+// Only prior edits with outstanding verification can turn a prose completion
+// into a verification action or an incomplete warning.
+fn native_prose_needs_validation(payload: &serde_json::Value) -> bool {
+    if !native_tool_workflow::is_file_turn(payload) { return false; }
+    let prose = serde_json::json!({"role":"assistant","content":""});
+    native_tool_workflow::verification(payload, &prose).is_some()
+        || !matches!(native_tool_workflow::compilation(payload, &prose), Ok(None))
+}
+
 fn parse_native_openai_stream_with_context<R: BufRead>(
     reader:R, output:&mut String, retry:bool, payload:Option<&serde_json::Value>,
 ) -> Result<String,String> {
+    let mut buffer_content = payload.is_some_and(native_prose_needs_validation);
     let mut assembled = native_stream::NativeStream::default();
     let mut usage = serde_json::Value::Null;
     let mut pending_tools = Vec::new();
     let mut pending_content = String::new();
+    let mut streamed_content = String::new();
     let mut sent_content = false;
     let mut last_content_sent = Instant::now();
     let mut reason = None;
@@ -3318,11 +3380,13 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
             }
             assembled.push(&delta)?;
             if delta.get("tool_calls").is_some() {
+                // Tool-associated prose can be replaced by edit recovery.
+                buffer_content |= payload.is_some_and(native_tool_workflow::is_file_turn);
                 pending_tools.push(serde_json::json!({"tool_calls":delta["tool_calls"]}));
             }
             // Tool arguments remain private until the entire batch is valid.
             // Prose still streams immediately; recovery must not duplicate it.
-            if !retry && !payload.is_some_and(native_tool_workflow::is_file_turn) {
+            if !retry && !buffer_content {
                 if let Some(content) = delta["content"].as_str().filter(|s| !s.is_empty()) {
                     output.push_str(content);
                     pending_content.push_str(content);
@@ -3332,6 +3396,7 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
                     if !sent_content || pending_content.len() >= 256
                         || last_content_sent.elapsed() >= Duration::from_millis(250) {
                         emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
+                        streamed_content.push_str(&pending_content);
                         pending_content.clear();
                         sent_content = true;
                         last_content_sent = Instant::now();
@@ -3344,8 +3409,9 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     if !done || reason.is_none() {
         return Err("native stream ended before terminal event".into());
     }
-    if !pending_content.is_empty() && !payload.is_some_and(native_tool_workflow::is_file_turn) {
+    if !pending_content.is_empty() && !buffer_content {
         emit_stream_delta(&serde_json::json!({"content":pending_content}).to_string());
+        streamed_content.push_str(&pending_content);
     }
     let mut message = assembled.message();
     validate_native_tool_message(&message, reason.as_deref())?;
@@ -3367,9 +3433,12 @@ fn parse_native_openai_stream_with_context<R: BufRead>(
     {
         return Err("native tool recovery returned no tool call".into());
     }
-    if payload.is_some_and(native_tool_workflow::is_file_turn) {
+    if buffer_content {
         if let Some(content)=message["content"].as_str().filter(|s|!s.is_empty()) {
-            emit_stream_delta(&serde_json::json!({"content":content}).to_string());
+            let content = content.strip_prefix(&streamed_content).unwrap_or(content);
+            if !content.is_empty() {
+                emit_stream_delta(&serde_json::json!({"content":content}).to_string());
+            }
         }
     } else { message["content"] = output.clone().into(); }
     // Preserve the provider's fragment sizes instead of creating one oversized
