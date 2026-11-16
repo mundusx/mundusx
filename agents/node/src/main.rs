@@ -2022,6 +2022,7 @@ fn execute_claimed_job(
     }
     match worker_result {
         Ok(response) => {
+            activity.measured_usage(&response.token_usage);
             let completion = build_completion_from_worker_response(
                 response,
                 started_at.elapsed().as_millis() as u64,

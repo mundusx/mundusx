@@ -40,8 +40,8 @@ DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 GLOBAL_BIN_DIR_OVERRIDE="${OPENGPU_GLOBAL_BIN_DIR:-}"
 GLOBAL_BIN_DIR="${OPENGPU_GLOBAL_BIN_DIR:-/usr/local/bin}"
-DEFAULT_RELEASE_TAG="cli-linux-v0.2.67"
-if [ "$(uname -s)" = "Darwin" ]; then DEFAULT_RELEASE_TAG="cli-macos-v0.2.67"; fi
+DEFAULT_RELEASE_TAG="cli-linux-v0.2.68"
+if [ "$(uname -s)" = "Darwin" ]; then DEFAULT_RELEASE_TAG="cli-macos-v0.2.68"; fi
 RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/mundusx/mundusx/releases/download/$DEFAULT_RELEASE_TAG}"
 OPENGPU_HOME="${OPENGPU_HOME:-$HOME/.opengpu}"
 VLLM_IMAGE="${OPENGPU_VLLM_IMAGE:-nvcr.io/nvidia/vllm@sha256:63b808804826a028e38f559747a9e4d5985cf676616fbaa70c1937c58f83e13e}"
