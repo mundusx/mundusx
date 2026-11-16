@@ -15,6 +15,23 @@ pub fn validate(payload: &Value, node: &str) -> Result<(), String> {
             return Err("Reward response is incomplete".into());
         }
     }
+    if let Some(ai) = payload.get("ai_credits") {
+        let valid = ai["earned"].as_str().is_some_and(|s| {
+            s.split_once('.').is_some_and(|(whole, frac)| {
+                !whole.is_empty()
+                    && whole.bytes().all(|c| c.is_ascii_digit())
+                    && frac.len() == 12
+                    && frac.bytes().all(|c| c.is_ascii_digit())
+            })
+        });
+        if ai["unit"] != "usd_ai_credits"
+            || ai["usd_per_credit"] != "1"
+            || ai["precision"] != 12
+            || !valid
+        {
+            return Err("Invalid measured AI credit balance".into());
+        }
+    }
     Ok(())
 }
 pub fn run() -> Result<(), String> {

@@ -19,6 +19,10 @@ struct Entry {
     process_id: u32,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -100,6 +104,8 @@ fn update(
             duration_ms: duration,
             process_id: std::process::id(),
             model: model.map(|s| s.chars().take(256).collect()),
+            input_tokens: None,
+            output_tokens: None,
         });
     }
     while rows.len() > LIMIT {
@@ -152,6 +158,31 @@ impl Job {
             finished: false,
         }
     }
+    // Retain only runtime measurements, including every internal retry call.
+    // Missing input measurement remains unknown even when output is measured.
+    pub fn measured_usage(&self, records: &[serde_json::Value]) {
+        let sum = |field: &str| -> Option<u64> {
+            if records.is_empty() {
+                return None;
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            records.iter().try_fold(0u64, |total, row| {
+                if row["source"] != "runtime" || !ids.insert(row["call_id"].as_str()?) {
+                    return None;
+                }
+                total.checked_add(row[field].as_u64()?)
+            })
+        };
+        let input = sum("prompt_tokens");
+        let output = sum("completion_tokens");
+        let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows = read(&self.path);
+        if let Some(row) = rows.iter_mut().find(|r| r.job_id == self.id) {
+            row.input_tokens = input;
+            row.output_tokens = output;
+            report(save(&self.path, &rows));
+        }
+    }
     pub fn finish(&mut self, status: &str) {
         report(update(
             &self.path,
@@ -195,6 +226,23 @@ mod tests {
         assert!(v[0].get("prompt").is_none());
         assert!(v[0].get("output").is_none());
         assert!(v[0]["duration_ms"].is_number());
+        fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn runtime_usage_sums_retries_and_preserves_unknown_and_zero() {
+        let p = fixture();
+        let mut job = Job::start_at(p.clone(), "metered", None);
+        job.measured_usage(&[]);
+        assert_eq!(read(&p)[0].output_tokens, None);
+        job.measured_usage(&[serde_json::json!({"call_id":"a","source":"runtime","prompt_tokens":100,"completion_tokens":2}), serde_json::json!({"call_id":"b","source":"runtime","prompt_tokens":50,"completion_tokens":0})]);
+        job.finish("completed");
+        assert_eq!(read(&p)[0].input_tokens, Some(150));
+        assert_eq!(read(&p)[0].output_tokens, Some(2));
+        job.measured_usage(&[
+            serde_json::json!({"call_id":"c","source":"runtime","completion_tokens":0}),
+        ]);
+        assert_eq!(read(&p)[0].input_tokens, None);
+        assert_eq!(read(&p)[0].output_tokens, Some(0));
         fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
     #[test]
