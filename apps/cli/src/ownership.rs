@@ -8,7 +8,7 @@ pub fn validate_code(code:&str)->Result<&str,String>{
  let code=code.trim();if code.len()<32||code.len()>256||!code.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'_'||c==b'-'){return Err("Invalid link code. Generate a fresh code in Nodara Chat settings.".into())}Ok(code)
 }
 fn read_code()->Result<String,String>{let mut text=String::new();io::stdin().lock().read_line(&mut text).map_err(|_|"Cannot read link code")?;Ok(validate_code(&text)?.to_string())}
-fn existing()->Result<(crate::config::Config,DeviceIdentity),String>{
+pub(crate) fn existing()->Result<(crate::config::Config,DeviceIdentity),String>{
  if !config_exists(){return Err("Set up and register this contributor before linking it.".into())}
  let config=load_config().map_err(|_|"Cannot read contributor settings")?.ok_or("Contributor settings are missing")?;
  let data=std::fs::read(resolved_identity_path()).map_err(|_|"Existing device identity is missing. Linking never generates a replacement key.")?;
