@@ -10,6 +10,7 @@ mod media_drain;
 #[path = "../../../packages/settings-drain.rs"]
 mod settings_drain;
 mod contracts;
+mod desktop_activity;
 #[path = "../../../packages/contribution-contract.rs"]
 mod contribution_contract;
 mod http;
@@ -1709,7 +1710,7 @@ fn control_plane_completion_message(record: &JobRecord, completion: &JobCompleti
     )
 }
 
-fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, completion: &JobCompletion) {
+fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, completion: &JobCompletion) -> bool {
     let agent =
         http::request_agent_with_timeouts(COMPLETION_CONNECT_TIMEOUT, COMPLETION_IO_TIMEOUT);
     for attempt in 1..=COMPLETION_DELIVERY_ATTEMPTS {
@@ -1723,7 +1724,7 @@ fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, completion: &Jo
         ) {
             Ok(record) => {
                 println!("{}", control_plane_completion_message(&record, completion));
-                return;
+                return true;
             }
             Err(error)
                 if attempt < COMPLETION_DELIVERY_ATTEMPTS
@@ -1734,10 +1735,11 @@ fn complete_job(config: &AgentConfig, identity: &DeviceIdentity, completion: &Jo
             }
             Err(error) => {
                 eprintln!("controlPlaneComplete: {error}");
-                return;
+                return false;
             }
         }
     }
+    false
 }
 
 const COMPLETION_DELIVERY_ATTEMPTS: usize = 3;
@@ -1817,8 +1819,10 @@ fn relay_job_deltas(
     let agent =
         http::request_agent_with_timeouts(STREAM_DELTA_CONNECT_TIMEOUT, STREAM_DELTA_IO_TIMEOUT);
     let mut sequence = 1u64;
+    let mut activity_streaming = false;
     while let Ok(first_delta) = deltas.recv() {
         let delta = coalesce_stream_deltas(first_delta, &deltas);
+        if !activity_streaming { desktop_activity::streaming(&job_id); activity_streaming = true; }
         let payload = JobStreamDelta {
             job_id: job_id.clone(),
             node_id: config.device_id.clone(),
@@ -1955,6 +1959,7 @@ fn execute_claimed_job(
     json: bool,
     _permit: local_api::SlotPermit,
 ) {
+    let mut activity = desktop_activity::Job::start(&job.job_id, resolve_job_model(&config, job.model.clone()).as_deref());
     let cancelled=Arc::new(AtomicBool::new(false));
     let monitor = if job.stream && config.contributed_cluster.is_none() {
         job.assigned_at.as_ref().map(|assignment| {
@@ -2011,6 +2016,7 @@ fn execute_claimed_job(
     }
     println!("jobTiming: relay {} elapsed_ms={}", job.job_id, started_at.elapsed().as_millis());
     if cancelled.load(Ordering::Acquire) {
+        activity.finish("cancelled");
         println!("jobCancelled: {} released its execution slot",job.job_id);
         return;
     }
@@ -2020,7 +2026,8 @@ fn execute_claimed_job(
                 response,
                 started_at.elapsed().as_millis() as u64,
             );
-            complete_job(&config, &identity, &completion);
+            let accepted = complete_job(&config, &identity, &completion);
+            activity.finish(if accepted { job_status_label(completion.status) } else { "interrupted" });
             println!("jobTiming: complete {} elapsed_ms={}", completion.job_id, started_at.elapsed().as_millis());
         }
         Err(error) => {
@@ -2030,7 +2037,8 @@ fn execute_claimed_job(
                 error,
                 started_at.elapsed().as_millis() as u64,
             );
-            complete_job(&config, &identity, &completion);
+            let accepted = complete_job(&config, &identity, &completion);
+            activity.finish(if accepted { job_status_label(completion.status) } else { "interrupted" });
         }
     }
 }
@@ -2290,6 +2298,7 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             std::process::exit(3);
         }
     };
+    desktop_activity::initialize();
     let mut config = load_config_or_exit();
     if normalize_verified_tool_capability(&mut config) {
         if let Err(error) = save_agent_config(&config) {
