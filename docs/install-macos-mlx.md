@@ -4,6 +4,9 @@ Use this guide for an M-series Mac. The published macOS binaries target Apple
 Silicon; this is not an Intel Mac installation guide. MLX is the native Apple
 Silicon LLM runtime, not a separate operating system.
 
+Release builds explicitly target macOS 14.0. Do not inherit the build machine's
+deployment target: a binary built for macOS 26 cannot run on a Sonoma contributor.
+
 ## 1. Open Terminal
 
 Run under your normal macOS account. Keep the machine awake and allow enough
