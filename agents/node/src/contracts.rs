@@ -196,6 +196,8 @@ pub struct JobRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_allowance: Option<u64>,
     #[serde(default)]
     pub graph: serde_json::Value,
     #[serde(default)]
@@ -275,6 +277,8 @@ pub struct JobStreamAck {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerLaunchRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_allowance: Option<u64>,
     #[serde(
         default,
         skip_serializing_if = "crate::contribution_contract::Operation::is_llm"

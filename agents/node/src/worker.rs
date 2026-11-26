@@ -1,3 +1,6 @@
+#[path = "request_token_budget.rs"]
+mod request_token_budget;
+pub const REQUEST_TOKEN_BUDGET_CAPABILITY: &str = request_token_budget::CAPABILITY;
 #[path = "download_progress.rs"]
 mod download_progress;
 #[path = "native_stream.rs"]
@@ -2608,7 +2611,7 @@ fn run_llama_server_completion(
             .set("Accept-Encoding", "identity").set("Cache-Control", "no-cache");
     }
     let response = request
-        .send_json(payload)
+        .send_json(request_token_budget::prepare(payload)?)
         .map_err(|error| format!("llama-server completion failed: {error}"))?;
     if live_stream {
         let generated = parse_openai_stream(BufReader::new(response.into_reader()))?;
@@ -2714,7 +2717,7 @@ fn run_vllm_completion(
             .set("Cache-Control", "no-cache");
     }
     let response = request
-        .send_json(payload)
+        .send_json(request_token_budget::prepare(payload)?)
         .map_err(|error| format!("OpenAI-compatible completion failed: {error}"))?;
     if live_stream {
         return parse_openai_stream(BufReader::new(response.into_reader()));
@@ -2792,6 +2795,7 @@ mod structured_image_tests {
     #[test]
     fn image_transport_does_not_grant_unverified_tool_calls() {
         let make=|body:serde_json::Value| WorkerLaunchRequest {
+            token_allowance: None,
             job_id:"vision-test".into(),node_id:"node".into(),backend:Backend::M,operation:Default::default(),stream:false,
             prompt:format!("{OPENAI_TOOL_TURN_PREFIX}{body}"), model:None,mode:None,system_prompt:None,
             max_tokens:Some(128),temperature:None,top_p:None,seed:None,
@@ -4934,6 +4938,7 @@ fn execute_request_with_cluster(
     request: &WorkerLaunchRequest,
     contributed_cluster: Option<&crate::storage::ContributedCluster>,
 ) -> WorkerLaunchResponse {
+    let _budget = request_token_budget::Scope::enter(request.token_allowance);
     RUNTIME_TOKEN_USAGE.with(|slot| {
         let previous=slot.replace(Vec::new());
         let mut response=execute_request_with_cluster_inner(request,contributed_cluster);
@@ -5077,6 +5082,7 @@ mod stream_stderr_regression {
 pub fn worker_main(cli: WorkerCli) {
     let live_stream = cli.stream;
     let request = WorkerLaunchRequest {
+        token_allowance: env::var("OPENGPU_REQUEST_TOKEN_ALLOWANCE").ok().and_then(|s|s.parse().ok()),
         operation: crate::contribution_contract::Operation::Llm,
         job_id: cli.job_id,
         node_id: cli.node_id,
@@ -5203,6 +5209,8 @@ pub fn launch_worker_with_control(
         .arg("--backend")
         .arg(request.backend.as_str());
 
+    if let Some(allowance) = request.token_allowance { command.env("OPENGPU_REQUEST_TOKEN_ALLOWANCE",allowance.to_string()); }
+    else {command.env_remove("OPENGPU_REQUEST_TOKEN_ALLOWANCE");}
     if let Some(model) = request.model.as_ref() {
         command.arg("--model").arg(model);
     }
@@ -6198,6 +6206,7 @@ mod tests {
 
     fn speakai_request(model: Option<&str>) -> WorkerLaunchRequest {
         WorkerLaunchRequest {
+            token_allowance: None,
             operation: Default::default(),
             job_id: "speakai-job".to_string(),
             node_id: "node-1".to_string(),
@@ -6750,6 +6759,7 @@ mod tests {
     #[test]
     fn vulkan_worker_uses_llama_runtime_path() {
         let response = execute_without_cluster(&WorkerLaunchRequest {
+            token_allowance: None,
             operation: crate::contribution_contract::Operation::Llm,
             job_id: "job-vulkan".to_string(),
             node_id: "node-1".to_string(),
@@ -6795,6 +6805,7 @@ mod tests {
             env::set_var("OPENGPU_MODEL_DIR", &model_dir);
 
             let response = execute_without_cluster(&WorkerLaunchRequest {
+                token_allowance: None,
                 operation: crate::contribution_contract::Operation::Llm,
                 job_id: "job-1".to_string(),
                 node_id: "node-1".to_string(),
@@ -6882,6 +6893,7 @@ mod tests {
     fn vllm_worker_fails_with_clear_runtime_message() {
         with_temp_runtime_home(|_| {
             let response = execute_without_cluster(&WorkerLaunchRequest {
+                token_allowance: None,
                 operation: crate::contribution_contract::Operation::Llm,
                 job_id: "job-vllm".to_string(),
                 node_id: "node-1".to_string(),
@@ -6941,6 +6953,7 @@ mod tests {
 
         let response = super::execute_request_with_cluster(
             &WorkerLaunchRequest {
+                token_allowance: None,
                 operation: Default::default(),
                 job_id: "j".to_string(),
                 node_id: "n".to_string(),
@@ -7044,6 +7057,7 @@ mod tests {
             env::set_var("OPENGPU_VLLM_URL", &url);
 
             let response = execute_without_cluster(&WorkerLaunchRequest {
+                token_allowance: None,
                 operation: crate::contribution_contract::Operation::Llm,
                 job_id: "job-vllm".to_string(),
                 node_id: "node-1".to_string(),
@@ -7145,6 +7159,7 @@ mod tests {
             env::set_var("OPENGPU_MLX_SERVER_URL", url);
 
             let response = execute_without_cluster(&WorkerLaunchRequest {
+                token_allowance: None,
                 operation: Default::default(),
                 job_id: "job-mlx".to_string(),
                 node_id: "node-m".to_string(),
@@ -7194,6 +7209,7 @@ mod tests {
             env::set_var("OPENGPU_LLAMA_SERVER_URL", url);
 
             let response = execute_without_cluster(&WorkerLaunchRequest {
+                token_allowance: None,
                 operation: crate::contribution_contract::Operation::Llm,
                 job_id: "job-1".to_string(),
                 node_id: "node-1".to_string(),
@@ -7672,6 +7688,7 @@ mod native_delta_tests {
         });
         let payload = serde_json::json!({"messages":[{"role":"user","content":"Improve menu"}],"tools":[{"type":"function","function":{"name":"edit_file","parameters":{"type":"object"}}}]});
         let request = WorkerLaunchRequest {
+            token_allowance: None,
             operation: Default::default(),
             job_id: "test".into(),
             node_id: "test".into(),
