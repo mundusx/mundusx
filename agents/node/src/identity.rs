@@ -239,7 +239,7 @@ fn macos_secure_identity() -> std::io::Result<DeviceIdentity> {
 
 #[cfg(target_os = "macos")]
 fn macos_sign_hex(message: &str) -> std::io::Result<String> {
-    macos_identity::sign_message(&macos_storage_dir(), message.as_bytes())
+    macos_identity::sign_existing_message(&macos_storage_dir(), message.as_bytes())
 }
 
 #[cfg(target_os = "linux")]

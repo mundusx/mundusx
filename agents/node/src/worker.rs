@@ -1054,20 +1054,21 @@ pub fn available_model_capabilities(model_dir: &Path) -> Vec<ModelCapability> {
             else {
                 continue;
             };
+            let cached_mlx = crate::mlx_context::cached_weight_directory(&record.name, model_dir);
             let resolved_path = record.source_path.clone().or_else(|| {
                 cached_model_file_from_manifest(model_dir, &record)
                     .map(|path| path.display().to_string())
-            });
+            }).or_else(|| cached_mlx.as_ref().map(|(path, _)| path.display().to_string()));
             if resolved_path.is_none() || record.compatibility.as_deref() == Some("rejected") {
                 continue;
             }
             capabilities.push(ModelCapability {
                 name: record.name.clone(),
                 path: resolved_path,
-                format: record.format.clone(),
+                format: record.format.clone().or_else(|| cached_mlx.as_ref().map(|_| "mlx".into())),
                 quantization: record.quantization.clone(),
-                size_bytes: record.size_bytes,
-                estimated_vram_mb: record.estimated_vram_mb,
+                size_bytes: record.size_bytes.or_else(|| cached_mlx.as_ref().map(|(_, size)| *size)),
+                estimated_vram_mb: record.estimated_vram_mb.or_else(|| cached_mlx.as_ref().map(|(_, size)| size.div_ceil(1 << 20))),
                 compatibility: record.compatibility.clone(),
                 compatibility_reason: record.compatibility_reason.clone(),
                 active: record.active,
@@ -5388,6 +5389,30 @@ fn kill_process_tree(pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_hf_model_is_advertised_without_a_legacy_source_path() {
+        let root = std::env::temp_dir().join(format!("opengpu-hf-inventory-{}", uuid::Uuid::new_v4()));
+        let repo = root.join(".huggingface/hub/models--test--complete-context-model");
+        let rev = "a".repeat(40);
+        let snapshot = repo.join("snapshots").join(&rev);
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(root.join(".opengpu")).unwrap();
+        std::fs::write(repo.join("refs/main"), rev).unwrap();
+        std::fs::write(snapshot.join("config.json"), "{}").unwrap();
+        std::fs::write(snapshot.join("model.safetensors.index.json"), r#"{"weight_map":{"w":"part.safetensors"}}"#).unwrap();
+        std::fs::write(root.join(".opengpu/model.json"), r#"{"name":"test/complete-context-model","active":true}"#).unwrap();
+        assert!(super::available_model_capabilities(&root).is_empty());
+        std::fs::write(snapshot.join("part.safetensors"), [1u8; 64]).unwrap();
+        let models = super::available_model_capabilities(&root);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].format.as_deref(), Some("mlx"));
+        assert_eq!(models[0].size_bytes, Some(64));
+        assert_eq!(models[0].estimated_vram_mb, Some(1));
+        assert_eq!(std::fs::canonicalize(models[0].path.as_ref().unwrap()).unwrap(), std::fs::canonicalize(&snapshot).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn outdated_mlx_restart_requires_exact_managed_wrapper_and_port() {
         let wrapper = std::path::Path::new("/home/a/.opengpu/runtimes/mlx/measured_startup.py");
