@@ -2842,9 +2842,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use super::*;
-    use std::fs;
-
     #[test]
     fn classification_keeps_embeddings_out_of_chat_and_coding() {
         let model = enrich_model_capability(contracts::ModelCapability {
