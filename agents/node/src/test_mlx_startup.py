@@ -246,6 +246,18 @@ class Qwen35LongContextTests(unittest.TestCase):
         loaded.args.text.rope_scaling={"type":"default"}
         with self.assertRaises(ValueError):verify_qwen35_loaded_context(loaded,1000000)
 
+    def test_loaded_qwen35_uses_constructed_language_model_args(self):
+        from types import SimpleNamespace
+        from mlx_startup import verify_qwen35_loaded_context
+        text = SimpleNamespace(max_position_embeddings=1000000, rope_scaling={
+            "type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144})
+        loaded = SimpleNamespace(args=SimpleNamespace(text_config={}),
+                                 language_model=SimpleNamespace(args=text))
+        verify_qwen35_loaded_context(loaded, 1000000)
+        text.max_position_embeddings = 262144
+        with self.assertRaises(ValueError):
+            verify_qwen35_loaded_context(loaded, 1000000)
+
     def test_yarn_override_preserves_original_and_other_rope_fields(self):
         import json
         from pathlib import Path

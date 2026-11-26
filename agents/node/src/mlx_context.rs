@@ -86,6 +86,13 @@ fn weight_bytes(directory: &Path) -> Option<u64> {
     (sum > 0).then_some(sum)
 }
 
+pub fn cached_weight_directory(name: &str, model_dir: &Path) -> Option<(PathBuf, u64)> {
+    let model = ModelCapability { name: name.into(), ..Default::default() };
+    let directory = cached_directory(&model, model_dir)?;
+    let weights = weight_bytes(&directory)?;
+    (weights > 0).then_some((directory, weights))
+}
+
 fn cached_directory(model: &ModelCapability, model_dir: &Path) -> Option<PathBuf> {
     for local in model
         .path

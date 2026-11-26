@@ -286,7 +286,10 @@ def qwen35_long_context_config(config, requested):
 
 def verify_qwen35_loaded_context(model, requested):
     args = getattr(model, "args", None)
-    text = getattr(args, "text", args)
+    language_model = getattr(model, "language_model", None)
+    text = getattr(language_model, "args", None)
+    if text is None:
+        text = getattr(args, "text", args)
     rope = getattr(text, "rope_scaling", None) or getattr(text, "rope_parameters", None) or {}
     if (getattr(text, "max_position_embeddings", None) != requested
         or (rope.get("type") or rope.get("rope_type")) != "yarn"
