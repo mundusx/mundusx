@@ -1454,7 +1454,13 @@ fn warm_mlx_runtime(url: &str, _model: &str, timeout: Duration) -> Result<(), St
 
 /// A catalog/runtime claim, not a tested capability. Central policy controls routing.
 pub fn managed_mlx_tools_declared(model: &str) -> bool {
-    configured_mlx_server_url().is_some() && crate::model_profile::is_qwen3_coder(model)
+    let Some(url) = configured_mlx_server_url() else { return false; };
+    if crate::model_profile::is_qwen3_coder(model) { return true; }
+    ureq::get(&format!("{url}/v1/opengpu/runtime-capabilities"))
+        .timeout(Duration::from_secs(2)).call().ok()
+        .and_then(|response| response.into_json::<serde_json::Value>().ok())
+        .is_some_and(|value| value["engine"] == "mlx-vlm" && value["model"] == model
+            && value["native_tool_calls_v1"] == true && value["version"].as_u64().is_some_and(|v|v>=12))
 }
 
 #[cfg(test)]
