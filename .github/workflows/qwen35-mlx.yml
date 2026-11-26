@@ -1,0 +1,21 @@
+name: Qwen3.5 MLX context profile
+on:
+  pull_request:
+    paths:
+      - 'agents/node/**'
+      - '.github/workflows/qwen35-mlx.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  context-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s agents/node/src -p test_mlx_startup.py
+      - run: cargo test --locked -p opengpu-node-agent mlx_context -- --test-threads=1
+      - run: cargo test --locked -p opengpu-node-agent qwen35_ -- --test-threads=1

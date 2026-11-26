@@ -1318,6 +1318,14 @@ fn llama_server_health_ok(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn served_mlx_context_tokens() -> Option<u32> {
+    let url = configured_mlx_server_url()?;
+    let value: serde_json::Value = ureq::get(&format!("{url}/v1/opengpu/runtime-capabilities"))
+        .timeout(Duration::from_secs(2)).call().ok()?.into_json().ok()?;
+    if value["configuration_profile"] != "qwen35-yarn-1m-v1" { return None; }
+    value["context_tokens"].as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
 fn mlx_server_health_ok(url: &str) -> bool {
     ureq::get(&format!("{url}/v1/models"))
         .timeout(Duration::from_secs(2))
@@ -2199,6 +2207,21 @@ pub fn recommended_parallel_slots(
     contribution_percent: u8,
     model_name: Option<&str>,
 ) -> u8 {
+    recommended_parallel_slots_with_context(backend, physical_vram_mb, unified_memory_mb,
+        contribution_percent, model_name, env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok().and_then(|v|v.parse().ok()))
+}
+
+fn recommended_parallel_slots_with_context(
+    backend: Backend, physical_vram_mb: Option<u32>, unified_memory_mb: Option<u32>,
+    contribution_percent: u8, model_name: Option<&str>, requested_context: Option<u32>,
+) -> u8 {
+    // Selecting the extended Qwen3.5 profile opts into a single active KV cache.
+    if backend == Backend::M
+        && model_name.is_some_and(|n| n.to_ascii_lowercase().contains("qwen3.5-35b-a3b"))
+        && requested_context.is_some_and(|n| n > 262144 && n <= 1010000)
+    {
+        return 1;
+    }
     let capacity_memory_mb = match backend {
         Backend::Cuda => physical_vram_mb,
         Backend::M | Backend::Vllm => unified_memory_mb,
@@ -6427,6 +6450,14 @@ mod tests {
             recommended_parallel_slots(Backend::Cuda, Some(32_768), None, 80, Some("Qwen2.5-32B"),),
             1
         );
+    }
+
+    #[test]
+    fn qwen35_long_profile_uses_one_slot_without_changing_native_defaults() {
+        let model=Some("mlx-community/Qwen3.5-35B-A3B-4bit");
+        assert_eq!(recommended_parallel_slots_with_context(Backend::M,None,Some(65536),90,model,Some(1_000_000)),1);
+        assert_eq!(recommended_parallel_slots_with_context(Backend::M,None,Some(65536),90,model,Some(131072)),3);
+        assert_eq!(recommended_parallel_slots_with_context(Backend::M,None,Some(65536),90,Some("Qwen3-Coder-30B-A3B"),Some(1_000_000)),3);
     }
 
     #[test]
