@@ -235,6 +235,17 @@ class ProgressTests(unittest.TestCase):
 
 
 class Qwen35LongContextTests(unittest.TestCase):
+    def test_runtime_context_proof_requires_loaded_args_not_only_requested_config(self):
+        from mlx_startup import verify_qwen35_loaded_context
+        loaded=SimpleNamespace(args=SimpleNamespace(text=SimpleNamespace(
+            max_position_embeddings=1000000,rope_scaling={"type":"yarn","factor":4.0,"original_max_position_embeddings":262144})))
+        verify_qwen35_loaded_context(loaded,1000000)
+        loaded.args.text.max_position_embeddings=262144
+        with self.assertRaises(ValueError):verify_qwen35_loaded_context(loaded,1000000)
+        loaded.args.text.max_position_embeddings=1000000
+        loaded.args.text.rope_scaling={"type":"default"}
+        with self.assertRaises(ValueError):verify_qwen35_loaded_context(loaded,1000000)
+
     def test_yarn_override_preserves_original_and_other_rope_fields(self):
         import json
         from pathlib import Path

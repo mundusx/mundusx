@@ -284,6 +284,17 @@ def qwen35_long_context_config(config, requested):
     return result
 
 
+def verify_qwen35_loaded_context(model, requested):
+    args = getattr(model, "args", None)
+    text = getattr(args, "text", args)
+    rope = getattr(text, "rope_scaling", None) or getattr(text, "rope_parameters", None) or {}
+    if (getattr(text, "max_position_embeddings", None) != requested
+        or (rope.get("type") or rope.get("rope_type")) != "yarn"
+        or rope.get("factor") != 4.0
+        or rope.get("original_max_position_embeddings") != 262144):
+        raise ValueError("Installed mlx-lm did not apply the Qwen3.5 YaRN profile; update the MLX runtime")
+
+
 def cached_model_config(model):
     path = Path(model)
     if not path.is_dir():
@@ -335,6 +346,8 @@ def main():
                     kwargs["model_config"] = override
                     applied_context = requested
             result = original_load(*args, **kwargs)
+            if applied_context is not None:
+                verify_qwen35_loaded_context(result[0], applied_context)
             server.opengpu_context_tokens = applied_context
             if not startup_complete and not kwargs.get("lazy", False):
                 ready.write_text("ready", encoding="utf-8")
