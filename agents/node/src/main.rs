@@ -273,6 +273,21 @@ fn worker_readiness(config: &AgentConfig) -> (WorkerHealthReport, WorkerPolicyRe
         health.notes = vec!["Media-only runtime; verified profiles determine readiness".into()];
         health.supported_runtime_modes.clear();
     }
+    if resolved_backend(config) == Backend::M && config.contributed_cluster.is_none()
+        && config.contribution.llm_enabled() && health.persistent_runtime_warm {
+        if let Some(name) = config.active_model.as_deref() {
+            if let Some(requested) = config.requested_context(name).filter(|n| *n >= 1024) {
+                let model = contracts::ModelCapability { name: name.into(), ..Default::default() };
+                let available = mlx_context::context_tokens_with_request(&model, &model_dir,
+                    detect_memory_mb(), config.contribution_percent, health.parallel_slots,
+                    worker::served_mlx_context_tokens(), Some(requested));
+                if available != Some(requested) {
+                    health.healthy = false;
+                    health.notes.push(format!("Requested context {requested} cannot be admitted within the configured memory and runtime limits (available: {}). Change the context or resource budget before contributing.", available.map(|n|n.to_string()).unwrap_or_else(||"unverified".into())));
+                }
+            }
+        }
+    }
     let policy = worker::probe_worker_policy(&health, config.contribution_percent);
     (health, policy)
 }

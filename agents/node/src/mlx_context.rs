@@ -209,7 +209,8 @@ fn limit(
         .checked_mul(u64::from(cap.min(100)))?
         / 100;
     // Leave room for prefill activations, allocator overhead and retained prefix cache.
-    let reserve = (4 * GIB).max(weights / 4) + prompt_cache_bytes(physical_mb, cap);
+    let workspace = if matches!(c["model_type"].as_str(), Some("qwen3_5_moe_text" | "qwen3_5_text")) { 8 * GIB } else { (4 * GIB).max(weights / 4) };
+    let reserve = workspace + prompt_cache_bytes(physical_mb, cap);
     let remaining = budget.checked_sub(weights)?.checked_sub(reserve)?
         .checked_sub(fixed_per_slot.checked_mul(u64::from(slots.max(1)))?)?;
     let memory_limit = remaining / per_token.checked_mul(u64::from(slots.max(1)))?;
@@ -232,6 +233,7 @@ mod tests {
         assert_eq!(limit(&config,19*GIB,65536,90,1,Some(1_000_000)),Some(262144));
         config["text_config"]["max_position_embeddings"]=serde_json::json!(1_000_000);
         assert_eq!(limit(&config,19*GIB,65536,90,1,Some(1_000_000)),Some(1_000_000));
+        assert_eq!(limit(&config,20_391_679_439,65536,80,1,Some(1_000_000)),Some(1_000_000));
         assert!(limit(&config,19*GIB,65536,70,1,Some(1_000_000)).unwrap()<1_000_000);
         assert!(limit(&config,19*GIB,65536,90,2,Some(1_000_000)).unwrap()<1_000_000);
         assert!(limit(&config,19*GIB,16384,90,1,Some(1_000_000)).is_none());
