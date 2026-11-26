@@ -1330,6 +1330,17 @@ fn mlx_context_at(url: &str) -> Option<u32> {
     value["context_tokens"].as_u64().and_then(|n| u32::try_from(n).ok())
 }
 
+fn mlx_vision_at(url: &str, model: &str) -> bool {
+    ureq::get(&format!("{url}/v1/opengpu/runtime-capabilities"))
+        .timeout(Duration::from_secs(2)).call().ok()
+        .and_then(|response| response.into_json::<serde_json::Value>().ok())
+        .is_some_and(|value| value["engine"] == "mlx-vlm" && value["supports_vision"] == true && value["model"] == model)
+}
+
+pub fn mlx_vision_ready(model: &str) -> bool {
+    configured_mlx_server_url().is_some_and(|url| mlx_vision_at(&url, model))
+}
+
 fn mlx_server_health_ok(url: &str) -> bool {
     ureq::get(&format!("{url}/v1/models"))
         .timeout(Duration::from_secs(2))
@@ -2020,7 +2031,15 @@ pub fn start_persistent_runtime_with_context(
         let Some(model_name) = model_name.map(str::trim).filter(|name| !name.is_empty()) else {
             return Ok(None);
         };
-        if let Ok(python) = probe_mlx_available() {
+        if let Ok(mut python) = probe_mlx_available() {
+            let vision_python = opengpu_home_dir().join("runtimes/mlx-vlm/venv/bin/python");
+            let use_vision = model_name.to_ascii_lowercase().contains("qwen3.5-35b-a3b") && vision_python.is_file();
+            if use_vision {
+                let status = Command::new(&vision_python).args(["-c", "import mlx_vlm"]).status()
+                    .map_err(|error| format!("Cannot check the vision runtime: {error}"))?;
+                if !status.success() { return Err("The installed mlx-vlm runtime cannot import; repair it before contributing vision".into()); }
+                python = vision_python;
+            }
             if crate::model_profile::is_qwen3_coder(model_name) {
                 crate::model_profile::verify_mlx_runtime(&python)?;
             }
@@ -2038,7 +2057,9 @@ pub fn start_persistent_runtime_with_context(
             let url = format!("http://127.0.0.1:{port}");
             let healthy = mlx_server_health_ok(&url);
             let desired_context=context_override.or_else(||env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok().and_then(|v|v.parse().ok()));
-            if healthy && mlx_context_reload_needed(model_name,desired_context,mlx_context_at(&url)) {
+            if healthy && use_vision && !mlx_vision_at(&url,model_name) {
+                retire_managed_mlx_for_profile(&url,port,"vision runtime")?;
+            } else if healthy && mlx_context_reload_needed(model_name,desired_context,mlx_context_at(&url)) {
                 retire_managed_mlx_for_profile(&url,port,"saved model context")?;
             } else if healthy && crate::model_profile::is_qwen3_coder(model_name) && !mlx_required_tools_ready(&url) {
                 retire_outdated_managed_mlx(&url, port)?;
@@ -2071,7 +2092,12 @@ pub fn start_persistent_runtime_with_context(
                 .try_clone()
                 .map_err(|error| format!("failed to clone MLX runtime log handle: {error}"))?;
             let wrapper = log_path.with_file_name("measured_startup.py");
-            fs::write(&wrapper, include_str!("mlx_startup.py")).map_err(|e| e.to_string())?;
+            if use_vision {
+                fs::write(log_path.with_file_name("mlx_startup.py"), include_str!("mlx_startup.py")).map_err(|e|e.to_string())?;
+                fs::write(&wrapper, include_str!("mlx_vlm_startup.py")).map_err(|e|e.to_string())?;
+            } else {
+                fs::write(&wrapper, include_str!("mlx_startup.py")).map_err(|e| e.to_string())?;
+            }
             let ready_file = log_path.with_file_name(format!("model-ready-{}.txt", uuid::Uuid::new_v4().simple()));
             let mut child = Command::new(python)
                 .arg(&wrapper)
