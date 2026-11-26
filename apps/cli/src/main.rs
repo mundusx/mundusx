@@ -3970,7 +3970,7 @@ fn apply_session_settings(child: &mut std::process::Child) -> Result<bool, Strin
         theme::note("Pending changes discarded. Resuming existing settings.");
         return Ok(false);
     };
-    let restart = changes.model_changed || changes.plane_changed;
+    let restart = changes.model_changed || changes.plane_changed || changes.context_changed;
     let mut registry = control_planes::Registry::load().map_err(|e| e.to_string())?;
     for url in [&original.control_plane_url, &changes.config.control_plane_url] {
         if url.trim_end_matches('/') != PUBLIC_CONTROL_PLANE_URL {

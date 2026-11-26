@@ -1319,7 +1319,10 @@ fn llama_server_health_ok(url: &str) -> bool {
 }
 
 pub fn served_mlx_context_tokens() -> Option<u32> {
-    let url = configured_mlx_server_url()?;
+    mlx_context_at(&configured_mlx_server_url()?)
+}
+
+fn mlx_context_at(url: &str) -> Option<u32> {
     let value: serde_json::Value = ureq::get(&format!("{url}/v1/opengpu/runtime-capabilities"))
         .timeout(Duration::from_secs(2)).call().ok()?.into_json().ok()?;
     if value["configuration_profile"] != "qwen35-yarn-1m-v1" { return None; }
@@ -1352,17 +1355,26 @@ fn managed_mlx_command_matches(command: &str, wrapper: &Path, port: u16) -> bool
         && args.windows(2).any(|pair| pair == ["--port", port.to_string().as_str()]))
 }
 
+fn mlx_context_reload_needed(model: &str, requested: Option<u32>, served: Option<u32>) -> bool {
+    model.to_ascii_lowercase().contains("qwen3.5-35b-a3b")
+        && requested.filter(|n| *n > 262144) != served
+}
+
 fn retire_outdated_managed_mlx(url: &str, port: u16) -> Result<(), String> {
+    retire_managed_mlx_for_profile(url,port,"required tool calls")
+}
+
+fn retire_managed_mlx_for_profile(url: &str, port: u16, reason: &str) -> Result<(), String> {
     let state = read_persistent_runtime_state()?.filter(|state|
         state.url == url && state.environment_variable == "OPENGPU_MLX_SERVER_URL" && state.container_name.is_none()
-    ).ok_or("Existing MLX server lacks required-tool support and is not a recorded managed runtime. Restart that server with the updated MLX wrapper; it was not stopped automatically.")?;
+    ).ok_or("Existing MLX server needs updated settings and is not a recorded managed runtime. Restart it with the updated MLX wrapper; it was not stopped automatically.")?;
     let wrapper = opengpu_home_dir().join("runtimes/mlx/measured_startup.py");
     let output = Command::new("ps").args(["-p", &state.pid.to_string(), "-o", "command="])
         .output().map_err(|error| format!("Cannot verify old MLX runtime ownership: {error}"))?;
     if !output.status.success() || !managed_mlx_command_matches(&String::from_utf8_lossy(&output.stdout), &wrapper, port) {
-        return Err("Existing MLX server lacks required-tool support; recorded process ownership could not be verified. Restart it manually; no process was stopped.".into());
+        return Err("Existing MLX server needs updated settings; recorded process ownership could not be verified. Restart it manually; no process was stopped.".into());
     }
-    println!("persistentRuntime: restarting outdated managed MLX runtime for required tool calls");
+    println!("persistentRuntime: restarting recorded managed MLX runtime for {reason}");
     stop_persistent_runtime_process(state.pid, None);
     remove_persistent_runtime_state();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1987,6 +1999,13 @@ pub fn start_persistent_runtime(
     parallel_slots: u8,
     prompt_cache_bytes: u64,
 ) -> Result<Option<PersistentRuntimeHandle>, String> {
+    start_persistent_runtime_with_context(model_dir, model_name, backend, parallel_slots, prompt_cache_bytes, None)
+}
+
+pub fn start_persistent_runtime_with_context(
+    model_dir: &Path, model_name: Option<&str>, backend: Backend,
+    parallel_slots: u8, prompt_cache_bytes: u64, context_override: Option<u32>,
+) -> Result<Option<PersistentRuntimeHandle>, String> {
     if env::var("OPENGPU_PERSISTENT_RUNTIME")
         .map(|value| value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
@@ -2017,7 +2036,10 @@ pub fn start_persistent_runtime(
                 .unwrap_or(8790);
             let url = format!("http://127.0.0.1:{port}");
             let healthy = mlx_server_health_ok(&url);
-            if healthy && crate::model_profile::is_qwen3_coder(model_name) && !mlx_required_tools_ready(&url) {
+            let desired_context=context_override.or_else(||env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok().and_then(|v|v.parse().ok()));
+            if healthy && mlx_context_reload_needed(model_name,desired_context,mlx_context_at(&url)) {
+                retire_managed_mlx_for_profile(&url,port,"saved model context")?;
+            } else if healthy && crate::model_profile::is_qwen3_coder(model_name) && !mlx_required_tools_ready(&url) {
                 retire_outdated_managed_mlx(&url, port)?;
             } else if healthy {
                 // A reused local server may be live but still cold.
@@ -2055,6 +2077,8 @@ pub fn start_persistent_runtime(
                 .env("OPENGPU_MLX_READY_FILE", &ready_file)
                 .env("PYTHONUNBUFFERED", "1")
                 .env("OPENGPU_MLX_PROMPT_CACHE_BYTES", prompt_cache_bytes.to_string())
+                .env("OPENGPU_MODEL_CONTEXT_TOKENS", context_override.map(|n|n.to_string())
+                    .or_else(||env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok()).unwrap_or_else(||"0".into()))
                 .args([
                     "--model",
                     model_name,
@@ -2211,7 +2235,7 @@ pub fn recommended_parallel_slots(
         contribution_percent, model_name, env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok().and_then(|v|v.parse().ok()))
 }
 
-fn recommended_parallel_slots_with_context(
+pub fn recommended_parallel_slots_with_context(
     backend: Backend, physical_vram_mb: Option<u32>, unified_memory_mb: Option<u32>,
     contribution_percent: u8, model_name: Option<&str>, requested_context: Option<u32>,
 ) -> u8 {
@@ -6450,6 +6474,17 @@ mod tests {
             recommended_parallel_slots(Backend::Cuda, Some(32_768), None, 80, Some("Qwen2.5-32B"),),
             1
         );
+    }
+
+    #[test]
+    fn saved_context_reloads_only_when_the_mlx_profile_changes() {
+        let model="mlx-community/Qwen3.5-35B-A3B-4bit";
+        assert!(mlx_context_reload_needed(model,Some(1000000),None));
+        assert!(!mlx_context_reload_needed(model,Some(1000000),Some(1000000)));
+        assert!(mlx_context_reload_needed(model,Some(0),Some(1000000)));
+        assert!(mlx_context_reload_needed(model,Some(131072),Some(1000000)));
+        assert!(!mlx_context_reload_needed(model,Some(131072),None));
+        assert!(!mlx_context_reload_needed("other-model",Some(1000000),None));
     }
 
     #[test]

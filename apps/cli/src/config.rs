@@ -75,6 +75,9 @@ pub struct Config {
     pub control_plane_url: String,
     #[serde(default)]
     pub active_model: Option<String>,
+    /// Requested per-model context; zero explicitly selects automatic defaults.
+    #[serde(default)]
+    pub model_context_limits: std::collections::BTreeMap<String, u32>,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
@@ -115,6 +118,7 @@ impl Default for Config {
             contribution_percent: 0,
             control_plane_url: PUBLIC_CONTROL_PLANE_URL.to_string(),
             active_model: None,
+            model_context_limits: Default::default(),
             models: vec![],
             model_dir: None,
             onboarding_completed: false,
@@ -231,6 +235,20 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod control_plane_url_tests {
     use super::*;
+
+    #[test]
+    fn model_context_limits_survive_config_roundtrip() {
+        let mut config=Config::default();
+        config.model_context_limits.insert("model-a".into(),1000000);
+        config.model_context_limits.insert("model-b".into(),131072);
+        config.model_context_limits.insert("model-auto".into(),0);
+        let value=serde_json::to_value(&config).unwrap();
+        let restored:Config=serde_json::from_value(value).unwrap();
+        assert_eq!(restored.model_context_limits,config.model_context_limits);
+        let mut legacy=serde_json::to_value(config).unwrap();
+        legacy.as_object_mut().unwrap().remove("model_context_limits");
+        assert!(serde_json::from_value::<Config>(legacy).unwrap().model_context_limits.is_empty());
+    }
 
     #[test]
     fn private_home_settings_survive_newer_local_copy_and_startup_save() {
