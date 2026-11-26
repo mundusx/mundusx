@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace as NS
 
-from mlx_vlm_startup import vision_runtime_proof
+from mlx_vlm_startup import vision_runtime_proof, native_tools_runtime_proof
 
 
 class VisionReadinessTests(unittest.TestCase):
@@ -27,6 +27,15 @@ class VisionReadinessTests(unittest.TestCase):
         self.assertEqual(proof["context_tokens"], 1000000)
         self.assertTrue(proof["supports_vision"])
         self.assertNotIn("native_tool_guard", proof)
+
+    def test_tools_require_qualified_runtime_architecture_and_template(self):
+        model = NS(config=NS(model_type="qwen3_5_moe"))
+        processor = NS(tokenizer=NS(chat_template="{% if tools %}<tool_call>{% endif %}"))
+        self.assertTrue(native_tools_runtime_proof(model, processor, "0.8.1"))
+        self.assertFalse(native_tools_runtime_proof(model, processor, "0.8.0"))
+        self.assertFalse(native_tools_runtime_proof(model, NS(chat_template="chat"), "0.8.1"))
+        model.config.model_type = "unqualified_model"
+        self.assertFalse(native_tools_runtime_proof(model, processor, "0.8.1"))
 
 
 if __name__ == "__main__":

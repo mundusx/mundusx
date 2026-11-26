@@ -18,6 +18,16 @@ def vision_runtime_proof(model, processor, requested, model_name):
     return proof
 
 
+def native_tools_runtime_proof(model, processor, runtime_version):
+    """Only claim the pinned Qwen3.5 runtime whose tool protocol was validated."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    template = getattr(processor, "chat_template", None) or getattr(tokenizer, "chat_template", "")
+    return (runtime_version == "0.8.1"
+            and getattr(model.config, "model_type", None) == "qwen3_5_moe"
+            and isinstance(template, str)
+            and "tools" in template and "<tool_call>" in template)
+
+
 def main():
     import mlx_vlm.utils as utils
 
@@ -40,6 +50,8 @@ def main():
             if kwargs.get("lazy", False):
                 raise ValueError("Managed vision readiness requires evaluated weights")
             proof.update(vision_runtime_proof(model, processor, requested, model_name))
+            from importlib.metadata import version
+            proof["native_tool_calls_v1"] = native_tools_runtime_proof(model, processor, version("mlx-vlm"))
             ready.write_text("ready", encoding="utf-8")
             return model, processor
         except Exception as error:
