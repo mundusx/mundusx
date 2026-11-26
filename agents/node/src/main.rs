@@ -288,6 +288,7 @@ fn worker_readiness(config: &AgentConfig) -> (WorkerHealthReport, WorkerPolicyRe
             }
         }
     }
+    if health.runtime_mode == "mlx" && health.healthy { health.notes.push(worker::REQUEST_TOKEN_BUDGET_CAPABILITY.into()); }
     let policy = worker::probe_worker_policy(&health, config.contribution_percent);
     (health, policy)
 }
@@ -534,7 +535,7 @@ fn model_capacity_class(model: &contracts::ModelCapability, node_capacity_class:
     let name = model.name.to_ascii_lowercase();
     let inferred = if name.contains("70b") || name.contains("72b") || name.contains("405b") {
         "synthesis"
-    } else if name.contains("30b") || name.contains("32b") || name.contains("34b") {
+    } else if name.contains("30b") || name.contains("32b") || name.contains("34b") || name.contains("35b") {
         "heavy"
     } else if name.contains("13b") || name.contains("14b") {
         "performance"
@@ -594,7 +595,7 @@ fn enrich_model_capability(
             .any(|value| value.to_ascii_lowercase().contains(needle))
     };
     let rank = capacity_rank(&model.capacity_class);
-    let coding = name.contains("code") || name.contains("coder") || declared("code") || declared("coding");
+    let coding = name.contains("code") || name.contains("coder") || declared("code") || declared("coding") || model.task_capabilities.iter().any(|task|task == "coding");
     // Keep reviewed/runtime-declared skills. Enrichment must not erase them.
     let mut tasks = model.task_capabilities.iter().map(|task| task.trim().to_ascii_lowercase())
         .filter(|task| !task.is_empty()).collect::<Vec<_>>();
@@ -1312,6 +1313,7 @@ fn build_worker_launch_request(
     seed: Option<u64>,
 ) -> WorkerLaunchRequest {
     WorkerLaunchRequest {
+        token_allowance: None,
         operation: crate::contribution_contract::Operation::Llm,
         job_id,
         node_id: config.device_id.clone(),
@@ -2021,6 +2023,7 @@ fn execute_claimed_job(
         })
     } else { None };
     let request = WorkerLaunchRequest {
+        token_allowance: job.token_allowance,
         operation: job.operation,
         job_id: job.job_id.clone(),
         node_id: config.device_id.clone(),
@@ -2823,6 +2826,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen35_active_parameter_suffix_does_not_downgrade_model_capacity() {
+        let model = super::enrich_model_capability(crate::contracts::ModelCapability {
+            name:"mlx-community/Qwen3.5-35B-A3B-4bit".into(),
+            task_capabilities:vec!["coding".into()], supports_vision:true, supports_tools:true,
+            ..Default::default()
+        },"heavy",&[],None,false);
+        assert_eq!(model.capacity_class,"heavy");
+        for capability in ["reasoning","medium_coding","large_coding","vision","tool_use"] {
+            assert!(model.task_capabilities.iter().any(|c|c==capability),"{capability}");
+        }
+        assert!(model.supports_vision && model.supports_tools);
+    }
     use super::*;
     use std::fs;
 
@@ -3704,6 +3720,7 @@ mod tests {
 
     fn test_job() -> JobRecord {
         JobRecord {
+            token_allowance: None,
             graph:serde_json::Value::Null, graph_execution_enabled:false,active_graph_node_id:None,
             operation: crate::contribution_contract::Operation::Llm,
             job_id: "job-1".to_string(),

@@ -508,6 +508,7 @@ fn handle_local_inference(
         control_plane_offline.clone(),
     );
     let worker_request = WorkerLaunchRequest {
+        token_allowance: None,
         operation: Default::default(),
         job_id: request_id.clone(),
         node_id: config.device_id.clone(),
