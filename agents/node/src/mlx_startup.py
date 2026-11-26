@@ -146,6 +146,10 @@ def install_capabilities_endpoint(server):
         if self.path != "/v1/opengpu/runtime-capabilities":
             return original_get(self)
         payload = json.dumps({"required_tool_opening": True, "native_tool_guard": True, "version": 7}).encode("utf-8")
+        if getattr(server, "opengpu_context_tokens", None):
+            data = json.loads(payload)
+            data.update(context_tokens=server.opengpu_context_tokens, configuration_profile="qwen35-yarn-1m-v1")
+            payload = json.dumps(data).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -260,6 +264,37 @@ def evaluate_weights(evaluate, parameters, report, batch_bytes=BATCH_BYTES):
     return result
 
 
+def qwen35_long_context_config(config, requested):
+    """Return an in-memory text override; never edit cached model files."""
+    import copy
+    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe"):
+        return None
+    text = config.get("text_config", config)
+    native = int(text.get("max_position_embeddings", 0))
+    if requested <= native:
+        return None
+    if native != 262144 or not 262144 < requested <= 1010000:
+        raise ValueError("Qwen3.5 long context requires native 262144 and at most 1010000 tokens")
+    result = copy.deepcopy(config)
+    target = result.get("text_config", result)
+    rope = target.setdefault("rope_parameters", {})
+    rope.pop("type", None)
+    rope.update(rope_type="yarn", factor=4.0, original_max_position_embeddings=262144)
+    target["max_position_embeddings"] = requested
+    return result
+
+
+def cached_model_config(model):
+    path = Path(model)
+    if not path.is_dir():
+        from huggingface_hub import try_to_load_from_cache
+        cached = try_to_load_from_cache(str(model), "config.json")
+        if not isinstance(cached, str):
+            raise ValueError("Download the selected model before configuring extended context")
+        path = Path(cached).parent
+    return json.loads((path / "config.json").read_text(encoding="utf-8"))
+
+
 def main():
     import mlx.core as mx
     import mlx_lm.utils as utils
@@ -289,7 +324,18 @@ def main():
         previous = getattr(state, "loading", False)
         state.loading = not startup_complete
         try:
+            requested = int(os.environ.get("OPENGPU_MODEL_CONTEXT_TOKENS", "0"))
+            applied_context = None
+            if requested > 262144:
+                model = args[0] if args else kwargs.get("path_or_hf_repo")
+                config = cached_model_config(model)
+                config.update(kwargs.get("model_config") or {})
+                override = qwen35_long_context_config(config, requested)
+                if override is not None:
+                    kwargs["model_config"] = override
+                    applied_context = requested
             result = original_load(*args, **kwargs)
+            server.opengpu_context_tokens = applied_context
             if not startup_complete and not kwargs.get("lazy", False):
                 ready.write_text("ready", encoding="utf-8")
                 startup_complete = True

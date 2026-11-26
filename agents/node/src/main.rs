@@ -771,12 +771,13 @@ fn build_scheduler_capabilities(
         entry.total_parameters = cluster.filter(|c| c.model.as_deref() == Some(entry.name.as_str())).and_then(|c| c.model_params);
         entry.warm |= entry.active && health.persistent_runtime_warm;
         if cluster.is_none() && backend == Backend::M {
-            if let Some(context) = mlx_context::context_tokens(
+            if let Some(context) = mlx_context::context_tokens_with_runtime(
                 entry,
                 &config.effective_model_dir(),
                 capabilities.physical_memory_mb.unwrap_or_else(detect_memory_mb),
                 config.contribution_percent,
                 health.parallel_slots,
+                worker::served_mlx_context_tokens(),
             ) {
                 entry.context_tokens = Some(context);
                 entry.max_output_tokens = None;

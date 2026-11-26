@@ -1318,6 +1318,14 @@ fn llama_server_health_ok(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn served_mlx_context_tokens() -> Option<u32> {
+    let url = configured_mlx_server_url()?;
+    let value: serde_json::Value = ureq::get(&format!("{url}/v1/opengpu/runtime-capabilities"))
+        .timeout(Duration::from_secs(2)).call().ok()?.into_json().ok()?;
+    if value["configuration_profile"] != "qwen35-yarn-1m-v1" { return None; }
+    value["context_tokens"].as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
 fn mlx_server_health_ok(url: &str) -> bool {
     ureq::get(&format!("{url}/v1/models"))
         .timeout(Duration::from_secs(2))

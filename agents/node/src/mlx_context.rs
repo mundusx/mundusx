@@ -20,13 +20,27 @@ pub fn context_tokens(
     cap: u8,
     slots: u8,
 ) -> Option<u32> {
+    context_tokens_with_runtime(model, model_dir, physical_mb, cap, slots, None)
+}
+
+pub fn context_tokens_with_runtime(
+    model: &ModelCapability, model_dir: &Path, physical_mb: u32, cap: u8,
+    slots: u8, runtime_context: Option<u32>,
+) -> Option<u32> {
     let override_tokens = std::env::var("OPENGPU_MODEL_CONTEXT_TOKENS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|n| *n >= 1024);
     let directory = cached_directory(model, model_dir)?;
-    let config: Value =
+    let mut config: Value =
         serde_json::from_slice(&fs::read(directory.join("config.json")).ok()?).ok()?;
+    // Only a running managed server can attest that YaRN was actually loaded.
+    if let Some(tokens) = runtime_context.filter(|n| *n > 262144 && *n <= 1010000) {
+        if matches!(config["model_type"].as_str(), Some("qwen3_5" | "qwen3_5_moe")) {
+            let text = config.get_mut("text_config")?;
+            text["max_position_embeddings"] = serde_json::json!(tokens);
+        }
+    }
     let weights = weight_bytes(&directory).or(model.size_bytes)?;
     limit(&config, weights, physical_mb, cap, slots, override_tokens)
 }
@@ -135,7 +149,7 @@ fn limit(
     // Unknown/hybrid architectures retain the existing conservative fallback.
     if !matches!(
         c["model_type"].as_str()?,
-        "qwen3_moe" | "qwen3" | "qwen2" | "llama" | "mistral"
+        "qwen3_moe" | "qwen3" | "qwen2" | "llama" | "mistral" | "qwen3_5_moe_text" | "qwen3_5_text"
     ) {
         return None;
     }
@@ -154,8 +168,24 @@ fn limit(
         Some("float16" | "bfloat16") | None => 2,
         _ => return None,
     };
+    // Qwen3.5 keeps full KV only at attention layers, plus fixed recurrent state.
+    let hybrid = matches!(c["model_type"].as_str(), Some("qwen3_5_moe_text" | "qwen3_5_text"));
+    let (kv_layers, fixed_per_slot) = if hybrid {
+        let types = c["layer_types"].as_array()?;
+        if types.len() as u64 != layers || types.iter().any(|t| !matches!(t.as_str(), Some("full_attention" | "linear_attention"))) { return None; }
+        let full = types.iter().filter(|t| **t == "full_attention").count() as u64;
+        let values=c["linear_num_value_heads"].as_u64()?;
+        let keys=c["linear_num_key_heads"].as_u64()?;
+        let key_dim=c["linear_key_head_dim"].as_u64()?;
+        let value_dim=c["linear_value_head_dim"].as_u64()?;
+        let kernel=c["linear_conv_kernel_dim"].as_u64()?;
+        if [values,keys,key_dim,value_dim,kernel].contains(&0) { return None; }
+        let recurrent=values.checked_mul(key_dim)?.checked_mul(value_dim)?.checked_mul(4)?;
+        let convolution=keys.checked_mul(key_dim)?.checked_mul(2)?.checked_add(values.checked_mul(value_dim)?)?.checked_mul(kernel)?.checked_mul(element_bytes)?;
+        (full,(layers-full).checked_mul(recurrent.checked_add(convolution)?)?)
+    } else { (layers,0) };
     // K + V. Weight quantization does not imply KV quantization.
-    let per_token = layers
+    let per_token = kv_layers
         .checked_mul(kv_heads)?
         .checked_mul(head_dim)?
         .checked_mul(2 * element_bytes)?;
@@ -168,12 +198,13 @@ fn limit(
         / 100;
     // Leave room for prefill activations, allocator overhead and retained prefix cache.
     let reserve = (4 * GIB).max(weights / 4) + prompt_cache_bytes(physical_mb, cap);
-    let remaining = budget.checked_sub(weights)?.checked_sub(reserve)?;
+    let remaining = budget.checked_sub(weights)?.checked_sub(reserve)?
+        .checked_sub(fixed_per_slot.checked_mul(u64::from(slots.max(1)))?)?;
     let memory_limit = remaining / per_token.checked_mul(u64::from(slots.max(1)))?;
     let tokens = maximum
         .min(memory_limit)
         .min(u64::from(requested.unwrap_or(131_072)));
-    let tokens = tokens / 1024 * 1024;
+    let tokens = if requested.is_some_and(|n| u64::from(n) == tokens) { tokens } else { tokens / 1024 * 1024 };
     (tokens >= 1024).then_some(tokens as u32)
 }
 
@@ -183,6 +214,17 @@ mod tests {
     fn qwen() -> Value {
         serde_json::json!({"model_type":"qwen3_moe","max_position_embeddings":262144,"num_hidden_layers":48,"num_key_value_heads":4,"head_dim":128})
     }
+    #[test]
+    fn qwen35_one_million_requires_memory_and_single_slot() {
+        let mut config: Value = serde_json::from_str(include_str!("qwen35_context_fixture.json")).unwrap();
+        assert_eq!(limit(&config,19*GIB,65536,90,1,Some(1_000_000)),Some(262144));
+        config["text_config"]["max_position_embeddings"]=serde_json::json!(1_000_000);
+        assert_eq!(limit(&config,19*GIB,65536,90,1,Some(1_000_000)),Some(1_000_000));
+        assert!(limit(&config,19*GIB,65536,70,1,Some(1_000_000)).unwrap()<1_000_000);
+        assert!(limit(&config,19*GIB,65536,90,2,Some(1_000_000)).unwrap()<1_000_000);
+        assert!(limit(&config,19*GIB,16384,90,1,Some(1_000_000)).is_none());
+    }
+
     #[test]
     fn large_mac_can_fit_an_agent_turn_without_ignoring_parallel_cache_memory() {
         let tokens = limit(&qwen(), 16 * GIB, 65536, 70, 3, None).unwrap();

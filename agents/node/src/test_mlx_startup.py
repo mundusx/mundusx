@@ -234,5 +234,24 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(totals[-1], (sum(a.nbytes for a in arrays),) * 2)
 
 
+class Qwen35LongContextTests(unittest.TestCase):
+    def test_yarn_override_preserves_original_and_other_rope_fields(self):
+        import json
+        from pathlib import Path
+        from mlx_startup import qwen35_long_context_config
+        original=json.loads(Path(__file__).with_name("qwen35_context_fixture.json").read_text())
+        result=qwen35_long_context_config(original,1_000_000)
+        self.assertEqual(original["text_config"]["max_position_embeddings"],262144)
+        self.assertEqual(result["text_config"]["max_position_embeddings"],1_000_000)
+        rope=result["text_config"]["rope_parameters"]
+        self.assertEqual(rope["rope_type"],"yarn")
+        self.assertEqual(rope["factor"],4.0)
+        self.assertEqual(rope["original_max_position_embeddings"],262144)
+        self.assertEqual(rope["mrope_section"],[11,11,10])
+        self.assertIsNone(qwen35_long_context_config(original,131072))
+        self.assertIsNone(qwen35_long_context_config({"model_type":"qwen3"},1_000_000))
+        with self.assertRaises(ValueError):qwen35_long_context_config(original,1_010_001)
+
+
 if __name__ == "__main__":
     unittest.main()
