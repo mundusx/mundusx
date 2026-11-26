@@ -14,7 +14,7 @@ available contribution memory, actual weights, sparse full-attention KV, fixed
 recurrent state, retained cache, workspace and execution slots. One million is
 not unconditionally advertised because a model card says it is supported.
 
-Use one execution slot. In the unit-test estimate a 64 GiB Mac at 90% contribution
+The opt-in extended profile caps this model to one execution slot. In the unit-test estimate a 64 GiB Mac at 90% contribution
 fits 1M, whereas 70% contribution or two slots reduces the limit. Do not override
 an existing user contribution cap. Memory estimates are not hardware qualification:
 actual 1M prefill, decoding, retrieval quality and responsiveness need a Mac test.
