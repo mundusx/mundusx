@@ -243,12 +243,13 @@ fn worker_readiness(config: &AgentConfig) -> (WorkerHealthReport, WorkerPolicyRe
         // when it reports nothing.
         contributed_cluster_slots(cluster)
     } else {
-        worker::recommended_parallel_slots(
+        worker::recommended_parallel_slots_with_context(
             resolved_backend(config),
             health.cuda_memory_mb,
             Some(detect_memory_mb()),
             config.contribution_percent,
             config.active_model.as_deref(),
+            config.active_model.as_deref().and_then(|m|config.requested_context(m)),
         )
     };
     health.parallel_slots = config
@@ -489,6 +490,17 @@ fn build_capabilities(
         active_model,
         ready_for_jobs,
         readiness_reason,
+    }
+}
+
+fn apply_saved_context_limits(models: &mut [contracts::ModelCapability], limits: &std::collections::BTreeMap<String,u32>) {
+    for model in models {
+        if let Some(requested)=limits.get(&model.name).filter(|n|**n>=1024) {
+            model.context_tokens=model.context_tokens.map(|n|n.min(*requested));
+            if let Some(context)=model.context_tokens {
+                model.max_output_tokens=model.max_output_tokens.map(|n|n.min(context));
+            }
+        }
     }
 }
 
@@ -771,13 +783,14 @@ fn build_scheduler_capabilities(
         entry.total_parameters = cluster.filter(|c| c.model.as_deref() == Some(entry.name.as_str())).and_then(|c| c.model_params);
         entry.warm |= entry.active && health.persistent_runtime_warm;
         if cluster.is_none() && backend == Backend::M {
-            if let Some(context) = mlx_context::context_tokens_with_runtime(
+            if let Some(context) = mlx_context::context_tokens_with_request(
                 entry,
                 &config.effective_model_dir(),
                 capabilities.physical_memory_mb.unwrap_or_else(detect_memory_mb),
                 config.contribution_percent,
                 health.parallel_slots,
                 worker::served_mlx_context_tokens(),
+                config.requested_context(&entry.name),
             ) {
                 entry.context_tokens = Some(context);
                 entry.max_output_tokens = None;
@@ -809,6 +822,7 @@ fn build_scheduler_capabilities(
             }
         }
     }
+    apply_saved_context_limits(&mut models, &config.model_context_limits);
     let context_tokens = models.iter().filter_map(|entry| entry.context_tokens).max();
     let measured_free_vram_mb = measured_free_vram_mb();
     let available_vram_mb = capabilities
@@ -2329,12 +2343,13 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
     let mut persistent_runtime = if json || !should_keep_runtime_warm(&config) {
         None
     } else {
-        match worker::start_persistent_runtime(
+        match worker::start_persistent_runtime_with_context(
             &config.effective_model_dir(),
             config.active_model.as_deref(),
             resolved_backend(&config),
             runtime_parallel_slots,
             mlx_context::prompt_cache_bytes(detect_memory_mb(), config.contribution_percent),
+            config.active_model.as_deref().and_then(|m|config.requested_context(m)),
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -2585,10 +2600,11 @@ fn run_agent(once: bool, json: bool, verbose: bool, interval_seconds: u64) {
             continue;
         }
         if media_drained && persistent_runtime.is_none() && should_keep_runtime_warm(&latest_config) {
-            match worker::start_persistent_runtime(
+            match worker::start_persistent_runtime_with_context(
                 &latest_config.effective_model_dir(), latest_config.active_model.as_deref(),
                 resolved_backend(&latest_config), worker_readiness(&latest_config).0.parallel_slots,
                 mlx_context::prompt_cache_bytes(detect_memory_mb(), latest_config.contribution_percent),
+                latest_config.active_model.as_deref().and_then(|m|latest_config.requested_context(m)),
             ) {
                 Ok(runtime) => {
                     persistent_runtime = runtime;
@@ -2968,6 +2984,21 @@ mod tests {
         assert!(!is_unknown_node_error("HTTP 401: invalid signature"));
     }
 
+    #[test]
+    fn saved_context_caps_runtime_reports_without_expanding_unknown_models() {
+        let mut models=vec![
+            crate::contracts::ModelCapability{name:"a".into(),context_tokens:Some(262144),max_output_tokens:Some(65536),..Default::default()},
+            crate::contracts::ModelCapability{name:"b".into(),context_tokens:Some(32768),..Default::default()},
+            crate::contracts::ModelCapability{name:"unknown".into(),..Default::default()},
+        ];
+        let limits=std::collections::BTreeMap::from([("a".into(),16384),("b".into(),1000000),("unknown".into(),1000000)]);
+        super::apply_saved_context_limits(&mut models,&limits);
+        assert_eq!(models[0].context_tokens,Some(16384));
+        assert_eq!(models[0].max_output_tokens,Some(16384));
+        assert_eq!(models[1].context_tokens,Some(32768));
+        assert_eq!(models[2].context_tokens,None);
+    }
+
     fn test_config() -> AgentConfig {
         AgentConfig {
             contribution: Default::default(),
@@ -2983,6 +3014,7 @@ mod tests {
             control_plane_url: "http://127.0.0.1:8787".to_string(),
             model_dir: None,
             active_model: Some("tiny-cuda".to_string()),
+            model_context_limits: Default::default(),
             models: vec!["tiny-cuda".to_string()],
             runtime_preference: None,
             fallback_runtime: None,

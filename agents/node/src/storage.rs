@@ -83,6 +83,9 @@ pub struct AgentConfig {
     pub model_dir: Option<String>,
     #[serde(default)]
     pub active_model: Option<String>,
+    /// Requested per-model context; zero explicitly selects automatic defaults.
+    #[serde(default)]
+    pub model_context_limits: std::collections::BTreeMap<String, u32>,
     /// Model identifiers this node has available (e.g. ["llama3.1:8b"]).
     #[serde(default)]
     pub models: Vec<String>,
@@ -116,6 +119,7 @@ impl Default for AgentConfig {
             control_plane_url: PUBLIC_CONTROL_PLANE_URL.to_string(),
             model_dir: None,
             active_model: None,
+            model_context_limits: Default::default(),
             models: Vec::new(),
             runtime_preference: None,
             fallback_runtime: None,
@@ -127,6 +131,11 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    pub fn requested_context(&self, model: &str) -> Option<u32> {
+        self.model_context_limits.get(model).copied().or_else(||
+            std::env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok().and_then(|v|v.parse().ok()))
+    }
+
     /// Effective model directory: explicit path, or ~/.opengpu/models as fallback.
     pub fn effective_model_dir(&self) -> std::path::PathBuf {
         self.model_dir
@@ -324,6 +333,31 @@ mod tests {
             None => std::env::remove_var("OPENGPU_HOME"),
         }
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn saved_context_is_per_model_and_auto_is_explicit() {
+        let mut config=AgentConfig::default();
+        config.model_context_limits.insert("model-a".into(),1000000);
+        config.model_context_limits.insert("model-b".into(),32768);
+        config.model_context_limits.insert("model-auto".into(),0);
+        assert_eq!(config.requested_context("model-a"),Some(1000000));
+        assert_eq!(config.requested_context("model-b"),Some(32768));
+        assert_eq!(config.requested_context("model-auto"),Some(0));
+    }
+
+    #[test]
+    fn model_context_limits_survive_config_roundtrip() {
+        let mut config=AgentConfig::default();
+        config.model_context_limits.insert("model-a".into(),1000000);
+        config.model_context_limits.insert("model-b".into(),131072);
+        config.model_context_limits.insert("model-auto".into(),0);
+        let value=serde_json::to_value(&config).unwrap();
+        let restored:AgentConfig=serde_json::from_value(value).unwrap();
+        assert_eq!(restored.model_context_limits,config.model_context_limits);
+        let mut legacy=serde_json::to_value(config).unwrap();
+        legacy.as_object_mut().unwrap().remove("model_context_limits");
+        assert!(serde_json::from_value::<AgentConfig>(legacy).unwrap().model_context_limits.is_empty());
     }
 
     #[test]

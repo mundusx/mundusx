@@ -25,6 +25,7 @@ pub struct Changes {
     pub config: Config,
     pub model_changed: bool,
     pub plane_changed: bool,
+    pub context_changed: bool,
     pub token: Option<(String, ControlPlaneTokenHeader)>,
 }
 
@@ -48,6 +49,7 @@ pub fn edit(original: &Config) -> Result<Option<Changes>, String> {
     loop {
         let options = vec![
             ("Model".into(), config.active_model.clone().unwrap_or_else(|| "not selected".into())),
+            ("Allowable context".into(), config.active_model.as_ref().and_then(|m|config.model_context_limits.get(m)).filter(|n|**n>0).map(|n|format!("{n} tokens")).unwrap_or_else(||"Automatic".into())),
             ("Control plane".into(), config.control_plane_url.clone()),
             ("API key / token".into(), if credentials.is_some() { "Updated · hidden" } else { "Unchanged · hidden" }.into()),
             ("Apply changes and resume".into(), "Active work has finished; restart only if required".into()),
@@ -70,6 +72,17 @@ pub fn edit(original: &Config) -> Result<Option<Changes>, String> {
                 }
             }
             Some(1) => {
+                let Some(model)=config.active_model.clone() else {crate::theme::warn("Choose a model first.");continue;};
+                print!("Allowable context tokens (1024–16777216, 0 for Automatic, Enter cancels): ");
+                io::stdout().flush().map_err(|e|e.to_string())?;
+                let mut input=String::new();io::stdin().read_line(&mut input).map_err(|e|e.to_string())?;
+                if input.trim().is_empty(){continue;}
+                match input.trim().parse::<u32>() {
+                    Ok(n) if n==0 || (1024..=16777216).contains(&n) => {config.model_context_limits.insert(model,n);},
+                    _=>crate::theme::warn("Enter Automatic (0) or a whole token count from 1024 to 16777216."),
+                }
+            }
+            Some(2) => {
                 let choices = vec![("Public MundusX".into(), crate::PUBLIC_CONTROL_PLANE_URL.into()),
                     ("Private / saved control plane".into(), "Pick a saved endpoint or add a new one".into())];
                 let url = match crate::select_menu_option(&["Choose control plane".into()], &choices, "↑↓ Select · Enter Continue · Esc Back", 0) {
@@ -85,12 +98,13 @@ pub fn edit(original: &Config) -> Result<Option<Changes>, String> {
                     credentials = Some(new_credentials);
                 }
             }
-            Some(2) => credentials = Some(token()?),
-            Some(3) => {
+            Some(3) => credentials = Some(token()?),
+            Some(4) => {
                 let model_changed = config.active_model != original.active_model;
                 let plane_changed = config.control_plane_url != original.control_plane_url;
-                if !model_changed && !plane_changed && credentials.is_none() { return Ok(None); }
-                return Ok(Some(Changes { config, model_changed, plane_changed, token: credentials }));
+                let context_changed=config.model_context_limits!=original.model_context_limits;
+                if !model_changed && !plane_changed && !context_changed && credentials.is_none() { return Ok(None); }
+                return Ok(Some(Changes { config, model_changed, plane_changed, context_changed, token: credentials }));
             }
             _ => return Ok(None),
         }

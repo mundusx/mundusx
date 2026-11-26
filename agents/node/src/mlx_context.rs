@@ -27,10 +27,15 @@ pub fn context_tokens_with_runtime(
     model: &ModelCapability, model_dir: &Path, physical_mb: u32, cap: u8,
     slots: u8, runtime_context: Option<u32>,
 ) -> Option<u32> {
-    let override_tokens = std::env::var("OPENGPU_MODEL_CONTEXT_TOKENS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|n| *n >= 1024);
+    context_tokens_with_request(model, model_dir, physical_mb, cap, slots, runtime_context,
+        std::env::var("OPENGPU_MODEL_CONTEXT_TOKENS").ok().and_then(|v|v.parse().ok()))
+}
+
+pub fn context_tokens_with_request(
+    model: &ModelCapability, model_dir: &Path, physical_mb: u32, cap: u8,
+    slots: u8, runtime_context: Option<u32>, requested_context: Option<u32>,
+) -> Option<u32> {
+    let override_tokens = requested_context.filter(|n| *n >= 1024);
     let directory = cached_directory(model, model_dir)?;
     let mut config: Value =
         serde_json::from_slice(&fs::read(directory.join("config.json")).ok()?).ok()?;
