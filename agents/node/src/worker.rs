@@ -1068,7 +1068,7 @@ pub fn available_model_capabilities(model_dir: &Path) -> Vec<ModelCapability> {
                 format: record.format.clone().or_else(|| cached_mlx.as_ref().map(|_| "mlx".into())),
                 quantization: record.quantization.clone(),
                 size_bytes: record.size_bytes.or_else(|| cached_mlx.as_ref().map(|(_, size)| *size)),
-                estimated_vram_mb: record.estimated_vram_mb,
+                estimated_vram_mb: record.estimated_vram_mb.or_else(|| cached_mlx.as_ref().map(|(_, size)| size.div_ceil(1 << 20))),
                 compatibility: record.compatibility.clone(),
                 compatibility_reason: record.compatibility_reason.clone(),
                 active: record.active,
@@ -5408,6 +5408,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].format.as_deref(), Some("mlx"));
         assert_eq!(models[0].size_bytes, Some(64));
+        assert_eq!(models[0].estimated_vram_mb, Some(1));
         assert_eq!(std::fs::canonicalize(models[0].path.as_ref().unwrap()).unwrap(), std::fs::canonicalize(&snapshot).unwrap());
         std::fs::remove_dir_all(&root).unwrap();
     }
