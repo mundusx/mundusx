@@ -821,6 +821,13 @@ fn build_scheduler_capabilities(
                 || (cluster.is_none() && backend == Backend::M && health.persistent_runtime_warm
                     && worker::managed_mlx_tools_declared(&entry.name)),
         );
+        if cluster.is_none() && backend == Backend::M {
+            entry.supports_vision = entry.active && health.persistent_runtime_warm && worker::mlx_vision_ready(&entry.name);
+            if !entry.supports_vision {
+                entry.task_capabilities.retain(|task| task != "vision");
+                entry.roles.retain(|role| *role != NodeRole::Vision);
+            }
+        }
     }
     if cluster.is_none() && health.runtime_mode == "vllm" && health.healthy {
         if let Some(model) = health.model_name.as_deref() {
