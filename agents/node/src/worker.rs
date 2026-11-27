@@ -3358,6 +3358,21 @@ fn compilation_retry_selects_only_existing_host_terminal_and_never_executes_it()
     assert_eq!(attempts,2);assert_eq!(result,"host tool selection only");
 }
 
+const NATIVE_EDIT_ARGUMENT_CHARS: usize = 131_072;
+
+#[test]
+fn native_complete_edit_budget_accepts_failed_18969_case_and_keeps_validation() {
+    let call=|text:String|serde_json::json!({"tool_calls":[{"id":"a","function":{"name":"edit","arguments":text}}]});
+    let base=serde_json::json!({"new_string":""}).to_string().chars().count();
+    for size in [18_969,65_536,NATIVE_EDIT_ARGUMENT_CHARS] {
+        let arguments=serde_json::json!({"new_string":"x".repeat(size-base)}).to_string();
+        assert_eq!(arguments.chars().count(),size);
+        validate_native_tool_message(&call(arguments),Some("tool_calls")).unwrap();
+    }
+    assert!(validate_native_tool_message(&call("{".into()),Some("tool_calls")).is_err());
+    assert!(validate_native_tool_message(&call(serde_json::json!({"new_string":"x".repeat(NATIVE_EDIT_ARGUMENT_CHARS)}).to_string()),Some("tool_calls")).is_err());
+}
+
 fn validate_native_tool_message(
     message: &serde_json::Value,
     reason: Option<&str>,
@@ -3412,13 +3427,13 @@ fn validate_native_tool_message(
                 return Err("native tool arguments must be a JSON object".into());
             }
             let normalized_name = tool_name.to_ascii_lowercase();
-            if argument_chars > 16_384
+            if argument_chars > NATIVE_EDIT_ARGUMENT_CHARS
                 && ["edit", "replace", "patch"]
                     .iter()
                     .any(|operation| normalized_name.contains(operation))
             {
                 return Err(format!(
-                    "native edit tool arguments exceed safe patch size: tool={tool_name}; argument_chars={argument_chars}; limit=16384"
+                    "native edit tool arguments exceed safe patch size: tool={tool_name}; argument_chars={argument_chars}; limit={NATIVE_EDIT_ARGUMENT_CHARS}"
                 ));
             }
         }
@@ -7550,7 +7565,7 @@ mod native_delta_tests {
     fn valid_whole_file_edit_is_replanned_as_a_bounded_patch() {
         let oversized = serde_json::json!({
             "path":"index.html",
-            "changes":"x".repeat(17_000)
+            "changes":"x".repeat(NATIVE_EDIT_ARGUMENT_CHARS + 1)
         })
         .to_string();
         let bounded = r#"{"path":"index.html","old":"before","new":"after"}"#;
